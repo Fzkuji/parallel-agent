@@ -158,7 +158,7 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         f"""
         你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
-        输出格式：
+        请直接输出符合下列格式的 JSON（不要包含任何额外说明）：
         {{
           "edges": [
             {{"source": "Q1", "target": "Q3", "confidence": 0.72}},
@@ -166,19 +166,17 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
           ]
         }}
 
-        约束：
-        - 只能引用给定的问题 ID。
-        - 如果问题可独立回答，可不给它添加依赖。
-        - confidence 范围 0~1。
-        - 禁止出现循环依赖。
+        规则：
+        1. 仅使用给定的问题 ID 作为 source/target。
+        2. confidence 取值 0~1，使用数字。
+        3. 如果某问题不依赖其他问题，可不在列表中出现。
+        4. 禁止引用不存在的 ID，禁止出现循环依赖。
 
         背景：
         {background.strip()}
 
         问题列表：
         {os.linesep.join(question_lines)}
-
-        请直接输出 JSON，不要有额外解释。
         """
     ).strip()
     return prompt
@@ -221,7 +219,13 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
         try:
             payload = extract_json_from_text(text)
         except ValueError as exc:
-            logging.warning("LLM dependency generation failed to produce valid JSON (%s); falling back to heuristics.", exc)
+            snippet = str(exc)
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            logging.warning(
+                "LLM dependency generation failed to produce valid JSON (%s); falling back to heuristics.",
+                snippet,
+            )
             heuristic = HeuristicDependencyGenerator()
             return heuristic.generate_edges(background, questions, metadata)
         edges_data = payload.get("edges", [])
