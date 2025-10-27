@@ -7,8 +7,9 @@ import math
 import os
 import re
 import textwrap
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -51,6 +52,51 @@ def compute_em(prediction: str, references: List[str]) -> float:
         if normalize_answer(ref) == pred_norm:
             return 1.0
     return 0.0
+
+
+def compute_contains(prediction: str, references: List[str]) -> float:
+    pred_norm = normalize_answer(prediction)
+    for ref in references:
+        ref_norm = normalize_answer(ref)
+        if not ref_norm:
+            continue
+        if ref_norm in pred_norm or pred_norm in ref_norm:
+            return 1.0
+    return 0.0
+
+
+def extract_json_answer(text: str) -> Optional[str]:
+    """Attempt to extract {"answer": "..."} from model text."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("```"):
+        parts = cleaned.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                cleaned = part[4:].strip()
+                break
+            if part.startswith("{"):
+                cleaned = part
+                break
+    try:
+        payload = json.loads(cleaned)
+        value = payload.get("answer")
+        if isinstance(value, str):
+            return value.strip()
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
+        if match:
+            snippet = match.group(0)
+            try:
+                payload = json.loads(snippet)
+                value = payload.get("answer")
+                if isinstance(value, str):
+                    return value.strip()
+            except json.JSONDecodeError:
+                pass
+    return None
 
 
 def compute_f1(prediction: str, references: List[str]) -> float:
@@ -113,17 +159,17 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
         输出格式：
-        {{
+        {
           "edges": [
-            {{"source": "Q1", "target": "Q3", "confidence": 0.72, "rationale": "原因"}},
+            {"source": "Q1", "target": "Q3", "confidence": 0.72},
             ...
           ]
-        }}
+        }
 
         约束：
         - 只能引用给定的问题 ID。
         - 如果问题可独立回答，可不给它添加依赖。
-        - confidence 范围 0~1；rationale 简要说明理由。
+        - confidence 范围 0~1。
         - 禁止出现循环依赖。
 
         背景：
@@ -187,8 +233,7 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             except KeyError:
                 continue
             confidence = float(item.get("confidence", 0.7))
-            rationale = item.get("rationale")
-            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence, rationale=rationale))
+            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
         return edges
 
 
@@ -202,7 +247,8 @@ def build_answer_prompt(
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
         "Provide the shortest possible span from the passage that answers the question.",
-        "If the answer is not explicitly stated, reply with 'unknown'.",
+        "Respond strictly as a JSON object: {\"answer\": \"<span-or-unknown>\"}.",
+        "If uncertain, return {\"answer\": \"unknown\"}. Do not add extra text.",
         "",
         "Background:",
         background.strip(),
@@ -217,7 +263,7 @@ def build_answer_prompt(
             prompt_parts.append(f"Answer: {dep_answer}")
         prompt_parts.append("")
     prompt_parts.append(f"Question ({question.qid}): {question.text.strip()}")
-    prompt_parts.append("Answer:")
+    prompt_parts.append("Answer in JSON:")
     return "\n".join(prompt_parts)
 
 
@@ -227,8 +273,9 @@ def answer_question(
     prompt: str,
     *,
     max_new_tokens: int = 96,
-) -> str:
+) -> Tuple[str, int, bool, float]:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    start = time.perf_counter()
     with torch.no_grad():
         generated = model.generate(
             **inputs,
@@ -236,30 +283,38 @@ def answer_question(
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
         )
-    text = decode_generated(tokenizer, inputs["input_ids"], generated)
-    # take first non-empty line as answer
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.lower().startswith("answer:"):
-            line = line[7:].strip()
-        return line
-    return text.strip()
+    elapsed = time.perf_counter() - start
+    sequences = generated.sequences
+    generated_part = sequences[:, inputs["input_ids"].shape[-1] :]
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+    trimmed_tokens: List[int] = []
+    for token in generated_part[0].tolist():
+        if token in (eos_id, pad_id):
+            break
+        trimmed_tokens.append(token)
+    raw_text = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+    extracted = extract_json_answer(raw_text)
+    strict_valid = extracted is not None
+    answer = extracted if strict_valid else raw_text
+    gen_token_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+    return answer, len(gen_token_ids), strict_valid, elapsed
 
 
-def evaluate_answers(predictions: Dict[str, str], question_lookup: Dict[str, Question]) -> Dict[str, float]:
+def evaluate_answers(predictions: Dict[str, Tuple[str, bool]], question_lookup: Dict[str, Question]) -> Dict[str, float]:
     total = len(predictions)
     if total == 0:
-        return {"em": 0.0, "f1": 0.0}
-    em_sum = 0.0
-    f1_sum = 0.0
-    for qid, pred in predictions.items():
+        return {"strict_acc": 0.0, "lenient_acc": 0.0}
+    strict_sum = 0.0
+    lenient_sum = 0.0
+    for qid, (pred, strict_valid) in predictions.items():
         references = question_lookup[qid].references
-        em_sum += compute_em(pred, references)
-        f1_sum += compute_f1(pred, references)
-    return {"em": em_sum / total, "f1": f1_sum / total}
+        strict_sum += compute_contains(pred, references) if strict_valid else 0.0
+        lenient_sum += compute_contains(pred, references)
+    return {"strict_acc": strict_sum / total, "lenient_acc": lenient_sum / total}
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -314,8 +369,8 @@ def main() -> None:
         generator = LocalLLMDependencyGenerator(tokenizer, model)
         logging.info("Using local LLM dependency generator.")
 
-    aggregate_em = []
-    aggregate_f1 = []
+    aggregate_strict = []
+    aggregate_lenient = []
 
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
@@ -352,25 +407,33 @@ def main() -> None:
         for q in questions_list:
             logging.info("  %s -> %s", q.qid, sorted(q.dependencies))
 
-        answers: Dict[str, str] = {}
+        answers: Dict[str, Tuple[str, bool]] = {}
+        answers_text: Dict[str, str] = {}
+        total_latency = 0.0
         for batch in schedule_result.batches:
+            batch_latencies: List[float] = []
             for qid in batch.question_ids:
                 question = questions_dict[qid]
                 deps = sorted(question.dependencies)
-                prompt = build_answer_prompt(background, question, answers, deps, questions_dict)
-                answer = answer_question(
+                prompt = build_answer_prompt(background, question, answers_text, deps, questions_dict)
+                ans_text, gen_len, strict_valid, elapsed = answer_question(
                     tokenizer,
                     model,
                     prompt,
                     max_new_tokens=args.max_new_tokens,
                 )
-                answers[qid] = answer
-                logging.info("Answer %s: %s", qid, answer)
+                answers[qid] = (ans_text, strict_valid)
+                answers_text[qid] = ans_text
+                logging.info("Answer %s: %s (len=%d tok)", qid, ans_text, gen_len)
+                batch_latencies.append(elapsed)
+            if batch_latencies:
+                total_latency += max(batch_latencies)
 
         metrics = evaluate_answers(answers, questions_dict)
-        aggregate_em.append(metrics["em"])
-        aggregate_f1.append(metrics["f1"])
-        logging.info("Context %s metrics -> EM: %.3f | F1: %.3f", title, metrics["em"], metrics["f1"])
+        aggregate_strict.append(metrics["strict_acc"])
+        aggregate_lenient.append(metrics["lenient_acc"])
+        logging.info("Context %s metrics -> strict ACC: %.3f | lenient ACC: %.3f", title, metrics["strict_acc"], metrics["lenient_acc"])
+        logging.info("Estimated parallel latency (max per batch sum): %.2fs", total_latency)
 
         scheduler.pretty_print_schedule(schedule_result)
         if args.html_dir:
@@ -381,8 +444,12 @@ def main() -> None:
 
             export_schedule_html(scheduler, schedule_result, html_path, title=f"{title} schedule")
 
-    if aggregate_em:
-        logging.info("Overall EM: %.3f | Overall F1: %.3f", sum(aggregate_em) / len(aggregate_em), sum(aggregate_f1) / len(aggregate_f1))
+    if aggregate_strict:
+        logging.info(
+            "Overall strict ACC: %.3f | Overall lenient ACC: %.3f",
+            sum(aggregate_strict) / len(aggregate_strict),
+            sum(aggregate_lenient) / len(aggregate_lenient),
+        )
 
 
 if __name__ == "__main__":

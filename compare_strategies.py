@@ -37,12 +37,48 @@ def normalize_answer(text: str) -> str:
     return text
 
 
-def compute_em(prediction: str, references: List[str]) -> float:
+def compute_contains(prediction: str, references: List[str]) -> float:
     pred_norm = normalize_answer(prediction)
     for ref in references:
-        if normalize_answer(ref) == pred_norm:
+        ref_norm = normalize_answer(ref)
+        if not ref_norm:
+            continue
+        if ref_norm in pred_norm or pred_norm in ref_norm:
             return 1.0
     return 0.0
+
+
+def extract_json_answer(text: str) -> Optional[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("```"):
+        parts = cleaned.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                cleaned = part[4:].strip()
+                break
+            if part.startswith("{"):
+                cleaned = part
+                break
+    try:
+        payload = json.loads(cleaned)
+        value = payload.get("answer")
+        if isinstance(value, str):
+            return value.strip()
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
+        if match:
+            snippet = match.group(0)
+            try:
+                payload = json.loads(snippet)
+                value = payload.get("answer")
+                if isinstance(value, str):
+                    return value.strip()
+            except json.JSONDecodeError:
+                pass
+    return None
 
 
 def compute_f1(prediction: str, references: List[str]) -> float:
@@ -67,12 +103,6 @@ def compute_f1(prediction: str, references: List[str]) -> float:
     return best_f1
 
 
-def decode_generated(tokenizer: AutoTokenizer, input_ids: torch.Tensor, generated_ids: torch.Tensor) -> str:
-    gen_tokens = generated_ids[0][input_ids.shape[-1] :]
-    text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-    return text.strip()
-
-
 def generate_answer(
     tokenizer: AutoTokenizer,
     model: AutoModelForCausalLM,
@@ -80,7 +110,7 @@ def generate_answer(
     *,
     max_new_tokens: int,
     temperature: Optional[float] = None,
-) -> Tuple[str, int, int, float]:
+) -> Tuple[str, int, int, float, bool]:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
     gen_kwargs = dict(
@@ -98,12 +128,36 @@ def generate_answer(
     else:
         gen_kwargs.update(do_sample=False)
     with torch.no_grad():
-        generated = model.generate(**inputs, **gen_kwargs)
+        generated = model.generate(
+            **inputs,
+            return_dict_in_generate=True,
+            output_scores=False,
+            **gen_kwargs,
+        )
     elapsed = time.perf_counter() - start
+    sequences = generated.sequences
     prompt_tokens = inputs["input_ids"].shape[-1]
-    generated_tokens = generated.shape[-1] - prompt_tokens
-    text = decode_generated(tokenizer, inputs["input_ids"], generated)
-    return text, prompt_tokens, max(generated_tokens, 0), elapsed
+    generated_part = sequences[:, prompt_tokens:]
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+
+    trimmed_tokens: List[List[int]] = []
+    for row in generated_part:
+        tokens = row.tolist()
+        actual: List[int] = []
+        for token in tokens:
+            if token in (eos_id, pad_id):
+                break
+            actual.append(token)
+        trimmed_tokens.append(actual)
+
+    decoded = [tokenizer.decode(tokens, skip_special_tokens=True).strip() for tokens in trimmed_tokens]
+    raw_text = decoded[0] if decoded else ""
+    extracted = extract_json_answer(raw_text)
+    strict_valid = extracted is not None
+    output_text = extracted if strict_valid else raw_text
+    generated_tokens = len(trimmed_tokens[0]) if trimmed_tokens else 0
+    return output_text, prompt_tokens, generated_tokens, elapsed, strict_valid
 
 
 def build_answer_prompt(
@@ -116,7 +170,9 @@ def build_answer_prompt(
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
         "Provide the shortest possible span from the passage that answers the question.",
-        "If the answer is not explicitly stated, reply with 'unknown'.",
+        "Respond strictly as a JSON object: {\"answer\": \"<span-or-unknown>\"}.",
+        "If uncertain, output {\"answer\": \"unknown\"}.",
+        "Do not add any explanation or text outside the JSON object.",
         "",
         "Background:",
         background.strip(),
@@ -131,25 +187,25 @@ def build_answer_prompt(
             prompt_parts.append(f"Answer: {dep_answer}")
         prompt_parts.append("")
     prompt_parts.append(f"Question ({question.qid}): {question.text.strip()}")
-    prompt_parts.append("Answer:")
+    prompt_parts.append("Answer JSON:")
     return "\n".join(prompt_parts)
 
 
 def build_sequential_prompt(history: str, question: Question) -> str:
-    return f"{history}Question ({question.qid}): {question.text.strip()}\nAnswer:"
+    return f"{history}Question ({question.qid}): {question.text.strip()}\nAnswer JSON:"
 
 
-def evaluate_predictions(predictions: Dict[str, str], lookup: Dict[str, Question]) -> Dict[str, float]:
+def evaluate_predictions(predictions: Dict[str, Tuple[str, bool]], lookup: Dict[str, Question]) -> Dict[str, float]:
     total = len(predictions)
     if total == 0:
-        return {"em": 0.0, "f1": 0.0}
-    em_sum = 0.0
-    f1_sum = 0.0
-    for qid, pred in predictions.items():
+        return {"strict_acc": 0.0, "lenient_acc": 0.0}
+    strict_sum = 0.0
+    lenient_sum = 0.0
+    for qid, (pred, strict_valid) in predictions.items():
         refs = lookup[qid].references
-        em_sum += compute_em(pred, refs)
-        f1_sum += compute_f1(pred, refs)
-    return {"em": em_sum / total, "f1": f1_sum / total}
+        strict_sum += compute_contains(pred, refs) if strict_valid else 0.0
+        lenient_sum += compute_contains(pred, refs)
+    return {"strict_acc": strict_sum / total, "lenient_acc": lenient_sum / total}
 
 
 def build_batch_prompt(background: str, questions: List[Question]) -> str:
@@ -242,28 +298,33 @@ def run_dependency_strategy(
     scheduler.build_dependencies(auto_infer=False)
     schedule = scheduler.schedule()
 
-    answers: Dict[str, str] = {}
+    answer_records: Dict[str, Tuple[str, bool]] = {}
+    answers_text: Dict[str, str] = {}
     total_prompt_tokens = 0
     total_generated_tokens = 0
     total_latency = 0.0
 
     for batch in schedule.batches:
+        batch_latencies: List[float] = []
         for qid in batch.question_ids:
             question = question_lookup[qid]
             deps = sorted(question.dependencies)
-            prompt = build_answer_prompt(background, question, answers, deps, question_lookup)
-            text, p_tokens, g_tokens, elapsed = generate_answer(
+            prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
+            text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
                 tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
             )
-            answers[qid] = text
+            answer_records[qid] = (text, strict_valid)
+            answers_text[qid] = text
             total_prompt_tokens += p_tokens
             total_generated_tokens += g_tokens
-            total_latency += elapsed
+            batch_latencies.append(elapsed)
+        if batch_latencies:
+            total_latency += max(batch_latencies)
 
-    metrics = evaluate_predictions(answers, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup)
     return StrategyResult(
         name="dependency_parallel",
-        answers=answers,
+        answers=answers_text,
         prompt_tokens=total_prompt_tokens,
         generated_tokens=total_generated_tokens,
         latency=total_latency,
@@ -281,7 +342,8 @@ def run_sequential_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
-    answers: Dict[str, str] = {}
+    answer_records: Dict[str, Tuple[str, bool]] = {}
+    answers_text: Dict[str, str] = {}
     total_prompt_tokens = 0
     total_generated_tokens = 0
     total_latency = 0.0
@@ -289,7 +351,8 @@ def run_sequential_strategy(
     history = textwrap.dedent(
         f"""You are a helpful assistant that answers questions given a background passage.
 Provide the shortest possible span from the passage that answers each question.
-If the answer is not explicitly stated, reply with 'unknown'.
+Respond strictly as JSON: {{\"answer\": \"<span-or-unknown>\"}}.
+If the answer is not explicitly stated, return {{\"answer\": \"unknown\"}}.
 
 Background:
 {background.strip()}
@@ -299,22 +362,24 @@ Background:
 
     for question in questions:
         prompt = build_sequential_prompt(history, question)
-        text, p_tokens, g_tokens, elapsed = generate_answer(
+        text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
             tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
         )
-        answers[question.qid] = text
+        answer_records[question.qid] = (text, strict_valid)
+        answers_text[question.qid] = text
         total_prompt_tokens += p_tokens
         total_generated_tokens += g_tokens
         total_latency += elapsed
+        safe_text = text.replace('"', '\\"')
         history = (
             f"{history}Question ({question.qid}): {question.text.strip()}\n"
-            f"Answer: {text}\n\n"
+            f"Answer JSON: {{\"answer\": \"{safe_text}\"}}\n\n"
         )
 
-    metrics = evaluate_predictions(answers, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup)
     return StrategyResult(
         name="sequential",
-        answers=answers,
+        answers=answers_text,
         prompt_tokens=total_prompt_tokens,
         generated_tokens=total_generated_tokens,
         latency=total_latency,
@@ -332,11 +397,12 @@ def run_full_batch_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     prompt = build_batch_prompt(background, questions)
-    text, p_tokens, g_tokens, elapsed = generate_answer(
+    text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
         tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
     )
     answers = parse_batch_answers(text, questions)
-    metrics = evaluate_predictions(answers, {q.qid: q for q in questions})
+    answer_records = {qid: (ans, bool(ans.strip())) for qid, ans in answers.items()}
+    metrics = evaluate_predictions(answer_records, {q.qid: q for q in questions})
     return StrategyResult(
         name="full_batch",
         answers=answers,
@@ -351,8 +417,8 @@ def run_full_batch_strategy(
 def summarize_results(results: List[StrategyResult]) -> str:
     headers = [
         "Strategy",
-        "EM",
-        "F1",
+        "Strict ACC",
+        "Lenient ACC",
         "PromptTok",
         "GenTok",
         "Latency(s)",
@@ -363,8 +429,8 @@ def summarize_results(results: List[StrategyResult]) -> str:
         rows.append(
             [
                 res.name,
-                f"{res.metrics['em']:.3f}",
-                f"{res.metrics['f1']:.3f}",
+                f"{res.metrics['strict_acc']:.3f}",
+                f"{res.metrics['lenient_acc']:.3f}",
                 res.prompt_tokens,
                 res.generated_tokens,
                 f"{res.latency:.2f}",
@@ -396,6 +462,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=96, help="Max new tokens for answer generation.")
     parser.add_argument("--log-level", default="INFO", help="Logging level.")
     parser.add_argument("--no-llm-deps", action="store_true", help="Force heuristic dependency generator.")
+    parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
     return parser.parse_args()
 
 
@@ -430,6 +497,7 @@ def main() -> None:
         logging.info("Using local LLM dependency generator.")
 
     overall_results: Dict[str, List[StrategyResult]] = {}
+    serialized_contexts: List[dict] = []
 
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
@@ -469,6 +537,22 @@ def main() -> None:
         overall_results[title] = [seq_res, batch_res, dep_res]
         print(f"\n=== Context: {title} ===")
         print(summarize_results([seq_res, batch_res, dep_res]))
+        serialized_contexts.append(
+            {
+                "context": title,
+                "strategies": [
+                    {
+                        "name": res.name,
+                        "metrics": res.metrics,
+                        "prompt_tokens": res.prompt_tokens,
+                        "generated_tokens": res.generated_tokens,
+                        "latency": res.latency,
+                        "batches": res.batches,
+                    }
+                    for res in (seq_res, batch_res, dep_res)
+                ],
+            }
+        )
 
     # aggregate
     strategy_totals: Dict[str, Dict[str, float]] = {}
@@ -476,38 +560,68 @@ def main() -> None:
         for res in results:
             stats = strategy_totals.setdefault(
                 res.name,
-                {"em": 0.0, "f1": 0.0, "prompt_tokens": 0, "generated_tokens": 0, "latency": 0.0, "count": 0, "batches": 0},
+                {
+                    "strict": 0.0,
+                    "lenient": 0.0,
+                    "prompt_tokens": 0,
+                    "generated_tokens": 0,
+                    "latency": 0.0,
+                    "count": 0,
+                    "batches": 0,
+                },
             )
-            stats["em"] += res.metrics["em"]
-            stats["f1"] += res.metrics["f1"]
+            stats["strict"] += res.metrics["strict_acc"]
+            stats["lenient"] += res.metrics["lenient_acc"]
             stats["prompt_tokens"] += res.prompt_tokens
             stats["generated_tokens"] += res.generated_tokens
             stats["latency"] += res.latency
             stats["batches"] += res.batches
             stats["count"] += 1
 
+    summary_rows = []
     if strategy_totals:
         print("\n=== Overall Averages ===")
-        headers = ["Strategy", "EM", "F1", "PromptTok", "GenTok", "Latency(s)", "Batches"]
+        headers = ["Strategy", "Strict ACC", "Lenient ACC", "PromptTok", "GenTok", "Latency(s)", "Batches"]
         rows = []
         for name, stats in strategy_totals.items():
             count = stats["count"]
             rows.append(
                 [
                     name,
-                    f"{stats['em'] / count:.3f}",
-                    f"{stats['f1'] / count:.3f}",
+                    f"{stats['strict'] / count:.3f}",
+                    f"{stats['lenient'] / count:.3f}",
                     int(stats["prompt_tokens"] / count),
                     int(stats["generated_tokens"] / count),
                     f"{stats['latency'] / count:.2f}",
                     f"{stats['batches'] / count:.2f}",
                 ]
             )
+            summary_rows.append(
+                {
+                    "name": name,
+                    "strict_acc": stats["strict"] / count,
+                    "lenient_acc": stats["lenient"] / count,
+                    "prompt_tokens": stats["prompt_tokens"] / count,
+                    "generated_tokens": stats["generated_tokens"] / count,
+                    "latency": stats["latency"] / count,
+                    "batches": stats["batches"] / count,
+                }
+            )
         widths = [max(len(str(cell)) for cell in column) for column in zip(headers, *rows)]
         header_line = " | ".join(h.ljust(widths[idx]) for idx, h in enumerate(headers))
         separator = "-+-".join("-" * width for width in widths)
         row_lines = [" | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)) for row in rows]
         print("\n".join([header_line, separator, *row_lines]))
+
+    if args.json_out:
+        payload = {
+            "contexts": serialized_contexts,
+            "averages": summary_rows,
+        }
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        with args.json_out.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logging.info("Wrote metrics JSON to %s", args.json_out)
 
 
 if __name__ == "__main__":

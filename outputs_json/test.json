@@ -1,0 +1,71 @@
+{
+  "contexts": [
+    {
+      "context": "John_von_Neumann",
+      "strategies": [
+        {
+          "name": "sequential",
+          "metrics": {
+            "strict_acc": 0.6666666666666666,
+            "lenient_acc": 0.6666666666666666
+          },
+          "prompt_tokens": 696,
+          "generated_tokens": 96,
+          "latency": 9.583610124886036,
+          "batches": 3
+        },
+        {
+          "name": "full_batch",
+          "metrics": {
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
+          },
+          "prompt_tokens": 216,
+          "generated_tokens": 96,
+          "latency": 7.933854834060185,
+          "batches": 1
+        },
+        {
+          "name": "dependency_parallel",
+          "metrics": {
+            "strict_acc": 0.6666666666666666,
+            "lenient_acc": 0.6666666666666666
+          },
+          "prompt_tokens": 653,
+          "generated_tokens": 96,
+          "latency": 5.492540417006239,
+          "batches": 2
+        }
+      ]
+    }
+  ],
+  "averages": [
+    {
+      "name": "sequential",
+      "strict_acc": 0.6666666666666666,
+      "lenient_acc": 0.6666666666666666,
+      "prompt_tokens": 696.0,
+      "generated_tokens": 96.0,
+      "latency": 9.583610124886036,
+      "batches": 3.0
+    },
+    {
+      "name": "full_batch",
+      "strict_acc": 1.0,
+      "lenient_acc": 1.0,
+      "prompt_tokens": 216.0,
+      "generated_tokens": 96.0,
+      "latency": 7.933854834060185,
+      "batches": 1.0
+    },
+    {
+      "name": "dependency_parallel",
+      "strict_acc": 0.6666666666666666,
+      "lenient_acc": 0.6666666666666666,
+      "prompt_tokens": 653.0,
+      "generated_tokens": 96.0,
+      "latency": 5.492540417006239,
+      "batches": 2.0
+    }
+  ]
+}

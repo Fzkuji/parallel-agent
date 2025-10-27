@@ -1,0 +1,147 @@
+{
+  "contexts": [
+    {
+      "context": "John_von_Neumann",
+      "strategies": [
+        {
+          "name": "sequential",
+          "metrics": {
+            "acc": 0.6666666666666666,
+            "f1": 0.1972332884315917
+          },
+          "prompt_tokens": 970,
+          "generated_tokens": 384,
+          "latency": 36.92379675002303,
+          "batches": 3
+        },
+        {
+          "name": "full_batch",
+          "metrics": {
+            "acc": 0.6666666666666666,
+            "f1": 0.6866096866096866
+          },
+          "prompt_tokens": 216,
+          "generated_tokens": 384,
+          "latency": 30.520354082924314,
+          "batches": 1
+        },
+        {
+          "name": "dependency_parallel",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.1896799496799497
+          },
+          "prompt_tokens": 538,
+          "generated_tokens": 384,
+          "latency": 28.978442416875623,
+          "batches": 1
+        }
+      ]
+    },
+    {
+      "context": "American_Idol",
+      "strategies": [
+        {
+          "name": "sequential",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.039210636727518844
+          },
+          "prompt_tokens": 1976,
+          "generated_tokens": 640,
+          "latency": 57.47906608309131,
+          "batches": 5
+        },
+        {
+          "name": "full_batch",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.780952380952381
+          },
+          "prompt_tokens": 170,
+          "generated_tokens": 640,
+          "latency": 52.22201041702647,
+          "batches": 1
+        },
+        {
+          "name": "dependency_parallel",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.03313076822252155
+          },
+          "prompt_tokens": 652,
+          "generated_tokens": 640,
+          "latency": 50.766241665929556,
+          "batches": 2
+        }
+      ]
+    },
+    {
+      "context": "Wood",
+      "strategies": [
+        {
+          "name": "sequential",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.032622412380853436
+          },
+          "prompt_tokens": 2589,
+          "generated_tokens": 640,
+          "latency": 63.5777629170334,
+          "batches": 5
+        },
+        {
+          "name": "full_batch",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.8666666666666666
+          },
+          "prompt_tokens": 301,
+          "generated_tokens": 640,
+          "latency": 58.94471320800949,
+          "batches": 1
+        },
+        {
+          "name": "dependency_parallel",
+          "metrics": {
+            "acc": 1.0,
+            "f1": 0.029604021571968942
+          },
+          "prompt_tokens": 1239,
+          "generated_tokens": 640,
+          "latency": 54.75488854118157,
+          "batches": 2
+        }
+      ]
+    }
+  ],
+  "averages": [
+    {
+      "name": "sequential",
+      "acc": 0.8888888888888888,
+      "f1": 0.089688779179988,
+      "prompt_tokens": 1845.0,
+      "generated_tokens": 554.6666666666666,
+      "latency": 52.66020858338258,
+      "batches": 4.333333333333333
+    },
+    {
+      "name": "full_batch",
+      "acc": 0.8888888888888888,
+      "f1": 0.7780762447429114,
+      "prompt_tokens": 229.0,
+      "generated_tokens": 554.6666666666666,
+      "latency": 47.229025902653426,
+      "batches": 1.0
+    },
+    {
+      "name": "dependency_parallel",
+      "acc": 1.0,
+      "f1": 0.08413824649148006,
+      "prompt_tokens": 809.6666666666666,
+      "generated_tokens": 554.6666666666666,
+      "latency": 44.83319087466225,
+      "batches": 1.6666666666666667
+    }
+  ]
+}
