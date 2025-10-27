@@ -11,6 +11,27 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that answers questions given a background passage."
+PLANNER_SYSTEM_PROMPT = "You are an expert planner. Return only JSON describing dependencies between questions."
+
+
+def build_chat_prompt(
+    tokenizer: AutoTokenizer,
+    user_prompt: str,
+    system_prompt: Optional[str] = DEFAULT_SYSTEM_PROMPT,
+) -> str:
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -205,7 +226,8 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
         metadata: Optional[dict] = None,
     ) -> List[EdgeCandidate]:
         prompt = build_dependency_prompt(background, questions)
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        chat_prompt = build_chat_prompt(self.tokenizer, prompt, system_prompt=PLANNER_SYSTEM_PROMPT)
+        inputs = self.tokenizer(chat_prompt, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             generated = self.model.generate(
                 **inputs,
@@ -278,7 +300,8 @@ def answer_question(
     *,
     max_new_tokens: int = 96,
 ) -> Tuple[str, int, bool, float]:
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    chat_prompt = build_chat_prompt(tokenizer, prompt, system_prompt=DEFAULT_SYSTEM_PROMPT)
+    inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
     with torch.no_grad():
         generated = model.generate(

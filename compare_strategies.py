@@ -26,6 +26,8 @@ from python import (
 )
 from run_qwen_parallel import (
     LocalLLMDependencyGenerator,
+    DEFAULT_SYSTEM_PROMPT,
+    build_chat_prompt,
 )
 
 
@@ -111,7 +113,8 @@ def generate_answer(
     max_new_tokens: int,
     temperature: Optional[float] = None,
 ) -> Tuple[str, int, int, float, bool]:
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    chat_prompt = build_chat_prompt(tokenizer, prompt, system_prompt=DEFAULT_SYSTEM_PROMPT)
+    inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
