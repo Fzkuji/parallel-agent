@@ -195,7 +195,7 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         f"""
         你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
-        以 JSON 形式列出问题之间的依赖关系。只输出以下结构，不要额外解释：
+        以 JSON 形式列出问题之间的依赖关系。直接输出以下结构：
         {{
           "edges": [
             {{"source": "Q1", "target": "Q3", "confidence": 0.72}},
@@ -208,6 +208,7 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         - confidence 取值 0~1 的数字。
         - 无需依赖的题目可省略。
         - 禁止引用不存在的 ID，禁止循环依赖。
+        - 不需要额外分析，直接给出依赖图json
 
         背景：
         {background.strip()}
