@@ -30,6 +30,7 @@ def build_chat_prompt(
         prompt_parts.append(f"System: {system}")
     prompt_parts.append(f"User: {user}")
     prompt_parts.append("Assistant:")
+    prompt_parts.append("<think></think>")
     return "\n\n".join(prompt_parts)
 
 import torch
