@@ -447,6 +447,33 @@ def summarize_results(results: List[StrategyResult]) -> str:
     return "\n".join([header_line, separator, *row_lines])
 
 
+def print_answer_table(
+    questions: List[Question],
+    sequential: StrategyResult,
+    full_batch: StrategyResult,
+    dependency: StrategyResult,
+) -> None:
+    headers = ["QID", "Gold", "Sequential", "Full Batch", "Parallel"]
+    rows = []
+    for question in questions:
+        gold = "; ".join(question.references) if question.references else ""
+        rows.append(
+            [
+                question.qid,
+                gold,
+                sequential.answers.get(question.qid, ""),
+                full_batch.answers.get(question.qid, ""),
+                dependency.answers.get(question.qid, ""),
+            ]
+        )
+    widths = [max(len(str(cell)) for cell in column) for column in zip(headers, *rows)]
+    header_line = " | ".join(h.ljust(widths[idx]) for idx, h in enumerate(headers))
+    separator = "-+-".join("-" * width for width in widths)
+    row_lines = [" | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)) for row in rows]
+    print("Answer comparison:")
+    print("\n".join([header_line, separator, *row_lines]))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare sequential, full-batch, and dependency-aware QA strategies using a local Qwen model.",
@@ -543,6 +570,7 @@ def main() -> None:
         overall_results[title] = [seq_res, batch_res, dep_res]
         print(f"\n=== Context: {title} ===")
         print(summarize_results([seq_res, batch_res, dep_res]))
+        print_answer_table(questions, seq_res, batch_res, dep_res)
         serialized_contexts.append(
             {
                 "context": title,
