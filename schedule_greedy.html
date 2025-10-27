@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>Greedy 调度可视化</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      margin: 20px;
+      color: #1f2933;
+      background-color: #f8fafc;
+    }
+    h1 {
+      margin-bottom: 0.25rem;
+    }
+    .metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 16px;
+      font-size: 0.95rem;
+    }
+    .metrics span {
+      background: #e2e8f0;
+      padding: 6px 12px;
+      border-radius: 999px;
+    }
+    .slider {
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .slider input[type=range] {
+      width: 320px;
+    }
+    svg {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+    }
+    .edge {
+      stroke: #cbd5e1;
+      stroke-width: 2px;
+      opacity: 0.7;
+    }
+    .edge.done {
+      stroke: #0ea5e9;
+      opacity: 0.9;
+    }
+    .edge.current {
+      stroke: #f97316;
+      opacity: 0.95;
+    }
+    .node {
+      stroke: #1e293b;
+      stroke-width: 2px;
+    }
+    .node.pending {
+      fill: #f1f5f9;
+    }
+    .node.done {
+      fill: #0ea5e9;
+    }
+    .node.current {
+      fill: #f97316;
+    }
+    text {
+      font-size: 12px;
+      text-anchor: middle;
+    }
+    text.id {
+      font-weight: 600;
+      font-size: 14px;
+      fill: #0f172a;
+    }
+    text.label {
+      fill: #1f2937;
+    }
+    .info {
+      margin-top: 16px;
+      padding: 12px;
+      background: #e0f2fe;
+      border-left: 4px solid #0284c7;
+      border-radius: 4px;
+      font-size: 0.95rem;
+      max-width: 900px;
+      white-space: pre-line;
+    }
+  </style>
+</head>
+<body>
+  <h1>Greedy 调度可视化</h1>
+  <div class="metrics" id="metrics"></div>
+  <div class="slider">
+    <label for="batchSlider">批次选择：</label>
+    <input type="range" min="0" id="batchSlider" />
+    <span id="batchLabel"></span>
+  </div>
+  <svg id="graph"></svg>
+  <div class="info" id="batchInfo"></div>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script>
+    const data = {"title": "Greedy 调度可视化", "nodes": [{"id": "q1", "label": "总结该并行推理项目的整体目标与愿景，强调需要支持多分支同步生成的原因。", "short_label": "总结该并行推理项目的整体目标…", "priority": 1.05, "answer_tokens": 110, "prompt_tokens": 27, "dependencies": [], "layer": 0, "x": 110.0, "y": 70.0, "depth": 0}, {"id": "q2", "label": "列出从最初试验到当前版本的关键迭代里程碑，包括时间与主要改动。", "short_label": "列出从最初试验到当前版本的关…", "priority": 1.35, "answer_tokens": 72, "prompt_tokens": 24, "dependencies": [], "layer": 0, "x": 110.0, "y": 298.33, "depth": 0}, {"id": "q3", "label": "梳理系统的核心技术模块，例如调度器、缓存管理、掩码构造等，并说明模块职责。", "short_label": "梳理系统的核心技术模块，例如…", "priority": 1.2, "answer_tokens": 58, "prompt_tokens": 27, "dependencies": [], "layer": 0, "x": 110.0, "y": 526.67, "depth": 0}, {"id": "q4", "label": "对比目标愿景与里程碑完成度，分析当前方案与最早设计的差距。", "short_label": "对比目标愿景与里程碑完成度，…", "priority": 1.6, "answer_tokens": 78, "prompt_tokens": 23, "dependencies": ["q1", "q2"], "layer": 1, "x": 336.67, "y": 298.33, "depth": 1}, {"id": "q5", "label": "结合迭代里程碑与模块划分，评估在训练阶段遇到的主要瓶颈以及对应的解决策略。", "short_label": "结合迭代里程碑与模块划分，评…", "priority": 1.55, "answer_tokens": 82, "prompt_tokens": 29, "dependencies": ["q2", "q3"], "layer": 1, "x": 336.67, "y": 526.67, "depth": 1}, {"id": "q6", "label": "描述线上部署环境的约束，包括 GPU 规格、并发限制与内存水位。", "short_label": "描述线上部署环境的约束，包括…", "priority": 0.95, "answer_tokens": 96, "prompt_tokens": 23, "dependencies": [], "layer": 0, "x": 110.0, "y": 755.0, "depth": 0}, {"id": "q7", "label": "基于差距分析与训练瓶颈，提出三条优先级最高的工程优化建议。", "short_label": "基于差距分析与训练瓶颈，提出…", "priority": 1.45, "answer_tokens": 88, "prompt_tokens": 23, "dependencies": ["q4", "q5"], "layer": 2, "x": 563.33, "y": 412.5, "depth": 2}, {"id": "q8", "label": "评估部署环境对调度策略的影响，指出需要额外监控的风险点。", "short_label": "评估部署环境对调度策略的影响…", "priority": 1.15, "answer_tokens": 70, "prompt_tokens": 22, "dependencies": ["q3", "q6"], "layer": 1, "x": 336.67, "y": 755.0, "depth": 1}, {"id": "q9", "label": "汇总前面所有回答，写出一份给团队高层的并行推理路线图摘要。", "short_label": "汇总前面所有回答，写出一份给…", "priority": 1.8, "answer_tokens": 140, "prompt_tokens": 23, "dependencies": ["q4", "q5", "q7", "q8"], "layer": 3, "x": 790.0, "y": 412.5, "depth": 3}, {"id": "q10", "label": "补充一段 FAQ，回答团队成员最常问的三类问题。", "short_label": "补充一段 FAQ，回答团队成…", "priority": 1.25, "answer_tokens": 54, "prompt_tokens": 17, "dependencies": ["q2", "q6"], "layer": 1, "x": 336.67, "y": 70.0, "depth": 1}], "edges": [{"source": "q1", "target": "q4"}, {"source": "q2", "target": "q10"}, {"source": "q2", "target": "q5"}, {"source": "q2", "target": "q4"}, {"source": "q3", "target": "q5"}, {"source": "q3", "target": "q8"}, {"source": "q5", "target": "q9"}, {"source": "q5", "target": "q7"}, {"source": "q4", "target": "q9"}, {"source": "q4", "target": "q7"}, {"source": "q6", "target": "q10"}, {"source": "q6", "target": "q8"}, {"source": "q7", "target": "q9"}, {"source": "q8", "target": "q9"}], "batches": [{"id": 0, "nodes": ["q1", "q2", "q3", "q6"], "depth": 0, "value": 4.55, "priority_sum": 4.55, "tokens": {"background": 69, "incremental": 101, "generation": 336, "total": 506}, "estimated_latency": 268.0}, {"id": 1, "nodes": ["q10", "q4", "q5", "q8"], "depth": 1, "value": 2.775, "priority_sum": 5.55, "tokens": {"background": 69, "incremental": 789, "generation": 284, "total": 1142}, "estimated_latency": 784.8}, {"id": 2, "nodes": ["q7"], "depth": 2, "value": 0.483, "priority_sum": 1.45, "tokens": {"background": 69, "incremental": 199, "generation": 88, "total": 356}, "estimated_latency": 320.0}, {"id": 3, "nodes": ["q9"], "depth": 3, "value": 0.45, "priority_sum": 1.8, "tokens": {"background": 69, "incremental": 373, "generation": 140, "total": 582}, "estimated_latency": 521.6}], "metrics": {"total_background_tokens": 276, "total_incremental_tokens": 1462, "total_generation_tokens": 848, "total_compute_tokens": 2586, "total_estimated_latency": 1894.4, "value_score": 8.258}, "config": {"width": 900, "height": 825}};
+    const svg = d3.select("#graph")
+      .attr("width", data.config.width)
+      .attr("height", data.config.height);
+
+    const nodeById = Object.fromEntries(data.nodes.map(d => [d.id, d]));
+
+    const edges = svg.selectAll("line")
+      .data(data.edges)
+      .enter()
+      .append("line")
+      .attr("class", "edge")
+      .attr("x1", d => nodeById[d.source].x)
+      .attr("y1", d => nodeById[d.source].y)
+      .attr("x2", d => nodeById[d.target].x)
+      .attr("y2", d => nodeById[d.target].y);
+
+    const nodeGroups = svg.selectAll("g.node-group")
+      .data(data.nodes)
+      .enter()
+      .append("g")
+      .attr("class", "node-group")
+      .attr("transform", d => `translate(${d.x}, ${d.y})`);
+
+    nodeGroups.append("circle")
+      .attr("r", 28)
+      .attr("class", "node pending");
+
+    nodeGroups.append("text")
+      .attr("class", "id")
+      .attr("y", -2)
+      .text(d => d.id);
+
+    nodeGroups.append("text")
+      .attr("class", "label")
+      .attr("y", 16)
+      .text(d => d.short_label);
+
+    nodeGroups.append("title")
+      .text(d => `${d.id}\n优先级: ${d.priority} | 回答 tokens: ${d.answer_tokens}`);
+
+    const slider = document.getElementById("batchSlider");
+    slider.setAttribute("max", data.batches.length);
+    slider.value = 0;
+
+    const batchLabel = document.getElementById("batchLabel");
+    const batchInfo = document.getElementById("batchInfo");
+    const metricsContainer = document.getElementById("metrics");
+
+    const metricsEntries = [
+      ["Value score", data.metrics.value_score],
+      ["Compute tokens", data.metrics.total_compute_tokens],
+      ["Background tokens", data.metrics.total_background_tokens],
+      ["Incremental tokens", data.metrics.total_incremental_tokens],
+      ["Generation tokens", data.metrics.total_generation_tokens],
+      ["Estimated latency", data.metrics.total_estimated_latency]
+    ];
+    metricsEntries.forEach(([label, value]) => {
+      const span = document.createElement("span");
+      span.textContent = `${label}: ${value}`;
+      metricsContainer.appendChild(span);
+    });
+
+    function update(step) {
+      const executed = new Set();
+      for (let i = 0; i < step; i += 1) {
+        data.batches[i].nodes.forEach(n => executed.add(n));
+      }
+      const current = new Set(step > 0 ? data.batches[step - 1].nodes : []);
+
+      nodeGroups.selectAll("circle")
+        .attr("class", d => {
+          if (current.has(d.id)) return "node current";
+          if (executed.has(d.id)) return "node done";
+          return "node pending";
+        });
+
+      nodeGroups.selectAll("text.id")
+        .attr("fill", d => current.has(d.id) ? "#ffffff" : executed.has(d.id) ? "#0b3d3d" : "#0f172a");
+
+      nodeGroups.selectAll("text.label")
+        .attr("fill", d => current.has(d.id) ? "#fff7ed" : executed.has(d.id) ? "#022c22" : "#1f2937");
+
+      edges.attr("class", d => {
+        if (current.has(d.target)) return "edge current";
+        if (executed.has(d.target)) return "edge done";
+        return "edge";
+      });
+
+      if (step === 0) {
+        batchLabel.textContent = "步骤 0：未执行任何批次";
+        batchInfo.textContent = "拖动滑块以查看每个批次的节点、token 成本和估计延迟。";
+      } else {
+        const batch = data.batches[step - 1];
+        const lines = [
+          `批次 ${batch.id} ，节点：${batch.nodes.join(", ")}`,
+          `深度：${batch.depth} | Value score：${batch.value.toFixed(3)} | 优先级和：${batch.priority_sum.toFixed(3)}`,
+          `Token：background={batch.tokens.background}, incremental={batch.tokens.incremental}, generation={batch.tokens.generation}, total={batch.tokens.total}`,
+          `估计延迟：${batch.estimated_latency.toFixed(1)}`
+        ];
+        batchLabel.textContent = `步骤 ${step}：批次 ${batch.id}`;
+        batchInfo.textContent = lines.join("\n");
+      }
+    }
+
+    slider.addEventListener("input", (event) => update(Number(event.target.value)));
+    update(0);
+  </script>
+</body>
+</html>
