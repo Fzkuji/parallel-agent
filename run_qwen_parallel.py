@@ -13,7 +13,9 @@ from typing import Dict, List, Optional, Tuple
 
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that answers questions given a background passage."
-PLANNER_SYSTEM_PROMPT = "You are an expert planner. Return only JSON describing dependencies between questions."
+PLANNER_SYSTEM_PROMPT = (
+    "You are an expert planner. Analyse the questions and output only a JSON object describing dependencies."
+)
 
 
 def build_chat_prompt(
@@ -21,16 +23,14 @@ def build_chat_prompt(
     user_prompt: str,
     system_prompt: Optional[str] = DEFAULT_SYSTEM_PROMPT,
 ) -> str:
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_prompt})
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    system = (system_prompt or "").strip()
+    user = user_prompt.strip()
+    prompt_parts = []
+    if system:
+        prompt_parts.append(f"System: {system}")
+    prompt_parts.append(f"User: {user}")
+    prompt_parts.append("Assistant:")
+    return "\n\n".join(prompt_parts)
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -159,18 +159,33 @@ def extract_json_from_text(text: str) -> dict:
             if part.startswith("json"):
                 cleaned = part[4:].strip()
                 break
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        # attempt to locate JSON object within text
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            snippet = match.group(0)
-            try:
-                return json.loads(snippet)
-            except json.JSONDecodeError:
-                pass
-        raise ValueError(f"Failed to parse JSON: {cleaned}") from exc
+    def try_parse(candidate: str) -> Optional[dict]:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+
+    parsed = try_parse(cleaned)
+    if parsed is not None:
+        return parsed
+
+    # attempt to find first balanced JSON object within text
+    start_positions = [idx for idx, ch in enumerate(cleaned) if ch == "{"]
+    for start in start_positions:
+        depth = 0
+        for idx in range(start, len(cleaned)):
+            ch = cleaned[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start : idx + 1]
+                    parsed = try_parse(candidate)
+                    if parsed is not None:
+                        return parsed
+                    break
+    raise ValueError(f"Failed to parse JSON: {cleaned}")
 
 
 def build_dependency_prompt(background: str, questions: List[Question]) -> str:
@@ -179,7 +194,7 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         f"""
         你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
-        请直接输出符合下列格式的 JSON（不要包含任何额外说明）：
+        以 JSON 形式列出问题之间的依赖关系。只输出以下结构，不要额外解释：
         {{
           "edges": [
             {{"source": "Q1", "target": "Q3", "confidence": 0.72}},
@@ -188,15 +203,15 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         }}
 
         规则：
-        1. 仅使用给定的问题 ID 作为 source/target。
-        2. confidence 取值 0~1，使用数字。
-        3. 如果某问题不依赖其他问题，可不在列表中出现。
-        4. 禁止引用不存在的 ID，禁止出现循环依赖。
+        - 只能使用给定问题的 ID 作为 source/target。
+        - confidence 取值 0~1 的数字。
+        - 无需依赖的题目可省略。
+        - 禁止引用不存在的 ID，禁止循环依赖。
 
         背景：
         {background.strip()}
 
-        问题列表：
+        问题：
         {os.linesep.join(question_lines)}
         """
     ).strip()

@@ -6,34 +6,34 @@
         {
           "name": "sequential",
           "metrics": {
-            "strict_acc": 0.6666666666666666,
+            "strict_acc": 0.3333333333333333,
             "lenient_acc": 0.6666666666666666
           },
-          "prompt_tokens": 696,
+          "prompt_tokens": 812,
           "generated_tokens": 96,
-          "latency": 9.583610124886036,
+          "latency": 10.080334666999988,
           "batches": 3
         },
         {
           "name": "full_batch",
           "metrics": {
-            "strict_acc": 1.0,
+            "strict_acc": 0.0,
             "lenient_acc": 1.0
           },
-          "prompt_tokens": 216,
+          "prompt_tokens": 235,
           "generated_tokens": 96,
-          "latency": 7.933854834060185,
+          "latency": 8.269907250069082,
           "batches": 1
         },
         {
           "name": "dependency_parallel",
           "metrics": {
-            "strict_acc": 0.6666666666666666,
-            "lenient_acc": 0.6666666666666666
+            "strict_acc": 0.3333333333333333,
+            "lenient_acc": 0.3333333333333333
           },
-          "prompt_tokens": 653,
+          "prompt_tokens": 732,
           "generated_tokens": 96,
-          "latency": 5.492540417006239,
+          "latency": 5.576763125020079,
           "batches": 2
         }
       ]
@@ -42,29 +42,29 @@
   "averages": [
     {
       "name": "sequential",
-      "strict_acc": 0.6666666666666666,
+      "strict_acc": 0.3333333333333333,
       "lenient_acc": 0.6666666666666666,
-      "prompt_tokens": 696.0,
+      "prompt_tokens": 812.0,
       "generated_tokens": 96.0,
-      "latency": 9.583610124886036,
+      "latency": 10.080334666999988,
       "batches": 3.0
     },
     {
       "name": "full_batch",
-      "strict_acc": 1.0,
+      "strict_acc": 0.0,
       "lenient_acc": 1.0,
-      "prompt_tokens": 216.0,
+      "prompt_tokens": 235.0,
       "generated_tokens": 96.0,
-      "latency": 7.933854834060185,
+      "latency": 8.269907250069082,
       "batches": 1.0
     },
     {
       "name": "dependency_parallel",
-      "strict_acc": 0.6666666666666666,
-      "lenient_acc": 0.6666666666666666,
-      "prompt_tokens": 653.0,
+      "strict_acc": 0.3333333333333333,
+      "lenient_acc": 0.3333333333333333,
+      "prompt_tokens": 732.0,
       "generated_tokens": 96.0,
-      "latency": 5.492540417006239,
+      "latency": 5.576763125020079,
       "batches": 2.0
     }
   ]
