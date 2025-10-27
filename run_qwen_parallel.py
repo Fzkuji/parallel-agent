@@ -159,12 +159,12 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
         输出格式：
-        {
+        {{
           "edges": [
-            {"source": "Q1", "target": "Q3", "confidence": 0.72},
+            {{"source": "Q1", "target": "Q3", "confidence": 0.72}},
             ...
           ]
-        }
+        }}
 
         约束：
         - 只能引用给定的问题 ID。
