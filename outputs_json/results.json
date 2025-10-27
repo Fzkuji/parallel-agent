@@ -6,35 +6,50 @@
         {
           "name": "sequential",
           "metrics": {
-            "acc": 0.6666666666666666,
-            "f1": 0.1972332884315917
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 970,
-          "generated_tokens": 384,
-          "latency": 36.92379675002303,
-          "batches": 3
+          "prompt_tokens": 764,
+          "generated_tokens": 65,
+          "latency": 7.37528725003358,
+          "batches": 3,
+          "answers": {
+            "Q1": "continuous geometry",
+            "Q2": "instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]",
+            "Q3": "the projections of the hyperfinite type II factor"
+          }
         },
         {
           "name": "full_batch",
           "metrics": {
-            "acc": 0.6666666666666666,
-            "f1": 0.6866096866096866
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 216,
-          "generated_tokens": 384,
-          "latency": 30.520354082924314,
-          "batches": 1
+          "prompt_tokens": 237,
+          "generated_tokens": 59,
+          "latency": 5.050506624975242,
+          "batches": 1,
+          "answers": {
+            "Q1": "continuous geometry",
+            "Q2": "instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]",
+            "Q3": "the projections of the hyperfinite type II factor"
+          }
         },
         {
           "name": "dependency_parallel",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.1896799496799497
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 538,
-          "generated_tokens": 384,
-          "latency": 28.978442416875623,
-          "batches": 1
+          "prompt_tokens": 753,
+          "generated_tokens": 77,
+          "latency": 5.947548082913272,
+          "batches": 2,
+          "answers": {
+            "Q1": "continuous geometry",
+            "Q2": "continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1].",
+            "Q3": "the projections of the hyperfinite type II factor"
+          }
         }
       ]
     },
@@ -44,35 +59,56 @@
         {
           "name": "sequential",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.039210636727518844
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 1976,
-          "generated_tokens": 640,
-          "latency": 57.47906608309131,
-          "batches": 5
+          "prompt_tokens": 983,
+          "generated_tokens": 41,
+          "latency": 5.144048706977628,
+          "batches": 5,
+          "answers": {
+            "Q1": "Diana DeGarmo",
+            "Q2": "five",
+            "Q3": "three",
+            "Q4": "Phillips",
+            "Q5": "five"
+          }
         },
         {
           "name": "full_batch",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.780952380952381
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 170,
-          "generated_tokens": 640,
-          "latency": 52.22201041702647,
-          "batches": 1
+          "prompt_tokens": 191,
+          "generated_tokens": 29,
+          "latency": 2.801519083091989,
+          "batches": 1,
+          "answers": {
+            "Q1": "Diana DeGarmo",
+            "Q2": "five",
+            "Q3": "three",
+            "Q4": "Phillips",
+            "Q5": "five"
+          }
         },
         {
           "name": "dependency_parallel",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.03313076822252155
+            "strict_acc": 0.8,
+            "lenient_acc": 0.8
           },
-          "prompt_tokens": 652,
-          "generated_tokens": 640,
-          "latency": 50.766241665929556,
-          "batches": 2
+          "prompt_tokens": 902,
+          "generated_tokens": 41,
+          "latency": 4.991776874870993,
+          "batches": 5,
+          "answers": {
+            "Q1": "Diana DeGarmo",
+            "Q2": "five",
+            "Q3": "five",
+            "Q4": "Phillips",
+            "Q5": "five"
+          }
         }
       ]
     },
@@ -82,35 +118,56 @@
         {
           "name": "sequential",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.032622412380853436
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 2589,
-          "generated_tokens": 640,
-          "latency": 63.5777629170334,
-          "batches": 5
+          "prompt_tokens": 1590,
+          "generated_tokens": 39,
+          "latency": 5.818597374018282,
+          "batches": 5,
+          "answers": {
+            "Q1": "temperate softwoods",
+            "Q2": "denser",
+            "Q3": "walls",
+            "Q4": "thin",
+            "Q5": "small"
+          }
         },
         {
           "name": "full_batch",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.8666666666666666
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 301,
-          "generated_tokens": 640,
-          "latency": 58.94471320800949,
-          "batches": 1
+          "prompt_tokens": 322,
+          "generated_tokens": 29,
+          "latency": 2.992917792056687,
+          "batches": 1,
+          "answers": {
+            "Q1": "temperate softwoods",
+            "Q2": "denser",
+            "Q3": "walls",
+            "Q4": "thin",
+            "Q5": "small"
+          }
         },
         {
           "name": "dependency_parallel",
           "metrics": {
-            "acc": 1.0,
-            "f1": 0.029604021571968942
+            "strict_acc": 1.0,
+            "lenient_acc": 1.0
           },
-          "prompt_tokens": 1239,
-          "generated_tokens": 640,
-          "latency": 54.75488854118157,
-          "batches": 2
+          "prompt_tokens": 1527,
+          "generated_tokens": 40,
+          "latency": 5.447907709050924,
+          "batches": 5,
+          "answers": {
+            "Q1": "temperate softwoods",
+            "Q2": "denser",
+            "Q3": "walls",
+            "Q4": "thin",
+            "Q5": "very small"
+          }
         }
       ]
     }
@@ -118,30 +175,30 @@
   "averages": [
     {
       "name": "sequential",
-      "acc": 0.8888888888888888,
-      "f1": 0.089688779179988,
-      "prompt_tokens": 1845.0,
-      "generated_tokens": 554.6666666666666,
-      "latency": 52.66020858338258,
+      "strict_acc": 1.0,
+      "lenient_acc": 1.0,
+      "prompt_tokens": 1112.3333333333333,
+      "generated_tokens": 48.333333333333336,
+      "latency": 6.112644443676497,
       "batches": 4.333333333333333
     },
     {
       "name": "full_batch",
-      "acc": 0.8888888888888888,
-      "f1": 0.7780762447429114,
-      "prompt_tokens": 229.0,
-      "generated_tokens": 554.6666666666666,
-      "latency": 47.229025902653426,
+      "strict_acc": 1.0,
+      "lenient_acc": 1.0,
+      "prompt_tokens": 250.0,
+      "generated_tokens": 39.0,
+      "latency": 3.6149811667079725,
       "batches": 1.0
     },
     {
       "name": "dependency_parallel",
-      "acc": 1.0,
-      "f1": 0.08413824649148006,
-      "prompt_tokens": 809.6666666666666,
-      "generated_tokens": 554.6666666666666,
-      "latency": 44.83319087466225,
-      "batches": 1.6666666666666667
+      "strict_acc": 0.9333333333333332,
+      "lenient_acc": 0.9333333333333332,
+      "prompt_tokens": 1060.6666666666667,
+      "generated_tokens": 52.666666666666664,
+      "latency": 5.462410888945063,
+      "batches": 4.0
     }
   ]
 }

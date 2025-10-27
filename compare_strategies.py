@@ -505,8 +505,11 @@ def main() -> None:
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
         background = context_payload["context"]
-        logging.info("Processing context %d/%d: %s", idx, len(contexts), title)
         questions = build_questions_from_group(context_payload)
+        logging.info("Processing context %d/%d: %s", idx, len(contexts), title)
+        logging.info("Background preview: %s", background[:200].replace("\n", " "))
+        for q in questions:
+            logging.info("  %s: %s (gold: %s)", q.qid, q.text.strip(), q.references)
 
         seq_res = run_sequential_strategy(
             background,
@@ -551,6 +554,7 @@ def main() -> None:
                         "generated_tokens": res.generated_tokens,
                         "latency": res.latency,
                         "batches": res.batches,
+                        "answers": res.answers,
                     }
                     for res in (seq_res, batch_res, dep_res)
                 ],
