@@ -350,9 +350,8 @@ def build_answer_prompt(
 ) -> str:
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
-        "Provide the shortest possible span from the passage that answers the question.",
-        "Respond strictly as a JSON object: {\"answer\": \"<span-or-unknown>\"}.",
-        "If uncertain, return {\"answer\": \"unknown\"}. Do not add extra text.",
+        "Analysis and provide the possible span from the passage that answers the question with a JSON object: {\"answer\": \"<span-or-unknown>\"}..",
+        "If uncertain, return {\"answer\": \"unknown\"}.",
         "",
         "Background:",
         background.strip(),
