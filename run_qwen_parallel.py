@@ -23,15 +23,39 @@ def build_chat_prompt(
     user_prompt: str,
     system_prompt: Optional[str] = DEFAULT_SYSTEM_PROMPT,
 ) -> str:
+    """Create a chat-style prompt with thinking disabled for Qwen3."""
+
+    messages: List[Dict[str, str]] = []
     system = (system_prompt or "").strip()
-    user = user_prompt.strip()
-    prompt_parts = []
     if system:
-        prompt_parts.append(f"System: {system}")
-    prompt_parts.append(f"User: {user}")
-    prompt_parts.append("Assistant:")
-    prompt_parts.append("<think></think>")
-    return "\n\n".join(prompt_parts)
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user_prompt.strip()})
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+    else:
+        parts = []
+        if system:
+            parts.append(f"System: {system}")
+        parts.append(f"User: {user_prompt.strip()}")
+        parts.append("Assistant:")
+        prompt = "\n\n".join(parts)
+
+    if "<think>" not in prompt:
+        prompt = f"{prompt}<think></think>"
+    return prompt
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -119,6 +143,21 @@ def extract_json_answer(text: str) -> Optional[str]:
             except json.JSONDecodeError:
                 pass
     return None
+
+
+def count_effective_tokens(tokenizer: AutoTokenizer, raw_text: str) -> int:
+    """Estimate generated tokens used by trimming after the first closing brace."""
+    snippet = raw_text.strip()
+    if not snippet:
+        return 0
+    brace_idx = snippet.find("}")
+    if brace_idx != -1:
+        snippet = snippet[: brace_idx + 1]
+    token_ids = tokenizer(
+        snippet,
+        add_special_tokens=False,
+    )["input_ids"]
+    return len(token_ids)
 
 
 def compute_f1(prediction: str, references: List[str]) -> float:
@@ -235,6 +274,7 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
         self.model = model
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        self.last_metrics: Dict[str, float] = {"prompt_tokens": 0, "generated_tokens": 0, "latency": 0.0}
 
     def generate_edges(
         self,
@@ -245,6 +285,8 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
         prompt = build_dependency_prompt(background, questions)
         chat_prompt = build_chat_prompt(self.tokenizer, prompt, system_prompt=PLANNER_SYSTEM_PROMPT)
         inputs = self.tokenizer(chat_prompt, return_tensors="pt").to(self.model.device)
+        prompt_tokens = inputs["input_ids"].shape[-1]
+        start = time.perf_counter()
         with torch.no_grad():
             generated = self.model.generate(
                 **inputs,
@@ -253,8 +295,26 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
                 temperature=self.temperature,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
             )
-        text = decode_generated(self.tokenizer, inputs["input_ids"], generated)
+        elapsed = time.perf_counter() - start
+        sequences = generated.sequences
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id or eos_id
+        tail_tokens: List[int] = []
+        for token in sequences[0].tolist()[prompt_tokens:]:
+            if token in (eos_id, pad_id):
+                break
+            tail_tokens.append(token)
+        raw_text = self.tokenizer.decode(tail_tokens, skip_special_tokens=True).strip()
+        text = raw_text
+        gen_tokens = count_effective_tokens(self.tokenizer, raw_text)
+        self.last_metrics = {
+            "prompt_tokens": float(prompt_tokens),
+            "generated_tokens": float(gen_tokens),
+            "latency": float(elapsed),
+        }
         try:
             payload = extract_json_from_text(text)
         except ValueError as exc:
@@ -266,6 +326,7 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
                 snippet,
             )
             heuristic = HeuristicDependencyGenerator()
+            # retain the cost already incurred before fallback
             return heuristic.generate_edges(background, questions, metadata)
         edges_data = payload.get("edges", [])
         edges: List[EdgeCandidate] = []
@@ -316,9 +377,10 @@ def answer_question(
     prompt: str,
     *,
     max_new_tokens: int = 96,
-) -> Tuple[str, int, bool, float]:
+) -> Tuple[str, int, int, bool, float]:
     chat_prompt = build_chat_prompt(tokenizer, prompt, system_prompt=DEFAULT_SYSTEM_PROMPT)
     inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+    prompt_tokens = inputs["input_ids"].shape[-1]
     start = time.perf_counter()
     with torch.no_grad():
         generated = model.generate(
@@ -344,8 +406,8 @@ def answer_question(
     extracted = extract_json_answer(raw_text)
     strict_valid = extracted is not None
     answer = extracted if strict_valid else raw_text
-    gen_token_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
-    return answer, len(gen_token_ids), strict_valid, elapsed
+    gen_tokens = count_effective_tokens(tokenizer, raw_text if raw_text else answer)
+    return answer, prompt_tokens, gen_tokens, strict_valid, elapsed
 
 
 def evaluate_answers(predictions: Dict[str, Tuple[str, bool]], question_lookup: Dict[str, Question]) -> Dict[str, float]:
@@ -423,6 +485,13 @@ def main() -> None:
 
         questions_list = build_questions_from_group(context_payload)
         questions_dict = {q.qid: q for q in questions_list}
+        for q in questions_list:
+            logging.info(
+                "  %s: %s (gold: %s)",
+                q.qid,
+                q.text.strip(),
+                "; ".join(q.references) if q.references else "n/a",
+            )
 
         edges = generator.generate_edges(background, questions_list, metadata=context_payload)
         selected = select_dependency_edges(
@@ -435,6 +504,11 @@ def main() -> None:
             fmt_overhead=6,
         )
         apply_dependencies(questions_dict, selected)
+
+        dep_metrics = getattr(generator, "last_metrics", None)
+        dep_prompt_tokens = dep_metrics.get("prompt_tokens", 0.0) if isinstance(dep_metrics, dict) else 0.0
+        dep_generated_tokens = dep_metrics.get("generated_tokens", 0.0) if isinstance(dep_metrics, dict) else 0.0
+        dep_latency = dep_metrics.get("latency", 0.0) if isinstance(dep_metrics, dict) else 0.0
 
         scheduler = DependencyScheduler(
             background,
@@ -453,14 +527,16 @@ def main() -> None:
 
         answers: Dict[str, Tuple[str, bool]] = {}
         answers_text: Dict[str, str] = {}
-        total_latency = 0.0
+        total_latency = dep_latency
+        total_prompt_tokens = dep_prompt_tokens
+        total_generated_tokens = dep_generated_tokens
         for batch in schedule_result.batches:
             batch_latencies: List[float] = []
             for qid in batch.question_ids:
                 question = questions_dict[qid]
                 deps = sorted(question.dependencies)
                 prompt = build_answer_prompt(background, question, answers_text, deps, questions_dict)
-                ans_text, gen_len, strict_valid, elapsed = answer_question(
+                ans_text, prompt_len, gen_len, strict_valid, elapsed = answer_question(
                     tokenizer,
                     model,
                     prompt,
@@ -470,6 +546,8 @@ def main() -> None:
                 answers_text[qid] = ans_text
                 logging.info("Answer %s: %s (len=%d tok)", qid, ans_text, gen_len)
                 batch_latencies.append(elapsed)
+                total_prompt_tokens += prompt_len
+                total_generated_tokens += gen_len
             if batch_latencies:
                 total_latency += max(batch_latencies)
 
@@ -478,6 +556,14 @@ def main() -> None:
         aggregate_lenient.append(metrics["lenient_acc"])
         logging.info("Context %s metrics -> strict ACC: %.3f | lenient ACC: %.3f", title, metrics["strict_acc"], metrics["lenient_acc"])
         logging.info("Estimated parallel latency (max per batch sum): %.2fs", total_latency)
+        logging.info("Total tokens -> prompt %.0f, generated %.0f", total_prompt_tokens, total_generated_tokens)
+        if dep_prompt_tokens or dep_generated_tokens:
+            logging.info(
+                "Dependency stage -> prompt tokens %.0f, generated tokens %.0f, latency %.2fs",
+                dep_prompt_tokens,
+                dep_generated_tokens,
+                dep_latency,
+            )
 
         scheduler.pretty_print_schedule(schedule_result)
         if args.html_dir:

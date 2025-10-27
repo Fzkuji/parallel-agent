@@ -28,6 +28,7 @@ from run_qwen_parallel import (
     LocalLLMDependencyGenerator,
     DEFAULT_SYSTEM_PROMPT,
     build_chat_prompt,
+    count_effective_tokens,
 )
 
 
@@ -144,22 +145,18 @@ def generate_answer(
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id or eos_id
 
-    trimmed_tokens: List[List[int]] = []
-    for row in generated_part:
-        tokens = row.tolist()
-        actual: List[int] = []
-        for token in tokens:
-            if token in (eos_id, pad_id):
-                break
-            actual.append(token)
-        trimmed_tokens.append(actual)
+    tokens = []
+    for token in generated_part[0].tolist():
+        if token in (eos_id, pad_id):
+            break
+        tokens.append(token)
 
-    decoded = [tokenizer.decode(tokens, skip_special_tokens=True).strip() for tokens in trimmed_tokens]
-    raw_text = decoded[0] if decoded else ""
+    raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
     extracted = extract_json_answer(raw_text)
     strict_valid = extracted is not None
     output_text = extracted if strict_valid else raw_text
-    generated_tokens = len(trimmed_tokens[0]) if trimmed_tokens else 0
+    effective_text = raw_text if raw_text else output_text
+    generated_tokens = count_effective_tokens(tokenizer, effective_text)
     return output_text, prompt_tokens, generated_tokens, elapsed, strict_valid
 
 
@@ -280,6 +277,10 @@ def run_dependency_strategy(
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     edges = generator.generate_edges(background, questions)
+    dep_metrics = getattr(generator, "last_metrics", None)
+    dep_prompt_tokens = dep_metrics.get("prompt_tokens", 0.0) if isinstance(dep_metrics, dict) else 0.0
+    dep_generated_tokens = dep_metrics.get("generated_tokens", 0.0) if isinstance(dep_metrics, dict) else 0.0
+    dep_latency = dep_metrics.get("latency", 0.0) if isinstance(dep_metrics, dict) else 0.0
     selected = select_dependency_edges(
         question_lookup,
         edges,
@@ -303,9 +304,9 @@ def run_dependency_strategy(
 
     answer_records: Dict[str, Tuple[str, bool]] = {}
     answers_text: Dict[str, str] = {}
-    total_prompt_tokens = 0
-    total_generated_tokens = 0
-    total_latency = 0.0
+    total_prompt_tokens = dep_prompt_tokens
+    total_generated_tokens = dep_generated_tokens
+    total_latency = dep_latency
 
     for batch in schedule.batches:
         batch_latencies: List[float] = []
@@ -328,8 +329,8 @@ def run_dependency_strategy(
     return StrategyResult(
         name="dependency_parallel",
         answers=answers_text,
-        prompt_tokens=total_prompt_tokens,
-        generated_tokens=total_generated_tokens,
+        prompt_tokens=int(total_prompt_tokens),
+        generated_tokens=int(total_generated_tokens),
         latency=total_latency,
         batches=len(schedule.batches),
         metrics=metrics,
@@ -453,13 +454,14 @@ def print_answer_table(
     full_batch: StrategyResult,
     dependency: StrategyResult,
 ) -> None:
-    headers = ["QID", "Gold", "Sequential", "Full Batch", "Parallel"]
+    headers = ["QID", "Question", "Gold", "Sequential", "Full Batch", "Parallel"]
     rows = []
     for question in questions:
         gold = "; ".join(question.references) if question.references else ""
         rows.append(
             [
                 question.qid,
+                question.text.strip(),
                 gold,
                 sequential.answers.get(question.qid, ""),
                 full_batch.answers.get(question.qid, ""),
