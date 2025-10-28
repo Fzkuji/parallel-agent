@@ -374,14 +374,21 @@ def answer_question(
 def evaluate_answers(predictions: Dict[str, Tuple[str, bool]], question_lookup: Dict[str, Question]) -> Dict[str, float]:
     total = len(predictions)
     if total == 0:
-        return {"strict_acc": 0.0, "lenient_acc": 0.0}
+        return {"strict_acc": 0.0, "lenient_acc": 0.0, "f1": 0.0}
     strict_sum = 0.0
     lenient_sum = 0.0
+    f1_sum = 0.0
     for qid, (pred, strict_valid) in predictions.items():
         references = question_lookup[qid].references
-        strict_sum += compute_contains(pred, references) if strict_valid else 0.0
+        if strict_valid:
+            strict_sum += compute_em(pred, references)
         lenient_sum += compute_contains(pred, references)
-    return {"strict_acc": strict_sum / total, "lenient_acc": lenient_sum / total}
+        f1_sum += compute_f1(pred, references)
+    return {
+        "strict_acc": strict_sum / total,
+        "lenient_acc": lenient_sum / total,
+        "f1": f1_sum / total,
+    }
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -438,6 +445,7 @@ def main() -> None:
 
     aggregate_strict = []
     aggregate_lenient = []
+    aggregate_f1 = []
 
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
@@ -515,7 +523,14 @@ def main() -> None:
         metrics = evaluate_answers(answers, questions_dict)
         aggregate_strict.append(metrics["strict_acc"])
         aggregate_lenient.append(metrics["lenient_acc"])
-        logging.info("Context %s metrics -> strict ACC: %.3f | lenient ACC: %.3f", title, metrics["strict_acc"], metrics["lenient_acc"])
+        aggregate_f1.append(metrics["f1"])
+        logging.info(
+            "Context %s metrics -> EM: %.3f | F1: %.3f | lenient ACC: %.3f",
+            title,
+            metrics["strict_acc"],
+            metrics["f1"],
+            metrics["lenient_acc"],
+        )
         logging.info("Estimated parallel latency (max per batch sum): %.2fs", total_latency)
         logging.info("Total tokens -> prompt %.0f, generated %.0f", total_prompt_tokens, total_generated_tokens)
         if dep_prompt_tokens or dep_generated_tokens:
@@ -537,8 +552,9 @@ def main() -> None:
 
     if aggregate_strict:
         logging.info(
-            "Overall strict ACC: %.3f | Overall lenient ACC: %.3f",
+            "Overall EM: %.3f | Overall F1: %.3f | Overall lenient ACC: %.3f",
             sum(aggregate_strict) / len(aggregate_strict),
+            sum(aggregate_f1) / len(aggregate_f1),
             sum(aggregate_lenient) / len(aggregate_lenient),
         )
 

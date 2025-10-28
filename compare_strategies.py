@@ -9,7 +9,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -51,6 +51,14 @@ def compute_contains(prediction: str, references: List[str]) -> float:
     return 0.0
 
 
+def compute_em(prediction: str, references: List[str]) -> float:
+    pred_norm = normalize_answer(prediction)
+    for ref in references:
+        if normalize_answer(ref) == pred_norm:
+            return 1.0
+    return 0.0
+
+
 def compute_f1(prediction: str, references: List[str]) -> float:
     pred_tokens = normalize_answer(prediction).split()
     if not pred_tokens:
@@ -80,7 +88,7 @@ def generate_answer(
     *,
     max_new_tokens: int,
     temperature: Optional[float] = None,
-) -> Tuple[str, int, int, float, bool]:
+) -> Tuple[str, str, int, int, float, bool]:
     chat_prompt = build_chat_prompt(tokenizer, prompt, system_prompt=DEFAULT_SYSTEM_PROMPT)
     inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
@@ -121,7 +129,7 @@ def generate_answer(
     raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
     output_text, strict_valid = extract_box_answer(raw_text)
     generated_tokens = len(tokens)
-    return output_text, prompt_tokens, generated_tokens, elapsed, strict_valid
+    return output_text, raw_text, prompt_tokens, generated_tokens, elapsed, strict_valid
 
 
 def build_answer_prompt(
@@ -166,14 +174,17 @@ def build_sequential_prompt(history: str, question: Question) -> str:
 def evaluate_predictions(predictions: Dict[str, Tuple[str, bool]], lookup: Dict[str, Question]) -> Dict[str, float]:
     total = len(predictions)
     if total == 0:
-        return {"strict_acc": 0.0, "lenient_acc": 0.0}
+        return {"strict_acc": 0.0, "lenient_acc": 0.0, "f1": 0.0}
     strict_sum = 0.0
     lenient_sum = 0.0
+    f1_sum = 0.0
     for qid, (pred, strict_valid) in predictions.items():
         refs = lookup[qid].references
-        strict_sum += compute_contains(pred, refs) if strict_valid else 0.0
+        if strict_valid:
+            strict_sum += compute_em(pred, refs)
         lenient_sum += compute_contains(pred, refs)
-    return {"strict_acc": strict_sum / total, "lenient_acc": lenient_sum / total}
+        f1_sum += compute_f1(pred, refs)
+    return {"strict_acc": strict_sum / total, "lenient_acc": lenient_sum / total, "f1": f1_sum / total}
 
 
 def build_batch_prompt(background: str, questions: List[Question]) -> str:
@@ -224,6 +235,7 @@ class StrategyResult:
     latency: float
     batches: int
     metrics: Dict[str, float]
+    details: Dict[str, Any]
 
 
 def run_dependency_strategy(
@@ -272,22 +284,67 @@ def run_dependency_strategy(
     total_generated_tokens = dep_generated_tokens
     total_latency = dep_latency
 
+    dependency_edges_detail = [
+        {
+            "source": edge.source,
+            "target": target,
+            "confidence": edge.confidence,
+            "rationale": edge.rationale,
+        }
+        for target, edge_list in selected.items()
+        for edge in edge_list
+    ]
+    batch_details: List[Dict[str, Any]] = []
+
     for batch in schedule.batches:
         batch_latencies: List[float] = []
+        batch_info: Dict[str, Any] = {
+            "batch_id": batch.batch_id,
+            "depth": batch.depth,
+            "question_ids": batch.question_ids,
+            "estimated_latency": batch.estimated_latency,
+            "background_tokens": batch.background_tokens,
+            "incremental_prefill_tokens": batch.incremental_prefill_tokens,
+            "generation_tokens": batch.generation_tokens,
+            "total_tokens": batch.total_tokens,
+            "questions": [],
+        }
         for qid in batch.question_ids:
             question = question_lookup[qid]
             deps = sorted(question.dependencies)
             prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
-            text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
+            dependency_answers = [
+                {
+                    "question_id": dep_id,
+                    "answer": answers_text.get(dep_id, ""),
+                }
+                for dep_id in deps
+            ]
+            final_answer, raw_response, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
                 tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
             )
-            answer_records[qid] = (text, strict_valid)
-            answers_text[qid] = text
+            answer_records[qid] = (final_answer, strict_valid)
+            answers_text[qid] = final_answer
             total_prompt_tokens += p_tokens
             total_generated_tokens += g_tokens
             batch_latencies.append(elapsed)
+            batch_info["questions"].append(
+                {
+                    "question_id": qid,
+                    "question": question.text.strip(),
+                    "dependencies": dependency_answers,
+                    "prompt": prompt,
+                    "raw_response": raw_response,
+                    "final_answer": final_answer,
+                    "strict_valid": strict_valid,
+                    "latency": elapsed,
+                    "prompt_tokens": p_tokens,
+                    "generated_tokens": g_tokens,
+                }
+            )
         if batch_latencies:
             total_latency += max(batch_latencies)
+        batch_details.append(batch_info)
 
     metrics = evaluate_predictions(answer_records, question_lookup)
     return StrategyResult(
@@ -298,6 +355,15 @@ def run_dependency_strategy(
         latency=total_latency,
         batches=len(schedule.batches),
         metrics=metrics,
+        details={
+            "dependency_stage": {
+                "edges": dependency_edges_detail,
+                "prompt_tokens": dep_prompt_tokens,
+                "generated_tokens": dep_generated_tokens,
+                "latency": dep_latency,
+            },
+            "batches": batch_details,
+        },
     )
 
 
@@ -327,20 +393,35 @@ Background:
 """
     )
 
+    detail_records: List[Dict[str, Any]] = []
+
     for question in questions:
         prompt = build_sequential_prompt(history, question)
-        text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
+        final_answer, raw_response, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
             tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
         )
-        answer_records[question.qid] = (text, strict_valid)
-        answers_text[question.qid] = text
+        answer_records[question.qid] = (final_answer, strict_valid)
+        answers_text[question.qid] = final_answer
         total_prompt_tokens += p_tokens
         total_generated_tokens += g_tokens
         total_latency += elapsed
-        safe_text = text.replace("}", "\\}")
+        escaped_answer = final_answer.replace("}", "\\}")
         history = (
             f"{history}Question ({question.qid}): {question.text.strip()}\n"
-            f"Answer: \\box{{{safe_text}}}\n\n"
+            f"Answer: \\box{{{escaped_answer}}}\n\n"
+        )
+        detail_records.append(
+            {
+                "question_id": question.qid,
+                "question": question.text.strip(),
+                "prompt": prompt,
+                "raw_response": raw_response,
+                "final_answer": final_answer,
+                "strict_valid": strict_valid,
+                "latency": elapsed,
+                "prompt_tokens": p_tokens,
+                "generated_tokens": g_tokens,
+            }
         )
 
     metrics = evaluate_predictions(answer_records, question_lookup)
@@ -352,6 +433,7 @@ Background:
         latency=total_latency,
         batches=len(questions),
         metrics=metrics,
+        details={"turns": detail_records},
     )
 
 
@@ -364,13 +446,22 @@ def run_full_batch_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     prompt = build_batch_prompt(background, questions)
-    text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
+    _, raw_response, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
         tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
     )
-    parsed = parse_batch_answers(text, questions)
+    parsed = parse_batch_answers(raw_response, questions)
     answer_records = {qid: (ans, valid) for qid, (ans, valid) in parsed.items()}
     answers_text = {qid: ans for qid, (ans, _) in parsed.items()}
     metrics = evaluate_predictions(answer_records, {q.qid: q for q in questions})
+    per_question = [
+        {
+            "question_id": question.qid,
+            "question": question.text.strip(),
+            "final_answer": answers_text.get(question.qid, ""),
+            "strict_valid": parsed[question.qid][1],
+        }
+        for question in questions
+    ]
     return StrategyResult(
         name="full_batch",
         answers=answers_text,
@@ -379,13 +470,19 @@ def run_full_batch_strategy(
         latency=elapsed,
         batches=1,
         metrics=metrics,
+        details={
+            "prompt": prompt,
+            "raw_response": raw_response,
+            "per_question": per_question,
+        },
     )
 
 
 def summarize_results(results: List[StrategyResult]) -> str:
     headers = [
         "Strategy",
-        "Strict ACC",
+        "EM",
+        "F1",
         "Lenient ACC",
         "PromptTok",
         "GenTok",
@@ -398,6 +495,7 @@ def summarize_results(results: List[StrategyResult]) -> str:
             [
                 res.name,
                 f"{res.metrics['strict_acc']:.3f}",
+                f"{res.metrics['f1']:.3f}",
                 f"{res.metrics['lenient_acc']:.3f}",
                 res.prompt_tokens,
                 res.generated_tokens,
@@ -549,6 +647,7 @@ def main() -> None:
                         "latency": res.latency,
                         "batches": res.batches,
                         "answers": res.answers,
+                        "details": res.details,
                     }
                     for res in (seq_res, batch_res, dep_res)
                 ],
@@ -563,6 +662,7 @@ def main() -> None:
                 res.name,
                 {
                     "strict": 0.0,
+                    "f1": 0.0,
                     "lenient": 0.0,
                     "prompt_tokens": 0,
                     "generated_tokens": 0,
@@ -572,6 +672,7 @@ def main() -> None:
                 },
             )
             stats["strict"] += res.metrics["strict_acc"]
+            stats["f1"] += res.metrics["f1"]
             stats["lenient"] += res.metrics["lenient_acc"]
             stats["prompt_tokens"] += res.prompt_tokens
             stats["generated_tokens"] += res.generated_tokens
@@ -582,7 +683,7 @@ def main() -> None:
     summary_rows = []
     if strategy_totals:
         print("\n=== Overall Averages ===")
-        headers = ["Strategy", "Strict ACC", "Lenient ACC", "PromptTok", "GenTok", "Latency(s)", "Batches"]
+        headers = ["Strategy", "EM", "F1", "Lenient ACC", "PromptTok", "GenTok", "Latency(s)", "Batches"]
         rows = []
         for name, stats in strategy_totals.items():
             count = stats["count"]
@@ -590,6 +691,7 @@ def main() -> None:
                 [
                     name,
                     f"{stats['strict'] / count:.3f}",
+                    f"{stats['f1'] / count:.3f}",
                     f"{stats['lenient'] / count:.3f}",
                     int(stats["prompt_tokens"] / count),
                     int(stats["generated_tokens"] / count),
@@ -601,6 +703,7 @@ def main() -> None:
                 {
                     "name": name,
                     "strict_acc": stats["strict"] / count,
+                    "f1": stats["f1"] / count,
                     "lenient_acc": stats["lenient"] / count,
                     "prompt_tokens": stats["prompt_tokens"] / count,
                     "generated_tokens": stats["generated_tokens"] / count,

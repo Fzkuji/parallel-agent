@@ -1,0 +1,240 @@
+{
+  "contexts": [
+    {
+      "context": "John_von_Neumann",
+      "strategies": [
+        {
+          "name": "sequential",
+          "metrics": {
+            "strict_acc": 0.6666666666666666,
+            "lenient_acc": 1.0,
+            "f1": 0.8777777777777778
+          },
+          "prompt_tokens": 825,
+          "generated_tokens": 164,
+          "latency": 15.567093500052579,
+          "batches": 3,
+          "answers": {
+            "Q1": "continuous geometry",
+            "Q2": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. This continuous dimension is motivated by the discovery of von Neumann algebras with a dimension function taking a",
+            "Q3": "projections of the hyperfinite type II factor"
+          },
+          "details": {
+            "turns": [
+              {
+                "question_id": "Q1",
+                "question": "What field did Von Neuman establish?",
+                "prompt": "You are a helpful assistant that answers questions given a background passage.\nYou may reason for each question but must end with \\box{answer}.\nIf the answer is unknown, use \\box{unknown}.\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nQuestion (Q1): What field did Von Neuman establish?\nRespond with your reasoning. The very last line must be exactly one \\box{final answer} with no extra text.\n",
+                "raw_response": "Von Neumann founded the field of continuous geometry. This is directly stated in the background passage, which mentions that he \"founded the field of continuous geometry.\" \n\n\\box{continuous geometry}",
+                "final_answer": "continuous geometry",
+                "strict_valid": true,
+                "latency": 4.211245542042889,
+                "prompt_tokens": 233,
+                "generated_tokens": 40
+              },
+              {
+                "question_id": "Q2",
+                "question": "What is the distinction of continuous geometry?",
+                "prompt": "You are a helpful assistant that answers questions given a background passage.\nYou may reason for each question but must end with \\box{answer}.\nIf the answer is unknown, use \\box{unknown}.\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nQuestion (Q1): What field did Von Neuman establish?\nAnswer: \\box{continuous geometry}\n\nQuestion (Q2): What is the distinction of continuous geometry?\nRespond with your reasoning. The very last line must be exactly one \\box{final answer} with no extra text.\n",
+                "raw_response": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. This continuous dimension is motivated by the discovery of von Neumann algebras with a dimension function taking a",
+                "final_answer": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. This continuous dimension is motivated by the discovery of von Neumann algebras with a dimension function taking a",
+                "strict_valid": false,
+                "latency": 5.5742273749783635,
+                "prompt_tokens": 254,
+                "generated_tokens": 64
+              },
+              {
+                "question_id": "Q3",
+                "question": "What was the first example of continuous geometry?",
+                "prompt": "You are a helpful assistant that answers questions given a background passage.\nYou may reason for each question but must end with \\box{answer}.\nIf the answer is unknown, use \\box{unknown}.\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nQuestion (Q1): What field did Von Neuman establish?\nAnswer: \\box{continuous geometry}\n\nQuestion (Q2): What is the distinction of continuous geometry?\nAnswer: \\box{The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. This continuous dimension is motivated by the discovery of von Neumann algebras with a dimension function taking a}\n\nQuestion (Q3): What was the first example of continuous geometry?\nRespond with your reasoning. The very last line must be exactly one \\box{final answer} with no extra text.\n",
+                "raw_response": "The background passage states that the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor. Therefore, the first example of continuous geometry is the projections of the hyperfinite type II factor.\n\n\\box{projections of the hyperfinite type II factor}",
+                "final_answer": "projections of the hyperfinite type II factor",
+                "strict_valid": true,
+                "latency": 5.7816205830313265,
+                "prompt_tokens": 338,
+                "generated_tokens": 60
+              }
+            ]
+          }
+        },
+        {
+          "name": "full_batch",
+          "metrics": {
+            "strict_acc": 0.6666666666666666,
+            "lenient_acc": 1.0,
+            "f1": 0.9914529914529915
+          },
+          "prompt_tokens": 293,
+          "generated_tokens": 69,
+          "latency": 5.899035166949034,
+          "batches": 1,
+          "answers": {
+            "Q1": "continuous geometry",
+            "Q2": "instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]",
+            "Q3": "the projections of the hyperfinite type II factor"
+          },
+          "details": {
+            "prompt": "You are a helpful assistant. Read the background and answer each question.\nYou may reason for each question, but finish its answer on a separate line in the form:\nA1: \\box{final answer}\nDo not add any text after the \\box. If the answer is unknown, use \\box{unknown}.\n\nExample:\nA1 reasoning...\nA1: \\box{final value}\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nQuestions:\nQ1: What field did Von Neuman establish?; Q2: What is the distinction of continuous geometry?; Q3: What was the first example of continuous geometry?\n\nProvide the answers (each prefixed by A1/A2/etc and ending with \\box{...}):",
+            "raw_response": "A1: \\box{continuous geometry}  \nA2: \\box{instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]}  \nA3: \\box{the projections of the hyperfinite type II factor}",
+            "per_question": [
+              {
+                "question_id": "Q1",
+                "question": "What field did Von Neuman establish?",
+                "final_answer": "continuous geometry",
+                "strict_valid": true
+              },
+              {
+                "question_id": "Q2",
+                "question": "What is the distinction of continuous geometry?",
+                "final_answer": "instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]",
+                "strict_valid": true
+              },
+              {
+                "question_id": "Q3",
+                "question": "What was the first example of continuous geometry?",
+                "final_answer": "the projections of the hyperfinite type II factor",
+                "strict_valid": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "dependency_parallel",
+          "metrics": {
+            "strict_acc": 0.3333333333333333,
+            "lenient_acc": 1.0,
+            "f1": 0.7739463601532567
+          },
+          "prompt_tokens": 878,
+          "generated_tokens": 102,
+          "latency": 7.15721641597338,
+          "batches": 2,
+          "answers": {
+            "Q1": "continuous geometry",
+            "Q2": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. \\box{Continuous geometry allows dimensions to take any value in the interval [0,1] rather than",
+            "Q3": "The first example of continuous geometry was the projections of the hyperfinite type II factor."
+          },
+          "details": {
+            "dependency_stage": {
+              "edges": [
+                {
+                  "source": "Q2",
+                  "target": "Q3",
+                  "confidence": 0.55,
+                  "rationale": "keyword-overlap"
+                }
+              ],
+              "prompt_tokens": 0.0,
+              "generated_tokens": 0.0,
+              "latency": 0.0
+            },
+            "batches": [
+              {
+                "batch_id": 0,
+                "depth": 0,
+                "question_ids": [
+                  "Q1",
+                  "Q2"
+                ],
+                "estimated_latency": 164.4,
+                "background_tokens": 136,
+                "incremental_prefill_tokens": 17,
+                "generation_tokens": 47,
+                "total_tokens": 200,
+                "questions": [
+                  {
+                    "question_id": "Q1",
+                    "question": "What field did Von Neuman establish?",
+                    "dependencies": [],
+                    "prompt": "You are a helpful assistant that answers questions given a background passage.\nYou may reason freely, but the final answer must appear exactly once as \\box{...}.\nIf the answer is unknown, write \\box{unknown}.\nPlace the \\box{...} on the final line alone. Example: \\box{42}\nIf you omit the final \\box, the answer is invalid.\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nQuestion (Q1): What field did Von Neuman establish?\nAfter reasoning, finish with a single line containing \\box{answer} and nothing else.",
+                    "raw_response": "Von Neumann founded the field of continuous geometry. \\box{continuous geometry}",
+                    "final_answer": "continuous geometry",
+                    "strict_valid": true,
+                    "latency": 1.6825899169780314,
+                    "prompt_tokens": 264,
+                    "generated_tokens": 17
+                  },
+                  {
+                    "question_id": "Q2",
+                    "question": "What is the distinction of continuous geometry?",
+                    "dependencies": [],
+                    "prompt": "You are a helpful assistant that answers questions given a background passage.\nYou may reason freely, but the final answer must appear exactly once as \\box{...}.\nIf the answer is unknown, write \\box{unknown}.\nPlace the \\box{...} on the final line alone. Example: \\box{42}\nIf you omit the final \\box, the answer is invalid.\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nQuestion (Q2): What is the distinction of continuous geometry?\nAfter reasoning, finish with a single line containing \\box{answer} and nothing else.",
+                    "raw_response": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. \\box{Continuous geometry allows dimensions to take any value in the interval [0,1] rather than",
+                    "final_answer": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. \\box{Continuous geometry allows dimensions to take any value in the interval [0,1] rather than",
+                    "strict_valid": false,
+                    "latency": 5.037962540984154,
+                    "prompt_tokens": 264,
+                    "generated_tokens": 64
+                  }
+                ]
+              },
+              {
+                "batch_id": 1,
+                "depth": 1,
+                "question_ids": [
+                  "Q3"
+                ],
+                "estimated_latency": 164.8,
+                "background_tokens": 136,
+                "incremental_prefill_tokens": 52,
+                "generation_tokens": 12,
+                "total_tokens": 200,
+                "questions": [
+                  {
+                    "question_id": "Q3",
+                    "question": "What was the first example of continuous geometry?",
+                    "dependencies": [
+                      {
+                        "question_id": "Q2",
+                        "answer": "The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. \\box{Continuous geometry allows dimensions to take any value in the interval [0,1] rather than"
+                      }
+                    ],
+                    "prompt": "You are a helpful assistant that answers questions given a background passage.\nYou may reason freely, but the final answer must appear exactly once as \\box{...}.\nIf the answer is unknown, write \\box{unknown}.\nPlace the \\box{...} on the final line alone. Example: \\box{42}\nIf you omit the final \\box, the answer is invalid.\n\nBackground:\nVon Neumann founded the field of continuous geometry. It followed his path-breaking work on rings of operators. In mathematics, continuous geometry is an analogue of complex projective geometry, where instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. Von Neumann was motivated by his discovery of von Neumann algebras with a dimension function taking a continuous range of dimensions, and the first example of a continuous geometry other than projective space was the projections of the hyperfinite type II factor.\n\nKnown previous answers:\nQ2 - What is the distinction of continuous geometry?\nAnswer: \\box{The distinction of continuous geometry is that instead of the dimension of a subspace being in a discrete set 0, 1, ..., n, it can be an element of the unit interval [0,1]. \\box{Continuous geometry allows dimensions to take any value in the interval [0,1] rather than}\n\nQuestion (Q3): What was the first example of continuous geometry?\nAfter reasoning, finish with a single line containing \\box{answer} and nothing else.",
+                    "raw_response": "\\box{The first example of continuous geometry was the projections of the hyperfinite type II factor.}",
+                    "final_answer": "The first example of continuous geometry was the projections of the hyperfinite type II factor.",
+                    "strict_valid": true,
+                    "latency": 2.1192538749892265,
+                    "prompt_tokens": 350,
+                    "generated_tokens": 21
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "averages": [
+    {
+      "name": "sequential",
+      "strict_acc": 0.6666666666666666,
+      "f1": 0.8777777777777778,
+      "lenient_acc": 1.0,
+      "prompt_tokens": 825.0,
+      "generated_tokens": 164.0,
+      "latency": 15.567093500052579,
+      "batches": 3.0
+    },
+    {
+      "name": "full_batch",
+      "strict_acc": 0.6666666666666666,
+      "f1": 0.9914529914529915,
+      "lenient_acc": 1.0,
+      "prompt_tokens": 293.0,
+      "generated_tokens": 69.0,
+      "latency": 5.899035166949034,
+      "batches": 1.0
+    },
+    {
+      "name": "dependency_parallel",
+      "strict_acc": 0.3333333333333333,
+      "f1": 0.7739463601532567,
+      "lenient_acc": 1.0,
+      "prompt_tokens": 878.0,
+      "generated_tokens": 102.0,
+      "latency": 7.15721641597338,
+      "batches": 2.0
+    }
+  ]
+}
