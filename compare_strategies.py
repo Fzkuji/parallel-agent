@@ -421,30 +421,26 @@ def run_sequential_strategy(
     total_prompt_tokens = 0
     total_generated_tokens = 0
     total_latency = 0.0
-    conversation: List[Dict[str, str]] = [
-        {
-            "role": "system",
-            "content": textwrap.dedent(
-                f"""You are a helpful assistant that answers questions given a background passage.
+
+    conversation_text = textwrap.dedent(
+        f"""You are a helpful assistant that answers questions given a background passage.
 You will receive multiple questions one by one. Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
 
 Background:
 {background.strip()}
 """
-            ).strip(),
-        }
-    ]
+    ).strip()
 
     detail_records: List[Dict[str, Any]] = []
 
     for question in questions:
-        user_message = (
-            f"Question ({question.qid}): {question.text.strip()}\n"
+        conversation_text += (
+            f"\n\nQuestion ({question.qid}): {question.text.strip()}\n"
             "Respond with your reasoning if needed and ensure the very last line is \\box{answer}."
         )
-        conversation.append({"role": "user", "content": user_message})
+        messages = [{"role": "user", "content": conversation_text}]
         chat_prompt = tokenizer.apply_chat_template(
-            conversation,
+            messages,
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -477,13 +473,14 @@ Background:
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
-        conversation.append({"role": "assistant", "content": raw_response})
 
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
         total_prompt_tokens += prompt_tokens
         total_generated_tokens += len(trimmed_tokens)
         total_latency += elapsed
+
+        conversation_text += f"\nAssistant: {raw_response}"
 
         detail_records.append(
             {
