@@ -28,6 +28,7 @@ from run_qwen_parallel import (
     LocalLLMDependencyGenerator,
     DEFAULT_SYSTEM_PROMPT,
     build_chat_prompt,
+    extract_box_answer,
 )
 
 
@@ -48,39 +49,6 @@ def compute_contains(prediction: str, references: List[str]) -> float:
         if ref_norm in pred_norm or pred_norm in ref_norm:
             return 1.0
     return 0.0
-
-
-def extract_json_answer(text: str) -> Optional[str]:
-    cleaned = text.strip()
-    if not cleaned:
-        return None
-    if cleaned.startswith("```"):
-        parts = cleaned.split("```")
-        for part in parts:
-            part = part.strip()
-            if part.startswith("json"):
-                cleaned = part[4:].strip()
-                break
-            if part.startswith("{"):
-                cleaned = part
-                break
-    try:
-        payload = json.loads(cleaned)
-        value = payload.get("answer")
-        if isinstance(value, str):
-            return value.strip()
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
-        if match:
-            snippet = match.group(0)
-            try:
-                payload = json.loads(snippet)
-                value = payload.get("answer")
-                if isinstance(value, str):
-                    return value.strip()
-            except json.JSONDecodeError:
-                pass
-    return None
 
 
 def compute_f1(prediction: str, references: List[str]) -> float:
@@ -151,9 +119,7 @@ def generate_answer(
         tokens.append(token)
 
     raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-    extracted = extract_json_answer(raw_text)
-    strict_valid = extracted is not None
-    output_text = extracted if strict_valid else raw_text
+    output_text, strict_valid = extract_box_answer(raw_text)
     generated_tokens = len(tokens)
     return output_text, prompt_tokens, generated_tokens, elapsed, strict_valid
 
@@ -167,10 +133,10 @@ def build_answer_prompt(
 ) -> str:
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
-        "Provide the shortest possible span from the passage that answers the question.",
-        "Respond strictly as a JSON object: {\"answer\": \"<span-or-unknown>\"}.",
-        "If uncertain, output {\"answer\": \"unknown\"}.",
-        "Do not add any explanation or text outside the JSON object.",
+        "You may reason freely, but the final answer must appear exactly once as \\box{...}.",
+        "If the answer is unknown, write \\box{unknown}.",
+        "Place the \\box{...} on the final line alone. Example: \\box{42}",
+        "If you omit the final \\box, the answer is invalid.",
         "",
         "Background:",
         background.strip(),
@@ -182,15 +148,19 @@ def build_answer_prompt(
             dep_question = question_lookup[dep_id]
             dep_answer = answers.get(dep_id, "").strip()
             prompt_parts.append(f"{dep_id} - {dep_question.text.strip()}")
-            prompt_parts.append(f"Answer: {dep_answer}")
+            escaped = dep_answer.replace("}", "\\}")
+            prompt_parts.append(f"Answer: \\box{{{escaped}}}")
         prompt_parts.append("")
     prompt_parts.append(f"Question ({question.qid}): {question.text.strip()}")
-    prompt_parts.append("Answer JSON:")
+    prompt_parts.append("After reasoning, finish with a single line containing \\box{answer} and nothing else.")
     return "\n".join(prompt_parts)
 
 
 def build_sequential_prompt(history: str, question: Question) -> str:
-    return f"{history}Question ({question.qid}): {question.text.strip()}\nAnswer JSON:"
+    return (
+        f"{history}Question ({question.qid}): {question.text.strip()}\n"
+        "Respond with your reasoning. The very last line must be exactly one \\box{final answer} with no extra text.\n"
+    )
 
 
 def evaluate_predictions(predictions: Dict[str, Tuple[str, bool]], lookup: Dict[str, Question]) -> Dict[str, float]:
@@ -212,12 +182,14 @@ def build_batch_prompt(background: str, questions: List[Question]) -> str:
         question_lines.append(f"Q{question.qid[1:]}: {question.text.strip()}")
     prompt = textwrap.dedent(
         f"""
-        You are a helpful assistant. Read the background and answer each question with the shortest possible span from the passage.
-        If the answer is not explicitly stated, return 'unknown'.
-        Return answers strictly in the format:
-        A1: ...
-        A2: ...
-        etc.
+        You are a helpful assistant. Read the background and answer each question.
+        You may reason for each question, but finish its answer on a separate line in the form:
+        A1: \\box{{final answer}}
+        Do not add any text after the \\box. If the answer is unknown, use \\box{{unknown}}.
+
+        Example:
+        A1 reasoning...
+        A1: \\box{{final value}}
 
         Background:
         {background.strip()}
@@ -225,27 +197,21 @@ def build_batch_prompt(background: str, questions: List[Question]) -> str:
         Questions:
         {'; '.join(question_lines)}
 
-        Answers:
+        Provide the answers (each prefixed by A1/A2/etc and ending with \\box{{...}}):
         """
     ).strip()
     return prompt
 
 
-def parse_batch_answers(text: str, questions: List[Question]) -> Dict[str, str]:
-    answers: Dict[str, str] = {}
-    pattern = re.compile(r"A(\d+)\s*[:：]\s*(.+)")
-    for line in text.splitlines():
-        line = line.strip()
-        match = pattern.match(line)
-        if not match:
-            continue
-        idx = match.group(1)
-        value = match.group(2).strip()
-        qid = f"Q{idx}"
-        answers[qid] = value
-    # ensure all have entries
-    for question in questions:
-        answers.setdefault(question.qid, "")
+def parse_batch_answers(text: str, questions: List[Question]) -> Dict[str, Tuple[str, bool]]:
+    answers: Dict[str, Tuple[str, bool]] = {}
+    box_pattern = re.compile(r"\\box\{([^}]*)\}")
+    matches = list(box_pattern.finditer(text))
+    for idx, question in enumerate(questions):
+        if idx < len(matches):
+            answers[question.qid] = (matches[idx].group(1).strip(), True)
+        else:
+            answers[question.qid] = ("", False)
     return answers
 
 
@@ -352,9 +318,8 @@ def run_sequential_strategy(
 
     history = textwrap.dedent(
         f"""You are a helpful assistant that answers questions given a background passage.
-Provide the shortest possible span from the passage that answers each question.
-Respond strictly as JSON: {{\"answer\": \"<span-or-unknown>\"}}.
-If the answer is not explicitly stated, return {{\"answer\": \"unknown\"}}.
+You may reason for each question but must end with \\box{{answer}}.
+If the answer is unknown, use \\box{{unknown}}.
 
 Background:
 {background.strip()}
@@ -372,10 +337,10 @@ Background:
         total_prompt_tokens += p_tokens
         total_generated_tokens += g_tokens
         total_latency += elapsed
-        safe_text = text.replace('"', '\\"')
+        safe_text = text.replace("}", "\\}")
         history = (
             f"{history}Question ({question.qid}): {question.text.strip()}\n"
-            f"Answer JSON: {{\"answer\": \"{safe_text}\"}}\n\n"
+            f"Answer: \\box{{{safe_text}}}\n\n"
         )
 
     metrics = evaluate_predictions(answer_records, question_lookup)
@@ -402,12 +367,13 @@ def run_full_batch_strategy(
     text, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
         tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
     )
-    answers = parse_batch_answers(text, questions)
-    answer_records = {qid: (ans, bool(ans.strip())) for qid, ans in answers.items()}
+    parsed = parse_batch_answers(text, questions)
+    answer_records = {qid: (ans, valid) for qid, (ans, valid) in parsed.items()}
+    answers_text = {qid: ans for qid, (ans, _) in parsed.items()}
     metrics = evaluate_predictions(answer_records, {q.qid: q for q in questions})
     return StrategyResult(
         name="full_batch",
-        answers=answers,
+        answers=answers_text,
         prompt_tokens=p_tokens,
         generated_tokens=g_tokens,
         latency=elapsed,

@@ -17,6 +17,8 @@ PLANNER_SYSTEM_PROMPT = (
     "You are an expert planner. Analyse the questions and output only a JSON object describing dependencies."
 )
 
+BOX_PATTERN = re.compile(r"\\box\{([^}]*)\}")
+
 
 def build_chat_prompt(
     tokenizer: AutoTokenizer,
@@ -111,38 +113,12 @@ def compute_contains(prediction: str, references: List[str]) -> float:
     return 0.0
 
 
-def extract_json_answer(text: str) -> Optional[str]:
-    """Attempt to extract {"answer": "..."} from model text."""
-    cleaned = text.strip()
-    if not cleaned:
-        return None
-    if cleaned.startswith("```"):
-        parts = cleaned.split("```")
-        for part in parts:
-            part = part.strip()
-            if part.startswith("json"):
-                cleaned = part[4:].strip()
-                break
-            if part.startswith("{"):
-                cleaned = part
-                break
-    try:
-        payload = json.loads(cleaned)
-        value = payload.get("answer")
-        if isinstance(value, str):
-            return value.strip()
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*?\}", cleaned, re.DOTALL)
-        if match:
-            snippet = match.group(0)
-            try:
-                payload = json.loads(snippet)
-                value = payload.get("answer")
-                if isinstance(value, str):
-                    return value.strip()
-            except json.JSONDecodeError:
-                pass
-    return None
+def extract_box_answer(text: str) -> Tuple[str, bool]:
+    """Return the first \\box{...} content if present; otherwise fallback to raw text."""
+    match = BOX_PATTERN.search(text)
+    if match:
+        return match.group(1).strip(), True
+    return text.strip(), False
 
 
 def compute_f1(prediction: str, references: List[str]) -> float:
@@ -335,8 +311,10 @@ def build_answer_prompt(
 ) -> str:
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
-        "Analysis and provide the possible span from the passage that answers the question with a JSON object: {\"answer\": \"<span-or-unknown>\"}.",
-        "If uncertain, return {\"answer\": \"unknown\"}.",
+        "You may reason step by step, but the final answer must appear exactly once as \\box{...}.",
+        "If the answer is unknown, output \\box{unknown}. Do not omit the box.",
+        "Place the \\box{...} on the last line by itself. Example: \\box{42}",
+        "Omitting the final \\box leads to an incorrect answer.",
         "",
         "Background:",
         background.strip(),
@@ -348,10 +326,11 @@ def build_answer_prompt(
             dep_question = question_lookup[dep_id]
             dep_answer = answers.get(dep_id, "").strip()
             prompt_parts.append(f"{dep_id} - {dep_question.text.strip()}")
-            prompt_parts.append(f"Answer: {dep_answer}")
+            escaped = dep_answer.replace("}", "\\}")
+            prompt_parts.append(f"Answer: \\box{{{escaped}}}")
         prompt_parts.append("")
     prompt_parts.append(f"Question ({question.qid}): {question.text.strip()}")
-    prompt_parts.append("Answer in JSON:")
+    prompt_parts.append("After reasoning, finish with a single line containing \\box{answer} and nothing after it.")
     return "\n".join(prompt_parts)
 
 
@@ -387,9 +366,7 @@ def answer_question(
             break
         trimmed_tokens.append(token)
     raw_text = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
-    extracted = extract_json_answer(raw_text)
-    strict_valid = extracted is not None
-    answer = extracted if strict_valid else raw_text
+    answer, strict_valid = extract_box_answer(raw_text)
     gen_tokens = len(trimmed_tokens)
     return answer, prompt_tokens, gen_tokens, strict_valid, elapsed
 
