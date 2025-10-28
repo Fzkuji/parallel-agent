@@ -18,6 +18,12 @@ PLANNER_SYSTEM_PROMPT = (
 )
 
 BOX_PATTERN = re.compile(r"\\box\{([^}]*)\}")
+USE_THINK_TOKENS = True
+
+
+def set_think_tokens(enabled: bool) -> None:
+    global USE_THINK_TOKENS
+    USE_THINK_TOKENS = enabled
 
 
 def build_chat_prompt(
@@ -55,8 +61,11 @@ def build_chat_prompt(
         parts.append("Assistant:")
         prompt = "\n\n".join(parts)
 
-    if "<think>" not in prompt:
-        prompt = f"{prompt}<think></think>"
+    if USE_THINK_TOKENS:
+        if "<think>" not in prompt:
+            prompt = f"{prompt}<think></think>"
+    else:
+        prompt = prompt.replace("<think></think>", "")
     return prompt
 
 import torch
@@ -410,11 +419,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--no-llm-deps", action="store_true", help="Disable LLM dependency generation (use heuristics).")
     parser.add_argument("--log-level", default="INFO", help="Logging level.")
     parser.add_argument("--max-new-tokens", type=int, default=96, help="Max new tokens for answer generation.")
+    parser.add_argument(
+        "--no-think-tokens",
+        action="store_true",
+        help="Disable <think></think> markers in prompts.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_arguments()
+    set_think_tokens(not args.no_think_tokens)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
     logging.info("Loading tokenizer and model: %s", args.model_name)

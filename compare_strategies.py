@@ -24,12 +24,7 @@ from python import (
     load_squad_groups,
     select_dependency_edges,
 )
-from run_qwen_parallel import (
-    LocalLLMDependencyGenerator,
-    DEFAULT_SYSTEM_PROMPT,
-    build_chat_prompt,
-    extract_box_answer,
-)
+import run_qwen_parallel as rq
 
 
 def normalize_answer(text: str) -> str:
@@ -89,7 +84,7 @@ def generate_answer(
     max_new_tokens: int,
     temperature: Optional[float] = None,
 ) -> Tuple[str, str, int, int, float, bool]:
-    chat_prompt = build_chat_prompt(tokenizer, prompt, system_prompt=DEFAULT_SYSTEM_PROMPT)
+    chat_prompt = rq.build_chat_prompt(tokenizer, prompt, system_prompt=rq.DEFAULT_SYSTEM_PROMPT)
     inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
     gen_kwargs = dict(
@@ -127,7 +122,7 @@ def generate_answer(
         tokens.append(token)
 
     raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-    output_text, strict_valid = extract_box_answer(raw_text)
+    output_text, strict_valid = rq.extract_box_answer(raw_text)
     generated_tokens = len(tokens)
     return output_text, raw_text, prompt_tokens, generated_tokens, elapsed, strict_valid
 
@@ -298,7 +293,7 @@ def run_dependency_strategy(
 
     for batch in schedule.batches:
         batch_latencies: List[float] = []
-        batch_prompts: List[str] = []
+        batch_text_prompts: List[str] = []
         batch_questions: List[Question] = []
         dep_answers_per_question: List[List[Dict[str, str]]] = []
 
@@ -306,7 +301,7 @@ def run_dependency_strategy(
             question = question_lookup[qid]
             deps = sorted(question.dependencies)
             prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
-            batch_prompts.append(prompt)
+            batch_text_prompts.append(prompt)
             batch_questions.append(question)
             dep_answers_per_question.append(
                 [
@@ -315,7 +310,8 @@ def run_dependency_strategy(
                 ]
             )
 
-        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(model.device)
+        batch_chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in batch_text_prompts]
+        inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
         attention = inputs["attention_mask"]
         input_lengths = attention.sum(dim=1).tolist()
 
@@ -336,15 +332,15 @@ def run_dependency_strategy(
         eos_id = tokenizer.eos_token_id
         pad_id = tokenizer.pad_token_id or eos_id
 
-        raw_texts = tokenizer.batch_decode(
-            [
-                seq[int(input_len):].tolist()
-                for seq, input_len in zip(sequences, input_lengths)
-            ],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )
-        boxes = list(map(extract_box_answer, raw_texts))
+        raw_texts = []
+        for seq, input_len in zip(sequences, input_lengths):
+            tokens = []
+            for token in seq[int(input_len):].tolist():
+                if token in (eos_id, pad_id):
+                    break
+                tokens.append(token)
+            raw_texts.append(tokenizer.decode(tokens, skip_special_tokens=True).strip())
+        boxes = list(map(rq.extract_box_answer, raw_texts))
         gen_token_counts = [
             sum(1 for token in sequences[idx, int(input_lengths[idx]):].tolist() if token not in (eos_id, pad_id))
             for idx in range(len(batch_questions))
@@ -376,8 +372,8 @@ def run_dependency_strategy(
                     "question_id": question.qid,
                     "question": question.text.strip(),
                     "dependencies": dep_answers_per_question[idx],
-                    "prompt": batch_prompts[idx],
-                    "raw_response": raw_texts[idx].strip(),
+                    "prompt": batch_chat_prompts[idx],
+                    "raw_response": raw_texts[idx],
                     "final_answer": final_answer,
                     "strict_valid": strict_valid,
                     "latency": elapsed,
@@ -451,8 +447,11 @@ Background:
             conversation,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
         )
+        if rq.USE_THINK_TOKENS and "<think>" not in chat_prompt:
+            chat_prompt = f"{chat_prompt}<think></think>"
+        elif not rq.USE_THINK_TOKENS:
+            chat_prompt = chat_prompt.replace("<think></think>", "")
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[-1]
         start = time.perf_counter()
@@ -477,7 +476,7 @@ Background:
                 break
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
-        final_answer, strict_valid = extract_box_answer(raw_response)
+        final_answer, strict_valid = rq.extract_box_answer(raw_response)
         conversation.append({"role": "assistant", "content": raw_response})
 
         answer_records[question.qid] = (final_answer, strict_valid)
@@ -522,11 +521,12 @@ def run_full_batch_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
-    prompts = [
+    text_prompts = [
         build_answer_prompt(background, question, {}, [], question_lookup)
         for question in questions
     ]
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+    chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in text_prompts]
+    inputs = tokenizer(chat_prompts, return_tensors="pt", padding=True).to(model.device)
     attention = inputs["attention_mask"]
     input_lengths = attention.sum(dim=1).tolist()
     start = time.perf_counter()
@@ -551,15 +551,15 @@ def run_full_batch_strategy(
     total_prompt_tokens = sum(int(length) for length in input_lengths)
     total_generated_tokens = 0
 
-    raw_texts = tokenizer.batch_decode(
-        [
-            seq[input_len:].tolist()
-            for seq, input_len in zip(sequences, input_lengths)
-        ],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True,
-    )
-    boxes = list(map(extract_box_answer, raw_texts))
+    raw_texts = []
+    for seq, input_len in zip(sequences, input_lengths):
+        tokens = []
+        for token in seq[int(input_len):].tolist():
+            if token in (eos_id, pad_id):
+                break
+            tokens.append(token)
+        raw_texts.append(tokenizer.decode(tokens, skip_special_tokens=True).strip())
+    boxes = list(map(rq.extract_box_answer, raw_texts))
     answers_text = {
         question.qid: final_answer for question, (final_answer, _) in zip(questions, boxes)
     }
@@ -576,8 +576,8 @@ def run_full_batch_strategy(
         {
             "question_id": question.qid,
             "question": question.text.strip(),
-            "prompt": prompts[idx],
-            "raw_response": raw_texts[idx].strip(),
+            "prompt": chat_prompts[idx],
+            "raw_response": raw_texts[idx],
             "final_answer": boxes[idx][0],
             "strict_valid": boxes[idx][1],
             "prompt_tokens": int(input_lengths[idx]),
@@ -678,11 +678,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", help="Logging level.")
     parser.add_argument("--no-llm-deps", action="store_true", help="Force heuristic dependency generator.")
     parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
+    parser.add_argument(
+        "--no-think-tokens",
+        action="store_true",
+        help="Disable <think></think> markers in prompts.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    rq.set_think_tokens(not args.no_think_tokens)
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
     logging.info("Loading tokenizer and model: %s", args.model_name)
@@ -708,7 +714,7 @@ def main() -> None:
         dep_generator = HeuristicDependencyGenerator()
         logging.info("Using heuristic dependency generator.")
     else:
-        dep_generator = LocalLLMDependencyGenerator(tokenizer, model)
+        dep_generator = rq.LocalLLMDependencyGenerator(tokenizer, model)
         logging.info("Using local LLM dependency generator.")
 
     overall_results: Dict[str, List[StrategyResult]] = {}
