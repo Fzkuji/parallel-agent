@@ -28,7 +28,6 @@ from run_qwen_parallel import (
     LocalLLMDependencyGenerator,
     DEFAULT_SYSTEM_PROMPT,
     build_chat_prompt,
-    count_effective_tokens,
 )
 
 
@@ -155,8 +154,7 @@ def generate_answer(
     extracted = extract_json_answer(raw_text)
     strict_valid = extracted is not None
     output_text = extracted if strict_valid else raw_text
-    effective_text = raw_text if raw_text else output_text
-    generated_tokens = count_effective_tokens(tokenizer, effective_text)
+    generated_tokens = len(tokens)
     return output_text, prompt_tokens, generated_tokens, elapsed, strict_valid
 
 

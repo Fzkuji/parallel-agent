@@ -145,21 +145,6 @@ def extract_json_answer(text: str) -> Optional[str]:
     return None
 
 
-def count_effective_tokens(tokenizer: AutoTokenizer, raw_text: str) -> int:
-    """Estimate generated tokens used by trimming after the first closing brace."""
-    snippet = raw_text.strip()
-    if not snippet:
-        return 0
-    brace_idx = snippet.find("}")
-    if brace_idx != -1:
-        snippet = snippet[: brace_idx + 1]
-    token_ids = tokenizer(
-        snippet,
-        add_special_tokens=False,
-    )["input_ids"]
-    return len(token_ids)
-
-
 def compute_f1(prediction: str, references: List[str]) -> float:
     pred_tokens = normalize_answer(prediction).split()
     if not pred_tokens:
@@ -309,7 +294,7 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             tail_tokens.append(token)
         raw_text = self.tokenizer.decode(tail_tokens, skip_special_tokens=True).strip()
         text = raw_text
-        gen_tokens = count_effective_tokens(self.tokenizer, raw_text)
+        gen_tokens = len(tail_tokens)
         self.last_metrics = {
             "prompt_tokens": float(prompt_tokens),
             "generated_tokens": float(gen_tokens),
@@ -350,7 +335,7 @@ def build_answer_prompt(
 ) -> str:
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
-        "Analysis and provide the possible span from the passage that answers the question with a JSON object: {\"answer\": \"<span-or-unknown>\"}..",
+        "Analysis and provide the possible span from the passage that answers the question with a JSON object: {\"answer\": \"<span-or-unknown>\"}.",
         "If uncertain, return {\"answer\": \"unknown\"}.",
         "",
         "Background:",
@@ -405,7 +390,7 @@ def answer_question(
     extracted = extract_json_answer(raw_text)
     strict_valid = extracted is not None
     answer = extracted if strict_valid else raw_text
-    gen_tokens = count_effective_tokens(tokenizer, raw_text if raw_text else answer)
+    gen_tokens = len(trimmed_tokens)
     return answer, prompt_tokens, gen_tokens, strict_valid, elapsed
 
 
