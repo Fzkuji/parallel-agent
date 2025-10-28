@@ -298,6 +298,58 @@ def run_dependency_strategy(
 
     for batch in schedule.batches:
         batch_latencies: List[float] = []
+        batch_prompts: List[str] = []
+        batch_questions: List[Question] = []
+        dep_answers_per_question: List[List[Dict[str, str]]] = []
+
+        for qid in batch.question_ids:
+            question = question_lookup[qid]
+            deps = sorted(question.dependencies)
+            prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
+            batch_prompts.append(prompt)
+            batch_questions.append(question)
+            dep_answers_per_question.append(
+                [
+                    {"question_id": dep_id, "answer": answers_text.get(dep_id, "")}
+                    for dep_id in deps
+                ]
+            )
+
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(model.device)
+        attention = inputs["attention_mask"]
+        input_lengths = attention.sum(dim=1).tolist()
+
+        start = time.perf_counter()
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        elapsed = time.perf_counter() - start
+
+        sequences = generated.sequences
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+
+        raw_texts = tokenizer.batch_decode(
+            [
+                seq[int(input_len):].tolist()
+                for seq, input_len in zip(sequences, input_lengths)
+            ],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )
+        boxes = list(map(extract_box_answer, raw_texts))
+        gen_token_counts = [
+            sum(1 for token in sequences[idx, int(input_lengths[idx]):].tolist() if token not in (eos_id, pad_id))
+            for idx in range(len(batch_questions))
+        ]
+
         batch_info: Dict[str, Any] = {
             "batch_id": batch.batch_id,
             "depth": batch.depth,
@@ -307,41 +359,33 @@ def run_dependency_strategy(
             "incremental_prefill_tokens": batch.incremental_prefill_tokens,
             "generation_tokens": batch.generation_tokens,
             "total_tokens": batch.total_tokens,
+            "batch_latency": elapsed,
             "questions": [],
         }
-        for qid in batch.question_ids:
-            question = question_lookup[qid]
-            deps = sorted(question.dependencies)
-            prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
-            dependency_answers = [
-                {
-                    "question_id": dep_id,
-                    "answer": answers_text.get(dep_id, ""),
-                }
-                for dep_id in deps
-            ]
-            final_answer, raw_response, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
-                tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
-            )
-            answer_records[qid] = (final_answer, strict_valid)
-            answers_text[qid] = final_answer
-            total_prompt_tokens += p_tokens
-            total_generated_tokens += g_tokens
+
+        for idx, question in enumerate(batch_questions):
+            final_answer, strict_valid = boxes[idx]
+            answer_records[question.qid] = (final_answer, strict_valid)
+            answers_text[question.qid] = final_answer
+            total_prompt_tokens += int(input_lengths[idx])
+            total_generated_tokens += gen_token_counts[idx]
             batch_latencies.append(elapsed)
+
             batch_info["questions"].append(
                 {
-                    "question_id": qid,
+                    "question_id": question.qid,
                     "question": question.text.strip(),
-                    "dependencies": dependency_answers,
-                    "prompt": prompt,
-                    "raw_response": raw_response,
+                    "dependencies": dep_answers_per_question[idx],
+                    "prompt": batch_prompts[idx],
+                    "raw_response": raw_texts[idx].strip(),
                     "final_answer": final_answer,
                     "strict_valid": strict_valid,
                     "latency": elapsed,
-                    "prompt_tokens": p_tokens,
-                    "generated_tokens": g_tokens,
+                    "prompt_tokens": int(input_lengths[idx]),
+                    "generated_tokens": gen_token_counts[idx],
                 }
             )
+
         if batch_latencies:
             total_latency += max(batch_latencies)
         batch_details.append(batch_info)
@@ -381,46 +425,78 @@ def run_sequential_strategy(
     total_prompt_tokens = 0
     total_generated_tokens = 0
     total_latency = 0.0
-
-    history = textwrap.dedent(
-        f"""You are a helpful assistant that answers questions given a background passage.
-You may reason for each question but must end with \\box{{answer}}.
-If the answer is unknown, use \\box{{unknown}}.
+    conversation: List[Dict[str, str]] = [
+        {
+            "role": "system",
+            "content": textwrap.dedent(
+                f"""You are a helpful assistant that answers questions given a background passage.
+You will receive multiple questions one by one. Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
 
 Background:
 {background.strip()}
-
 """
-    )
+            ).strip(),
+        }
+    ]
 
     detail_records: List[Dict[str, Any]] = []
 
     for question in questions:
-        prompt = build_sequential_prompt(history, question)
-        final_answer, raw_response, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
-            tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
+        user_message = (
+            f"Question ({question.qid}): {question.text.strip()}\n"
+            "Respond with your reasoning if needed and ensure the very last line is \\box{answer}."
         )
+        conversation.append({"role": "user", "content": user_message})
+        chat_prompt = tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+        prompt_tokens = inputs["input_ids"].shape[-1]
+        start = time.perf_counter()
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        elapsed = time.perf_counter() - start
+        sequences = generated.sequences
+        generated_part = sequences[:, prompt_tokens:]
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+        trimmed_tokens: List[int] = []
+        for token in generated_part[0].tolist():
+            if token in (eos_id, pad_id):
+                break
+            trimmed_tokens.append(token)
+        raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+        final_answer, strict_valid = extract_box_answer(raw_response)
+        conversation.append({"role": "assistant", "content": raw_response})
+
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
-        total_prompt_tokens += p_tokens
-        total_generated_tokens += g_tokens
+        total_prompt_tokens += prompt_tokens
+        total_generated_tokens += len(trimmed_tokens)
         total_latency += elapsed
-        escaped_answer = final_answer.replace("}", "\\}")
-        history = (
-            f"{history}Question ({question.qid}): {question.text.strip()}\n"
-            f"Answer: \\box{{{escaped_answer}}}\n\n"
-        )
+
         detail_records.append(
             {
                 "question_id": question.qid,
                 "question": question.text.strip(),
-                "prompt": prompt,
+                "prompt": chat_prompt,
                 "raw_response": raw_response,
                 "final_answer": final_answer,
                 "strict_valid": strict_valid,
                 "latency": elapsed,
-                "prompt_tokens": p_tokens,
-                "generated_tokens": g_tokens,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": len(trimmed_tokens),
             }
         )
 
@@ -445,36 +521,81 @@ def run_full_batch_strategy(
     *,
     max_new_tokens: int,
 ) -> StrategyResult:
-    prompt = build_batch_prompt(background, questions)
-    _, raw_response, p_tokens, g_tokens, elapsed, strict_valid = generate_answer(
-        tokenizer, model, prompt, max_new_tokens=max_new_tokens, temperature=None
+    question_lookup = {q.qid: q for q in questions}
+    prompts = [
+        build_answer_prompt(background, question, {}, [], question_lookup)
+        for question in questions
+    ]
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
+    attention = inputs["attention_mask"]
+    input_lengths = attention.sum(dim=1).tolist()
+    start = time.perf_counter()
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+    elapsed = time.perf_counter() - start
+    sequences = generated.sequences
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+
+    answer_records: Dict[str, Tuple[str, bool]] = {}
+    answers_text: Dict[str, str] = {}
+    per_question: List[Dict[str, Any]] = []
+    total_prompt_tokens = sum(int(length) for length in input_lengths)
+    total_generated_tokens = 0
+
+    raw_texts = tokenizer.batch_decode(
+        [
+            seq[input_len:].tolist()
+            for seq, input_len in zip(sequences, input_lengths)
+        ],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
     )
-    parsed = parse_batch_answers(raw_response, questions)
-    answer_records = {qid: (ans, valid) for qid, (ans, valid) in parsed.items()}
-    answers_text = {qid: ans for qid, (ans, _) in parsed.items()}
-    metrics = evaluate_predictions(answer_records, {q.qid: q for q in questions})
+    boxes = list(map(extract_box_answer, raw_texts))
+    answers_text = {
+        question.qid: final_answer for question, (final_answer, _) in zip(questions, boxes)
+    }
+    answer_records = {
+        question.qid: (final_answer, strict_valid)
+        for question, (final_answer, strict_valid) in zip(questions, boxes)
+    }
+    generated_token_counts = [
+        sum(1 for token in sequences[idx, int(input_lengths[idx]):].tolist() if token not in (eos_id, pad_id))
+        for idx in range(len(questions))
+    ]
+    total_generated_tokens = sum(generated_token_counts)
     per_question = [
         {
             "question_id": question.qid,
             "question": question.text.strip(),
-            "final_answer": answers_text.get(question.qid, ""),
-            "strict_valid": parsed[question.qid][1],
+            "prompt": prompts[idx],
+            "raw_response": raw_texts[idx].strip(),
+            "final_answer": boxes[idx][0],
+            "strict_valid": boxes[idx][1],
+            "prompt_tokens": int(input_lengths[idx]),
+            "generated_tokens": generated_token_counts[idx],
         }
-        for question in questions
+        for idx, question in enumerate(questions)
     ]
+
+    metrics = evaluate_predictions(answer_records, question_lookup)
     return StrategyResult(
         name="full_batch",
         answers=answers_text,
-        prompt_tokens=p_tokens,
-        generated_tokens=g_tokens,
+        prompt_tokens=int(total_prompt_tokens),
+        generated_tokens=int(total_generated_tokens),
         latency=elapsed,
         batches=1,
         metrics=metrics,
-        details={
-            "prompt": prompt,
-            "raw_response": raw_response,
-            "per_question": per_question,
-        },
+        details={"questions": per_question},
     )
 
 
