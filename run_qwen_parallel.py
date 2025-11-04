@@ -380,10 +380,12 @@ def answer_question(
     return answer, prompt_tokens, gen_tokens, strict_valid, elapsed
 
 
-def evaluate_answers(predictions: Dict[str, Tuple[str, bool]], question_lookup: Dict[str, Question]) -> Dict[str, float]:
+def evaluate_answers(
+    predictions: Dict[str, Tuple[str, bool]], question_lookup: Dict[str, Question]
+) -> Dict[str, float]:
     total = len(predictions)
     if total == 0:
-        return {"strict_acc": 0.0, "lenient_acc": 0.0, "f1": 0.0}
+        return {"strict_sum": 0.0, "lenient_sum": 0.0, "f1_sum": 0.0, "total": 0}
     strict_sum = 0.0
     lenient_sum = 0.0
     f1_sum = 0.0
@@ -394,9 +396,10 @@ def evaluate_answers(predictions: Dict[str, Tuple[str, bool]], question_lookup: 
         lenient_sum += compute_contains(pred, references)
         f1_sum += compute_f1(pred, references)
     return {
-        "strict_acc": strict_sum / total,
-        "lenient_acc": lenient_sum / total,
-        "f1": f1_sum / total,
+        "strict_sum": strict_sum,
+        "lenient_sum": lenient_sum,
+        "f1_sum": f1_sum,
+        "total": total,
     }
 
 
@@ -458,9 +461,10 @@ def main() -> None:
         generator = LocalLLMDependencyGenerator(tokenizer, model)
         logging.info("Using local LLM dependency generator.")
 
-    aggregate_strict = []
-    aggregate_lenient = []
-    aggregate_f1 = []
+    total_strict_sum = 0.0
+    total_lenient_sum = 0.0
+    total_f1_sum = 0.0
+    total_questions = 0
 
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
@@ -536,15 +540,24 @@ def main() -> None:
                 total_latency += max(batch_latencies)
 
         metrics = evaluate_answers(answers, questions_dict)
-        aggregate_strict.append(metrics["strict_acc"])
-        aggregate_lenient.append(metrics["lenient_acc"])
-        aggregate_f1.append(metrics["f1"])
+        total_strict_sum += metrics["strict_sum"]
+        total_lenient_sum += metrics["lenient_sum"]
+        total_f1_sum += metrics["f1_sum"]
+        total_questions += metrics["total"]
+
+        if metrics["total"] > 0:
+            strict_acc = metrics["strict_sum"] / metrics["total"]
+            f1 = metrics["f1_sum"] / metrics["total"]
+            lenient_acc = metrics["lenient_sum"] / metrics["total"]
+        else:
+            strict_acc, f1, lenient_acc = 0.0, 0.0, 0.0
+
         logging.info(
             "Context %s metrics -> EM: %.3f | F1: %.3f | lenient ACC: %.3f",
             title,
-            metrics["strict_acc"],
-            metrics["f1"],
-            metrics["lenient_acc"],
+            strict_acc,
+            f1,
+            lenient_acc,
         )
         logging.info("Estimated parallel latency (max per batch sum): %.2fs", total_latency)
         logging.info("Total tokens -> prompt %.0f, generated %.0f", total_prompt_tokens, total_generated_tokens)
@@ -565,12 +578,12 @@ def main() -> None:
 
             export_schedule_html(scheduler, schedule_result, html_path, title=f"{title} schedule")
 
-    if aggregate_strict:
+    if total_questions > 0:
         logging.info(
             "Overall EM: %.3f | Overall F1: %.3f | Overall lenient ACC: %.3f",
-            sum(aggregate_strict) / len(aggregate_strict),
-            sum(aggregate_f1) / len(aggregate_f1),
-            sum(aggregate_lenient) / len(aggregate_lenient),
+            total_strict_sum / total_questions,
+            total_f1_sum / total_questions,
+            total_lenient_sum / total_questions,
         )
 
 
