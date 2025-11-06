@@ -367,10 +367,18 @@ def run_dependency_strategy(
             total_generated_tokens += gen_token_counts[idx]
             batch_latencies.append(elapsed)
 
+            # Debug logging
+            logging.debug(f"[DEPENDENCY] {question.qid}: {question.text.strip()}")
+            logging.debug(f"  Gold: {question.references}")
+            logging.debug(f"  Raw response: {raw_texts[idx][:200]}")
+            logging.debug(f"  Final answer: {final_answer}")
+            logging.debug(f"  Valid: {strict_valid}")
+
             batch_info["questions"].append(
                 {
                     "question_id": question.qid,
                     "question": question.text.strip(),
+                    "gold_answers": question.references,
                     "dependencies": dep_answers_per_question[idx],
                     "prompt": batch_chat_prompts[idx],
                     "raw_response": raw_texts[idx],
@@ -480,12 +488,20 @@ Background:
         total_generated_tokens += len(trimmed_tokens)
         total_latency += elapsed
 
+        # Debug logging
+        logging.debug(f"[SEQUENTIAL] {question.qid}: {question.text.strip()}")
+        logging.debug(f"  Gold: {question.references}")
+        logging.debug(f"  Raw response: {raw_response[:200]}")
+        logging.debug(f"  Final answer: {final_answer}")
+        logging.debug(f"  Valid: {strict_valid}")
+
         conversation_text += f"\nAssistant: {raw_response}"
 
         detail_records.append(
             {
                 "question_id": question.qid,
                 "question": question.text.strip(),
+                "gold_answers": question.references,
                 "prompt": chat_prompt,
                 "raw_response": raw_response,
                 "final_answer": final_answer,
@@ -576,10 +592,19 @@ def run_full_batch_strategy(
         for question, (final_answer, strict_valid) in zip(questions, boxes)
     }
 
+    # Debug logging
+    for idx, question in enumerate(questions):
+        logging.debug(f"[FULL_BATCH] {question.qid}: {question.text.strip()}")
+        logging.debug(f"  Gold: {question.references}")
+        logging.debug(f"  Raw response: {raw_texts[idx][:200]}")
+        logging.debug(f"  Final answer: {boxes[idx][0]}")
+        logging.debug(f"  Valid: {boxes[idx][1]}")
+
     per_question = [
         {
             "question_id": question.qid,
             "question": question.text.strip(),
+            "gold_answers": question.references,
             "prompt": chat_prompts[idx],
             "raw_response": raw_texts[idx],
             "final_answer": boxes[idx][0],
@@ -643,23 +668,48 @@ def print_answer_table(
 ) -> None:
     headers = ["QID", "Question", "Gold", "Sequential", "Full Batch", "Parallel"]
     rows = []
+    max_answer_len = 40
+    max_question_len = 60
+
     for question in questions:
         gold = "; ".join(question.references) if question.references else ""
+        if len(gold) > max_answer_len:
+            gold = gold[:max_answer_len-3] + "..."
+
+        question_text = question.text.strip()
+        if len(question_text) > max_question_len:
+            question_text = question_text[:max_question_len-3] + "..."
+
+        seq_ans = sequential.answers.get(question.qid, "")
+        batch_ans = full_batch.answers.get(question.qid, "")
+        dep_ans = dependency.answers.get(question.qid, "")
+
+        # Add markers for correct/incorrect
+        def mark_answer(ans, gold_refs):
+            if not ans:
+                return "∅"
+            norm_ans = normalize_answer(ans)
+            for ref in gold_refs:
+                if normalize_answer(ref) == norm_ans:
+                    return f"✓ {ans[:max_answer_len]}"
+            return f"✗ {ans[:max_answer_len]}"
+
         rows.append(
             [
                 question.qid,
-                question.text.strip(),
+                question_text,
                 gold,
-                sequential.answers.get(question.qid, ""),
-                full_batch.answers.get(question.qid, ""),
-                dependency.answers.get(question.qid, ""),
+                mark_answer(seq_ans, question.references),
+                mark_answer(batch_ans, question.references),
+                mark_answer(dep_ans, question.references),
             ]
         )
+
     widths = [max(len(str(cell)) for cell in column) for column in zip(headers, *rows)]
     header_line = " | ".join(h.ljust(widths[idx]) for idx, h in enumerate(headers))
     separator = "-+-".join("-" * width for width in widths)
     row_lines = [" | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)) for row in rows]
-    print("Answer comparison:")
+    print("\nAnswer comparison (✓ = correct, ✗ = incorrect, ∅ = empty):")
     print("\n".join([header_line, separator, *row_lines]))
 
 
@@ -687,13 +737,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable <think></think> markers in prompts.",
     )
+    parser.add_argument(
+        "--verbose-debug",
+        action="store_true",
+        help="Print detailed prompts and responses for debugging.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     rq.set_think_tokens(not args.no_think_tokens)
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
+    log_level = logging.DEBUG if args.verbose_debug else getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
 
     logging.info("Loading tokenizer and model: %s", args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -766,9 +822,14 @@ def main() -> None:
         print(f"\n=== Context: {title} ===")
         print(summarize_results([seq_res, batch_res, dep_res]))
         print_answer_table(questions, seq_res, batch_res, dep_res)
+        # Add gold answers for comparison
+        gold_answers = {q.qid: q.references for q in questions}
+
         serialized_contexts.append(
             {
                 "context": title,
+                "gold_answers": gold_answers,
+                "questions_text": {q.qid: q.text.strip() for q in questions},
                 "strategies": [
                     {
                         "name": res.name,
