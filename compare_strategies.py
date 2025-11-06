@@ -549,14 +549,25 @@ def run_full_batch_strategy(
     total_generated_tokens = 0
 
     raw_texts = []
+    boxes = []
+    generated_token_counts = []
     for seq, input_len in zip(sequences, input_lengths):
         tokens = []
         for token in seq[int(input_len):].tolist():
             if token in (eos_id, pad_id):
                 break
             tokens.append(token)
-        raw_texts.append(tokenizer.decode(tokens, skip_special_tokens=True).strip())
-    boxes = list(map(rq.extract_box_answer, raw_texts))
+        
+        raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+        raw_texts.append(raw_text)
+        
+        box = rq.extract_box_answer(raw_text)
+        boxes.append(box)
+        
+        generated_token_counts.append(len(tokens))
+
+    total_generated_tokens = sum(generated_token_counts)
+
     answers_text = {
         question.qid: final_answer for question, (final_answer, _) in zip(questions, boxes)
     }
@@ -564,11 +575,7 @@ def run_full_batch_strategy(
         question.qid: (final_answer, strict_valid)
         for question, (final_answer, strict_valid) in zip(questions, boxes)
     }
-    generated_token_counts = [
-        sum(1 for token in sequences[idx, int(input_lengths[idx]):].tolist() if token not in (eos_id, pad_id))
-        for idx in range(len(questions))
-    ]
-    total_generated_tokens = sum(generated_token_counts)
+
     per_question = [
         {
             "question_id": question.qid,
