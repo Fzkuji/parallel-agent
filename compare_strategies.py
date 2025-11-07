@@ -311,6 +311,11 @@ def run_dependency_strategy(
             )
 
         batch_chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in batch_text_prompts]
+
+        # Set left padding for batch generation
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+
         inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
         attention = inputs["attention_mask"]
         input_lengths = attention.sum(dim=1).tolist()
@@ -322,10 +327,14 @@ def run_dependency_strategy(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
                 return_dict_in_generate=True,
                 output_scores=False,
             )
+
+        # Restore original padding side
+        tokenizer.padding_side = original_padding_side
+
         elapsed = time.perf_counter() - start
 
         sequences = generated.sequences
@@ -539,9 +548,15 @@ def run_full_batch_strategy(
         for question in questions
     ]
     chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in text_prompts]
+
+    # Set left padding for batch generation
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
     inputs = tokenizer(chat_prompts, return_tensors="pt", padding=True).to(model.device)
     attention = inputs["attention_mask"]
     input_lengths = attention.sum(dim=1).tolist()
+
     start = time.perf_counter()
     with torch.no_grad():
         generated = model.generate(
@@ -549,10 +564,13 @@ def run_full_batch_strategy(
             max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
             return_dict_in_generate=True,
             output_scores=False,
         )
+
+    # Restore original padding side
+    tokenizer.padding_side = original_padding_side
     elapsed = time.perf_counter() - start
     sequences = generated.sequences
     eos_id = tokenizer.eos_token_id
