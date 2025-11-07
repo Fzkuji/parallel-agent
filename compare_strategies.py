@@ -452,11 +452,8 @@ Background:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=rq.USE_THINK_TOKENS,
         )
-        if rq.USE_THINK_TOKENS and "<think>" not in chat_prompt:
-            chat_prompt = f"{chat_prompt}<think></think>"
-        elif not rq.USE_THINK_TOKENS:
-            chat_prompt = chat_prompt.replace("<think></think>", "")
 
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[-1]

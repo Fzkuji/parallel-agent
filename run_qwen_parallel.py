@@ -44,8 +44,10 @@ def build_chat_prompt(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=USE_THINK_TOKENS,
         )
     else:
+        # Fallback for tokenizers without chat template support
         parts = []
         if system:
             parts.append(f"System: {system}")
@@ -53,11 +55,10 @@ def build_chat_prompt(
         parts.append("Assistant:")
         prompt = "\n\n".join(parts)
 
-    if USE_THINK_TOKENS:
-        if "<think>" not in prompt:
+        # Manually add thinking tokens for fallback case
+        if USE_THINK_TOKENS:
             prompt = f"{prompt}<think></think>"
-    else:
-        prompt = prompt.replace("<think></think>", "")
+
     return prompt
 
 import torch
