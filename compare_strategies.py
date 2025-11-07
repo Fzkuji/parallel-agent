@@ -136,10 +136,8 @@ def build_answer_prompt(
 ) -> str:
     prompt_parts = [
         "You are a helpful assistant that answers questions given a background passage.",
-        "You may reason freely, but the final answer must appear exactly once as \\box{...}.",
+        "You may reason freely, but give the final answer in the format \\box{...}. Example: \\box{42}",
         "If the answer is unknown, write \\box{unknown}.",
-        "Place the \\box{...} on the final line alone. Example: \\box{42}",
-        "If you omit the final \\box, the answer is invalid.",
         "",
         "Background:",
         background.strip(),
@@ -155,15 +153,7 @@ def build_answer_prompt(
             prompt_parts.append(f"Answer: \\box{{{escaped}}}")
         prompt_parts.append("")
     prompt_parts.append(f"Question ({question.qid}): {question.text.strip()}")
-    prompt_parts.append("After reasoning, finish with a single line containing \\box{answer} and nothing else.")
     return "\n".join(prompt_parts)
-
-
-def build_sequential_prompt(history: str, question: Question) -> str:
-    return (
-        f"{history}Question ({question.qid}): {question.text.strip()}\n"
-        "Respond with your reasoning. The very last line must be exactly one \\box{final answer} with no extra text.\n"
-    )
 
 
 def evaluate_predictions(predictions: Dict[str, Tuple[str, bool]], lookup: Dict[str, Question]) -> Dict[str, float]:
@@ -454,10 +444,7 @@ Background:
 
     for question in questions:
         # Add user question to conversation history
-        user_message = (
-            f"Question ({question.qid}): {question.text.strip()}\n"
-            "Respond with your reasoning if needed and ensure the very last line is \\box{answer}."
-        )
+        user_message = f"Question ({question.qid}): {question.text.strip()}"
         messages.append({"role": "user", "content": user_message})
 
         # Generate prompt using chat template
