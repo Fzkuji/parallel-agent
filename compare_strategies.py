@@ -439,7 +439,8 @@ def run_sequential_strategy(
     total_generated_tokens = 0
     total_latency = 0.0
 
-    conversation_text = textwrap.dedent(
+    # Initialize conversation history with system message
+    system_message = textwrap.dedent(
         f"""You are a helpful assistant that answers questions given a background passage.
 You will receive multiple questions one by one. Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
 
@@ -448,14 +449,18 @@ Background:
 """
     ).strip()
 
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
     detail_records: List[Dict[str, Any]] = []
 
     for question in questions:
-        conversation_text += (
-            f"\n\nQuestion ({question.qid}): {question.text.strip()}\n"
+        # Add user question to conversation history
+        user_message = (
+            f"Question ({question.qid}): {question.text.strip()}\n"
             "Respond with your reasoning if needed and ensure the very last line is \\box{answer}."
         )
-        messages = [{"role": "user", "content": conversation_text}]
+        messages.append({"role": "user", "content": user_message})
+
+        # Generate prompt using chat template
         chat_prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -465,6 +470,7 @@ Background:
             chat_prompt = f"{chat_prompt}<think></think>"
         elif not rq.USE_THINK_TOKENS:
             chat_prompt = chat_prompt.replace("<think></think>", "")
+
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[-1]
         start = time.perf_counter()
@@ -491,6 +497,9 @@ Background:
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
 
+        # Update conversation history with assistant response
+        messages.append({"role": "assistant", "content": raw_response})
+
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
         total_prompt_tokens += prompt_tokens
@@ -503,8 +512,6 @@ Background:
         logging.debug(f"  Raw response: {raw_response[:200]}")
         logging.debug(f"  Final answer: {final_answer}")
         logging.debug(f"  Valid: {strict_valid}")
-
-        conversation_text += f"\nAssistant: {raw_response}"
 
         detail_records.append(
             {
