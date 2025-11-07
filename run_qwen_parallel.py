@@ -40,19 +40,11 @@ def build_chat_prompt(
     messages.append({"role": "user", "content": user_prompt.strip()})
 
     if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
     else:
         parts = []
         if system:
