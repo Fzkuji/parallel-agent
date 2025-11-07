@@ -525,6 +525,121 @@ Background:
     )
 
 
+def run_independent_strategy(
+    background: str,
+    questions: List[Question],
+    tokenizer: AutoTokenizer,
+    model: AutoModelForCausalLM,
+    *,
+    max_new_tokens: int,
+) -> StrategyResult:
+    """
+    Theoretical upper bound: Each question is inferred independently without shared context.
+    This establishes the baseline for comparison:
+    - vs Sequential: shows impact of context accumulation
+    - vs Full_batch: shows GPU parallelization speedup
+    - Should have same answer quality as full_batch (both are independent inference)
+    """
+    question_lookup = {q.qid: q for q in questions}
+    answer_records: Dict[str, Tuple[str, bool]] = {}
+    answers_text: Dict[str, str] = {}
+    total_prompt_tokens = 0
+    total_generated_tokens = 0
+    total_latency = 0.0
+    detail_records: List[Dict[str, Any]] = []
+
+    # System message template (same for each question)
+    system_message = textwrap.dedent(
+        f"""You are a helpful assistant that answers questions given a background passage.
+Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
+
+Background:
+{background.strip()}
+"""
+    ).strip()
+
+    for question in questions:
+        # Each question gets a fresh conversation with no shared history
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Question ({question.qid}): {question.text.strip()}"},
+        ]
+
+        # Generate prompt using chat template
+        chat_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=rq.USE_THINK_TOKENS,
+        )
+
+        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+        prompt_tokens = inputs["input_ids"].shape[-1]
+        start = time.perf_counter()
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        elapsed = time.perf_counter() - start
+        sequences = generated.sequences
+        generated_part = sequences[:, prompt_tokens:]
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+        trimmed_tokens: List[int] = []
+        for token in generated_part[0].tolist():
+            if token in (eos_id, pad_id):
+                break
+            trimmed_tokens.append(token)
+        raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+        final_answer, strict_valid = rq.extract_box_answer(raw_response)
+
+        answer_records[question.qid] = (final_answer, strict_valid)
+        answers_text[question.qid] = final_answer
+        total_prompt_tokens += prompt_tokens
+        total_generated_tokens += len(trimmed_tokens)
+        total_latency += elapsed
+
+        # Debug logging
+        logging.debug(f"[INDEPENDENT] {question.qid}: {question.text.strip()}")
+        logging.debug(f"  Gold: {question.references}")
+        logging.debug(f"  Raw response: {raw_response[:200]}")
+        logging.debug(f"  Final answer: {final_answer}")
+        logging.debug(f"  Valid: {strict_valid}")
+
+        detail_records.append(
+            {
+                "question_id": question.qid,
+                "question": question.text.strip(),
+                "gold_answers": question.references,
+                "prompt": chat_prompt,
+                "raw_response": raw_response,
+                "final_answer": final_answer,
+                "strict_valid": strict_valid,
+                "latency": elapsed,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": len(trimmed_tokens),
+            }
+        )
+
+    metrics = evaluate_predictions(answer_records, question_lookup)
+    return StrategyResult(
+        name="independent",
+        answers=answers_text,
+        prompt_tokens=total_prompt_tokens,
+        generated_tokens=total_generated_tokens,
+        latency=total_latency,
+        batches=len(questions),
+        metrics=metrics,
+        details={"turns": detail_records},
+    )
+
+
 def run_full_batch_strategy(
     background: str,
     questions: List[Question],
@@ -672,10 +787,11 @@ def summarize_results(results: List[StrategyResult]) -> str:
 def print_answer_table(
     questions: List[Question],
     sequential: StrategyResult,
+    independent: StrategyResult,
     full_batch: StrategyResult,
     dependency: StrategyResult,
 ) -> None:
-    headers = ["QID", "Question", "Gold", "Sequential", "Full Batch", "Parallel"]
+    headers = ["QID", "Question", "Gold", "Sequential", "Independent", "Full Batch", "Parallel"]
     rows = []
     max_answer_len = 40
     max_question_len = 60
@@ -690,6 +806,7 @@ def print_answer_table(
             question_text = question_text[:max_question_len-3] + "..."
 
         seq_ans = sequential.answers.get(question.qid, "")
+        indep_ans = independent.answers.get(question.qid, "")
         batch_ans = full_batch.answers.get(question.qid, "")
         dep_ans = dependency.answers.get(question.qid, "")
 
@@ -709,6 +826,7 @@ def print_answer_table(
                 question_text,
                 gold,
                 mark_answer(seq_ans, question.references),
+                mark_answer(indep_ans, question.references),
                 mark_answer(batch_ans, question.references),
                 mark_answer(dep_ans, question.references),
             ]
@@ -808,6 +926,14 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
 
+        indep_res = run_independent_strategy(
+            background,
+            questions,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens * len(questions),  # Same per-question budget as full_batch
+        )
+
         batch_res = run_full_batch_strategy(
             background,
             questions,
@@ -829,10 +955,10 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
 
-        overall_results[title] = [seq_res, batch_res, dep_res]
+        overall_results[title] = [seq_res, indep_res, batch_res, dep_res]
         print(f"\n=== Context: {title} ===")
-        print(summarize_results([seq_res, batch_res, dep_res]))
-        print_answer_table(questions, seq_res, batch_res, dep_res)
+        print(summarize_results([seq_res, indep_res, batch_res, dep_res]))
+        print_answer_table(questions, seq_res, indep_res, batch_res, dep_res)
         # Add gold answers for comparison
         gold_answers = {q.qid: q.references for q in questions}
 
