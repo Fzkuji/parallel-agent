@@ -788,6 +788,8 @@ def main() -> None:
         seed=args.seed,
     )
 
+    logging.info("Loaded %d contexts (requested: %d)", len(contexts), args.context_count)
+
     if args.no_llm_deps:
         dep_generator = HeuristicDependencyGenerator()
         logging.info("Using heuristic dependency generator.")
@@ -932,6 +934,7 @@ def main() -> None:
             "contexts": serialized_contexts,
             "averages": summary_rows,
         }
+        logging.info("Saving %d contexts to JSON", len(serialized_contexts))
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         with args.json_out.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
