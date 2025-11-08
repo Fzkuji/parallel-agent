@@ -236,6 +236,15 @@ def run_dependency_strategy(
     total_cost_budget: Optional[int],
     max_new_tokens: int,
 ) -> StrategyResult:
+    """
+    Dependency-aware parallel strategy with theoretical upper bound latency.
+
+    Assumes infinite machines: within each batch (same dependency depth), questions run in parallel.
+    Batch latency = max(individual question latencies in that batch).
+    Total latency = sum of all batch latencies (batches run sequentially due to dependencies).
+
+    This represents the best-case parallelization given the dependency constraints.
+    """
     question_lookup = {q.qid: q for q in questions}
     edges = generator.generate_edges(background, questions)
     dep_metrics = getattr(generator, "last_metrics", None)
@@ -283,67 +292,76 @@ def run_dependency_strategy(
 
     for batch in schedule.batches:
         batch_latencies: List[float] = []
-        batch_text_prompts: List[str] = []
-        batch_questions: List[Question] = []
-        dep_answers_per_question: List[List[Dict[str, str]]] = []
+        batch_questions_data: List[Dict[str, Any]] = []
 
+        # Theoretical upper bound: infer each question independently to simulate infinite machines
+        # Within a batch, all questions can run in parallel, so batch_latency = max(individual latencies)
         for qid in batch.question_ids:
             question = question_lookup[qid]
             deps = sorted(question.dependencies)
             prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
-            batch_text_prompts.append(prompt)
-            batch_questions.append(question)
-            dep_answers_per_question.append(
-                [
-                    {"question_id": dep_id, "answer": answers_text.get(dep_id, "")}
-                    for dep_id in deps
-                ]
-            )
+            chat_prompt = rq.build_chat_prompt(tokenizer, prompt)
 
-        batch_chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in batch_text_prompts]
+            # Independent inference for this question
+            inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+            prompt_tokens = inputs["input_ids"].shape[-1]
 
-        # Set left padding for batch generation
-        original_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"
+            start = time.perf_counter()
+            with torch.no_grad():
+                generated = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                )
+            elapsed = time.perf_counter() - start
 
-        inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
-        attention = inputs["attention_mask"]
-        input_lengths = attention.sum(dim=1).tolist()
+            sequences = generated.sequences
+            eos_id = tokenizer.eos_token_id
+            pad_id = tokenizer.pad_token_id or eos_id
 
-        start = time.perf_counter()
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,  # Use eos as pad to avoid interference
-                return_dict_in_generate=True,
-                output_scores=False,
-            )
-
-        # Restore original padding side
-        tokenizer.padding_side = original_padding_side
-
-        elapsed = time.perf_counter() - start
-
-        sequences = generated.sequences
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id or eos_id
-
-        raw_texts = []
-        for seq, input_len in zip(sequences, input_lengths):
             tokens = []
-            for token in seq[int(input_len):].tolist():
+            for token in sequences[0, prompt_tokens:].tolist():
                 if token in (eos_id, pad_id):
                     break
                 tokens.append(token)
-            raw_texts.append(tokenizer.decode(tokens, skip_special_tokens=True).strip())
-        boxes = list(map(rq.extract_box_answer, raw_texts))
-        gen_token_counts = [
-            sum(1 for token in sequences[idx, int(input_lengths[idx]):].tolist() if token not in (eos_id, pad_id))
-            for idx in range(len(batch_questions))
-        ]
+
+            raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            final_answer, strict_valid = rq.extract_box_answer(raw_text)
+
+            answer_records[question.qid] = (final_answer, strict_valid)
+            answers_text[question.qid] = final_answer
+            total_prompt_tokens += prompt_tokens
+            total_generated_tokens += len(tokens)
+            batch_latencies.append(elapsed)
+
+            # Debug logging
+            logging.debug(f"[DEPENDENCY] {question.qid}: {question.text.strip()}")
+            logging.debug(f"  Gold: {question.references}")
+            logging.debug(f"  Raw response: {raw_text[:200]}")
+            logging.debug(f"  Final answer: {final_answer}")
+            logging.debug(f"  Valid: {strict_valid}")
+
+            batch_questions_data.append({
+                "question": question,
+                "dependencies": [
+                    {"question_id": dep_id, "answer": answers_text.get(dep_id, "")}
+                    for dep_id in deps
+                ],
+                "chat_prompt": chat_prompt,
+                "raw_text": raw_text,
+                "final_answer": final_answer,
+                "strict_valid": strict_valid,
+                "latency": elapsed,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": len(tokens),
+            })
+
+        # Batch latency = max individual latency (simulates perfect parallelization)
+        batch_latency = max(batch_latencies) if batch_latencies else 0.0
 
         batch_info: Dict[str, Any] = {
             "batch_id": batch.batch_id,
@@ -354,43 +372,29 @@ def run_dependency_strategy(
             "incremental_prefill_tokens": batch.incremental_prefill_tokens,
             "generation_tokens": batch.generation_tokens,
             "total_tokens": batch.total_tokens,
-            "batch_latency": elapsed,
+            "batch_latency": batch_latency,
             "questions": [],
         }
 
-        for idx, question in enumerate(batch_questions):
-            final_answer, strict_valid = boxes[idx]
-            answer_records[question.qid] = (final_answer, strict_valid)
-            answers_text[question.qid] = final_answer
-            total_prompt_tokens += int(input_lengths[idx])
-            total_generated_tokens += gen_token_counts[idx]
-            batch_latencies.append(elapsed)
-
-            # Debug logging
-            logging.debug(f"[DEPENDENCY] {question.qid}: {question.text.strip()}")
-            logging.debug(f"  Gold: {question.references}")
-            logging.debug(f"  Raw response: {raw_texts[idx][:200]}")
-            logging.debug(f"  Final answer: {final_answer}")
-            logging.debug(f"  Valid: {strict_valid}")
-
+        for data in batch_questions_data:
             batch_info["questions"].append(
                 {
-                    "question_id": question.qid,
-                    "question": question.text.strip(),
-                    "gold_answers": question.references,
-                    "dependencies": dep_answers_per_question[idx],
-                    "prompt": batch_chat_prompts[idx],
-                    "raw_response": raw_texts[idx],
-                    "final_answer": final_answer,
-                    "strict_valid": strict_valid,
-                    "latency": elapsed,
-                    "prompt_tokens": int(input_lengths[idx]),
-                    "generated_tokens": gen_token_counts[idx],
+                    "question_id": data["question"].qid,
+                    "question": data["question"].text.strip(),
+                    "gold_answers": data["question"].references,
+                    "dependencies": data["dependencies"],
+                    "prompt": data["chat_prompt"],
+                    "raw_response": data["raw_text"],
+                    "final_answer": data["final_answer"],
+                    "strict_valid": data["strict_valid"],
+                    "latency": data["latency"],
+                    "prompt_tokens": data["prompt_tokens"],
+                    "generated_tokens": data["generated_tokens"],
                 }
             )
 
-        if batch_latencies:
-            total_latency += max(batch_latencies)
+        # Add batch's max latency to total (simulates sequential batches, parallel within batch)
+        total_latency += batch_latency
         batch_details.append(batch_info)
 
     metrics = evaluate_predictions(answer_records, question_lookup)
