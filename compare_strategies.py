@@ -317,7 +317,7 @@ def run_dependency_strategy(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
+                pad_token_id=tokenizer.eos_token_id,  # Use eos as pad to avoid interference
                 return_dict_in_generate=True,
                 output_scores=False,
             )
@@ -691,7 +691,7 @@ Background:
             max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            pad_token_id=tokenizer.eos_token_id,  # Use eos as pad to avoid interference
             return_dict_in_generate=True,
             output_scores=False,
         )

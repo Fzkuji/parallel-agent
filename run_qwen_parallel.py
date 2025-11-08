@@ -155,6 +155,24 @@ def decode_generated(
 
 def extract_json_from_text(text: str) -> dict:
     cleaned = text.strip()
+
+    # Remove thinking tokens first (handles both <think></think> and <think>...</think>)
+    # This handles multi-line thinking blocks
+    while True:
+        think_start = cleaned.find("<think>")
+        if think_start == -1:
+            break
+        think_end = cleaned.find("</think>", think_start)
+        if think_end == -1:
+            # Unclosed think tag, remove from start to end
+            cleaned = cleaned[:think_start] + cleaned[think_start + 7:]
+            break
+        # Remove the entire <think>...</think> block
+        cleaned = cleaned[:think_start] + cleaned[think_end + 8:]
+
+    cleaned = cleaned.strip()
+
+    # Handle markdown code blocks
     if cleaned.startswith("```"):
         parts = cleaned.split("```")
         for part in parts:
@@ -162,6 +180,11 @@ def extract_json_from_text(text: str) -> dict:
             if part.startswith("json"):
                 cleaned = part[4:].strip()
                 break
+            elif part and not part.startswith("```"):
+                # Try the first non-empty block that doesn't start with ```
+                cleaned = part.strip()
+                break
+
     def try_parse(candidate: str) -> Optional[dict]:
         try:
             return json.loads(candidate)
@@ -197,26 +220,32 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         f"""
         你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
-        以 JSON 形式列出问题之间的依赖关系。直接输出以下结构：
+        **重要：你的回答必须是markdown代码块格式，以```json开头，以```结尾。**
+
+        输出格式示例：
+        ```json
         {{
           "edges": [
             {{"source": "Q1", "target": "Q3", "confidence": 0.72}},
-            ...
+            {{"source": "Q2", "target": "Q4", "confidence": 0.85}}
           ]
         }}
+        ```
 
         规则：
         - 只能使用给定问题的 ID 作为 source/target。
         - confidence 取值 0~1 的数字。
-        - 无需依赖的题目可省略。
+        - 无需依赖的题目可省略（返回空edges数组）。
         - 禁止引用不存在的 ID，禁止循环依赖。
-        - 不需要额外分析，直接给出依赖图json
+        - 不需要额外解释或分析，只输出```json代码块。
 
         背景：
         {background.strip()}
 
         问题：
         {os.linesep.join(question_lines)}
+
+        请直接输出```json代码块：
         """
     ).strip()
     return prompt
