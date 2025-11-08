@@ -534,10 +534,11 @@ def run_independent_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     """
-    Theoretical upper bound: Each question is inferred independently without shared context.
-    This establishes the baseline for comparison:
-    - vs Sequential: shows impact of context accumulation
-    - vs Full_batch: shows GPU parallelization speedup
+    Theoretical optimal parallel bound: Each question is inferred independently on separate machines.
+    Assumes infinite parallelism (unlimited machines), so total latency = max individual latency.
+    This establishes the best-case baseline for comparison:
+    - vs Sequential: shows maximum parallelization benefit
+    - vs Full_batch: shows overhead of single-GPU batch inference (padding, synchronization)
     - Should have same answer quality as full_batch (both are independent inference)
     """
     question_lookup = {q.qid: q for q in questions}
@@ -545,7 +546,7 @@ def run_independent_strategy(
     answers_text: Dict[str, str] = {}
     total_prompt_tokens = 0
     total_generated_tokens = 0
-    total_latency = 0.0
+    max_latency = 0.0  # Track the longest individual inference time
     detail_records: List[Dict[str, Any]] = []
 
     # System message template (same for each question)
@@ -603,7 +604,7 @@ Background:
         answers_text[question.qid] = final_answer
         total_prompt_tokens += prompt_tokens
         total_generated_tokens += len(trimmed_tokens)
-        total_latency += elapsed
+        max_latency = max(max_latency, elapsed)  # Track maximum latency (parallel upper bound)
 
         # Debug logging
         logging.debug(f"[INDEPENDENT] {question.qid}: {question.text.strip()}")
@@ -633,7 +634,7 @@ Background:
         answers=answers_text,
         prompt_tokens=total_prompt_tokens,
         generated_tokens=total_generated_tokens,
-        latency=total_latency,
+        latency=max_latency,  # Use max latency to simulate perfect parallelization
         batches=len(questions),
         metrics=metrics,
         details={"turns": detail_records},
@@ -931,7 +932,7 @@ def main() -> None:
             questions,
             tokenizer,
             model,
-            max_new_tokens=args.max_new_tokens * len(questions),  # Same per-question budget as full_batch
+            max_new_tokens=args.max_new_tokens,  # Each question gets the same per-question budget
         )
 
         batch_res = run_full_batch_strategy(
@@ -939,7 +940,7 @@ def main() -> None:
             questions,
             tokenizer,
             model,
-            max_new_tokens=args.max_new_tokens * len(questions),
+            max_new_tokens=args.max_new_tokens,  # Each question gets the same budget in batch
         )
 
         dep_res = run_dependency_strategy(
