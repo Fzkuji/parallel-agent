@@ -650,11 +650,31 @@ def run_full_batch_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
-    text_prompts = [
-        build_answer_prompt(background, question, {}, [], question_lookup)
-        for question in questions
-    ]
-    chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in text_prompts]
+
+    # Use the same system message structure as Independent strategy
+    system_message = textwrap.dedent(
+        f"""You are a helpful assistant that answers questions given a background passage.
+Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
+
+Background:
+{background.strip()}
+"""
+    ).strip()
+
+    # Build chat prompts using the same structure as Independent
+    chat_prompts = []
+    for question in questions:
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": f"Question ({question.qid}): {question.text.strip()}"},
+        ]
+        chat_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=rq.USE_THINK_TOKENS,
+        )
+        chat_prompts.append(chat_prompt)
 
     # Set left padding for batch generation
     original_padding_side = tokenizer.padding_side
