@@ -513,10 +513,17 @@ def run_dependency_batch_strategy(
         attention = inputs["attention_mask"]
         input_lengths = attention.sum(dim=1).tolist()
 
+        # Construct position_ids to start from 0 for each sequence (ignoring padding)
+        position_ids = torch.zeros_like(attention)
+        for i in range(len(position_ids)):
+            mask = attention[i]
+            position_ids[i] = (mask.cumsum(dim=0) - 1).clamp(min=0) * mask
+
         start = time.perf_counter()
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
+                position_ids=position_ids,  # Override default position_ids
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
@@ -886,10 +893,21 @@ Background:
     attention = inputs["attention_mask"]
     input_lengths = attention.sum(dim=1).tolist()
 
+    # Construct position_ids to start from 0 for each sequence (ignoring padding)
+    # This ensures all sequences use the same position embeddings regardless of padding
+    position_ids = torch.zeros_like(attention)
+    for i in range(len(position_ids)):
+        mask = attention[i]
+        # Cumsum creates positions starting from 0 for valid tokens
+        position_ids[i] = (mask.cumsum(dim=0) - 1).clamp(min=0)
+        # Set padding positions to 0 (they will be masked anyway)
+        position_ids[i] = position_ids[i] * mask
+
     start = time.perf_counter()
     with torch.no_grad():
         generated = model.generate(
             **inputs,
+            position_ids=position_ids,  # Override default position_ids
             max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
