@@ -18,10 +18,15 @@ PLANNER_SYSTEM_PROMPT = (
 )
 
 BOX_PATTERN = re.compile(r"\\box\{([^}]*)\}")
+
+# Control whether to add <think></think> tags in prompts
+# True: Add empty <think>\n\n</think>\n\n tags (prevents actual thinking, just provides structure)
+# False: No thinking tags at all
 USE_THINK_TOKENS = True
 
 
 def set_think_tokens(enabled: bool) -> None:
+    """Enable/disable adding <think></think> tags to prompts."""
     global USE_THINK_TOKENS
     USE_THINK_TOKENS = enabled
 
@@ -40,11 +45,15 @@ def build_chat_prompt(
     messages.append({"role": "user", "content": user_prompt.strip()})
 
     if hasattr(tokenizer, "apply_chat_template"):
+        # Qwen3 quirk: enable_thinking parameter is inverted
+        # - enable_thinking=False → adds <think>\n\n</think>\n\n to prompt
+        # - enable_thinking=True  → no thinking tags
+        # We want tags when USE_THINK_TOKENS=True, so we use enable_thinking=False
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=USE_THINK_TOKENS,
+            enable_thinking=(not USE_THINK_TOKENS),
         )
     else:
         # Fallback for tokenizers without chat template support
