@@ -1217,7 +1217,7 @@ def main() -> None:
                         "answers": res.answers,
                         "details": res.details,
                     }
-                    for res in (seq_res, batch_res, dep_res)
+                    for res in (seq_res, batch_res, batch_ideal_res, parallel_res, parallel_ideal_res)
                 ],
             }
         )
