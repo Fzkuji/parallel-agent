@@ -505,7 +505,7 @@ def run_dependency_batch_strategy(
 
         batch_chat_prompts = [rq.build_chat_prompt(tokenizer, prompt) for prompt in batch_text_prompts]
 
-        # Set left padding for batch generation
+        # Use left padding for batch generation (standard for decoder-only models)
         original_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
 
@@ -513,17 +513,10 @@ def run_dependency_batch_strategy(
         attention = inputs["attention_mask"]
         input_lengths = attention.sum(dim=1).tolist()
 
-        # Construct position_ids to start from 0 for each sequence (ignoring padding)
-        position_ids = torch.zeros_like(attention)
-        for i in range(len(position_ids)):
-            mask = attention[i]
-            position_ids[i] = (mask.cumsum(dim=0) - 1).clamp(min=0) * mask
-
         start = time.perf_counter()
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
-                position_ids=position_ids,  # Override default position_ids
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 eos_token_id=tokenizer.eos_token_id,
@@ -870,22 +863,29 @@ Background:
 """
     ).strip()
 
-    # Build chat prompts using the same structure as Independent
+    # Build chat prompts - manually control generation prompt to avoid left padding issues
     chat_prompts = []
     for question in questions:
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_message},
             {"role": "user", "content": f"Question ({question.qid}): {question.text.strip()}"},
         ]
+        # Apply chat template without add_generation_prompt to avoid issues with left padding
         chat_prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=(not rq.USE_THINK_TOKENS),  # Qwen3 quirk: False adds <think> tags
+            add_generation_prompt=False,  # We'll add the assistant prompt manually
+            enable_thinking=(not rq.USE_THINK_TOKENS),
         )
+        # Manually add assistant start - this works better with left padding
+        # Format: <|im_start|>assistant\n
+        chat_prompt = chat_prompt + "<|im_start|>assistant\n"
+        # Add thinking tags if enabled (empty tags to structure output without actual thinking)
+        if rq.USE_THINK_TOKENS:
+            chat_prompt = chat_prompt + "<think>\n\n</think>\n\n"
         chat_prompts.append(chat_prompt)
 
-    # Set left padding for batch generation
+    # Use left padding for batch generation (standard for decoder-only models)
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
 
@@ -893,21 +893,11 @@ Background:
     attention = inputs["attention_mask"]
     input_lengths = attention.sum(dim=1).tolist()
 
-    # Construct position_ids to start from 0 for each sequence (ignoring padding)
-    # This ensures all sequences use the same position embeddings regardless of padding
-    position_ids = torch.zeros_like(attention)
-    for i in range(len(position_ids)):
-        mask = attention[i]
-        # Cumsum creates positions starting from 0 for valid tokens
-        position_ids[i] = (mask.cumsum(dim=0) - 1).clamp(min=0)
-        # Set padding positions to 0 (they will be masked anyway)
-        position_ids[i] = position_ids[i] * mask
 
     start = time.perf_counter()
     with torch.no_grad():
         generated = model.generate(
             **inputs,
-            position_ids=position_ids,  # Override default position_ids
             max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
@@ -932,19 +922,20 @@ Background:
     raw_texts = []
     boxes = []
     generated_token_counts = []
-    for seq, input_len in zip(sequences, input_lengths):
+    for idx, (seq, input_len) in enumerate(zip(sequences, input_lengths)):
         tokens = []
         for token in seq[int(input_len):].tolist():
             if token in (eos_id, pad_id):
                 break
             tokens.append(token)
-        
+
+
         raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
         raw_texts.append(raw_text)
-        
+
         box = rq.extract_box_answer(raw_text)
         boxes.append(box)
-        
+
         generated_token_counts.append(len(tokens))
 
     total_generated_tokens = sum(generated_token_counts)

@@ -22,7 +22,9 @@ BOX_PATTERN = re.compile(r"\\box\{([^}]*)\}")
 # Control whether to add <think></think> tags in prompts
 # True: Add empty <think>\n\n</think>\n\n tags (prevents actual thinking, just provides structure)
 # False: No thinking tags at all
-USE_THINK_TOKENS = True
+# Note: In batch inference with left padding, Qwen3 may regenerate chat template markers
+# when thinking tokens are present. Setting to False for batch compatibility.
+USE_THINK_TOKENS = False
 
 
 def set_think_tokens(enabled: bool) -> None:
@@ -49,12 +51,21 @@ def build_chat_prompt(
         # - enable_thinking=False → adds <think>\n\n</think>\n\n to prompt
         # - enable_thinking=True  → no thinking tags
         # We want tags when USE_THINK_TOKENS=True, so we use enable_thinking=False
+        #
+        # Note: Using add_generation_prompt=False and manually adding assistant start
+        # to avoid issues with left padding in batch inference (model regenerates the
+        # assistant tag when there's padding)
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
+            add_generation_prompt=False,  # Manually add below to avoid left padding issues
             enable_thinking=(not USE_THINK_TOKENS),
         )
+        # Manually add assistant start token
+        prompt = prompt + "<|im_start|>assistant\n"
+        # Add thinking tags if enabled (empty tags to structure output without actual thinking)
+        if USE_THINK_TOKENS:
+            prompt = prompt + "<think>\n\n</think>\n\n"
     else:
         # Fallback for tokenizers without chat template support
         parts = []
