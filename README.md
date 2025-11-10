@@ -53,8 +53,13 @@ Runs three strategies side-by-side on sampled contexts:
 1. **sequential** – questions answered one-by-one (no reuse).
 2. **full_batch** – model answers all questions in a single prompt.
 3. **dependency_parallel** – DAG-driven batches (same as `run_qwen_parallel.py`).
+4. **parallel_ideal** – dependency DAG with theoretical infinite-parallel batches.
+5. **parallel_bert** – uses BERT self-attention weights to derive dependencies, then runs the same batch executor.
+6. **parallel_bert_ideal** – theoretical upper bound for the attention-derived DAG.
 
 For each context it prints per-strategy strict accuracy (`answer` JSON matches gold exactly), lenient accuracy (answer text contains the gold span), prompt/generation token usage, latency, and batch count; averages are reported at the end.
+
+Use the `--bert-*` flags (model name, attention/dependency thresholds, token caps, and cost weight) to tune the attention-based strategies without affecting the LLM-driven dependency runs.
 
 ### Example
 
@@ -69,6 +74,24 @@ python compare_strategies.py \
 ```
 
 Additional flags mirror `run_qwen_parallel.py` (`--no-llm-deps`, `--max-dependencies`, `--cost-weight`, etc.).
+
+## Offline dependency experiments
+
+`test_bert_dependencies.py` now packs every question into a single BERT encoder pass, aggregates token-to-token attentions, and converts those weights into dependency confidences. This reproduces the “question A attends strongly to question B” signal without running the full Qwen pipeline.
+
+Example:
+
+```bash
+python test_bert_dependencies.py \
+  --model-name bert-base-uncased \
+  --context-count 4 \
+  --attention-threshold 0.02 \
+  --dependency-threshold 0.02 \
+  --max-dependencies 3 \
+  --show-attention-summary \
+  --show-attention-matrix \
+  --show-attention-summary
+```
 
 ## Notes
 

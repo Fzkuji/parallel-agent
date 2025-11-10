@@ -15,7 +15,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from python import (
-    EdgeCandidate,
+    BertAttentionDependencyGenerator,
     DependencyScheduler,
     HeuristicDependencyGenerator,
     Question,
@@ -235,6 +235,7 @@ def run_dependency_ideal_strategy(
     max_dependencies: int,
     total_cost_budget: Optional[int],
     max_new_tokens: int,
+    strategy_name: str = "parallel_ideal",
 ) -> StrategyResult:
     """
     Dependency-aware parallel strategy with theoretical upper bound latency.
@@ -399,7 +400,7 @@ def run_dependency_ideal_strategy(
 
     metrics = evaluate_predictions(answer_records, question_lookup)
     return StrategyResult(
-        name="parallel_ideal",
+        name=strategy_name,
         answers=answers_text,
         prompt_tokens=int(total_prompt_tokens),
         generated_tokens=int(total_generated_tokens),
@@ -430,6 +431,7 @@ def run_dependency_batch_strategy(
     max_dependencies: int,
     total_cost_budget: Optional[int],
     max_new_tokens: int,
+    strategy_name: str = "parallel",
 ) -> StrategyResult:
     """
     Dependency-aware parallel strategy with ACTUAL batch inference.
@@ -597,7 +599,7 @@ def run_dependency_batch_strategy(
 
     metrics = evaluate_predictions(answer_records, question_lookup)
     return StrategyResult(
-        name="parallel",
+        name=strategy_name,
         answers=answers_text,
         prompt_tokens=int(total_prompt_tokens),
         generated_tokens=int(total_generated_tokens),
@@ -1018,13 +1020,9 @@ def summarize_results(results: List[StrategyResult]) -> str:
 
 def print_answer_table(
     questions: List[Question],
-    sequential: StrategyResult,
-    batch: StrategyResult,
-    batch_ideal: StrategyResult,
-    parallel: StrategyResult,
-    parallel_ideal: StrategyResult,
+    strategies: List[StrategyResult],
 ) -> None:
-    headers = ["QID", "Question", "Gold", "Sequential", "Batch", "Batch Ideal", "Parallel", "Parallel Ideal"]
+    headers = ["QID", "Question", "Gold"] + [res.name for res in strategies]
     rows = []
     max_answer_len = 40
     max_question_len = 60
@@ -1038,12 +1036,6 @@ def print_answer_table(
         if len(question_text) > max_question_len:
             question_text = question_text[:max_question_len-3] + "..."
 
-        seq_ans = sequential.answers.get(question.qid, "")
-        batch_ans = batch.answers.get(question.qid, "")
-        batch_ideal_ans = batch_ideal.answers.get(question.qid, "")
-        parallel_ans = parallel.answers.get(question.qid, "")
-        parallel_ideal_ans = parallel_ideal.answers.get(question.qid, "")
-
         # Add markers for correct/incorrect
         def mark_answer(ans, gold_refs):
             if not ans:
@@ -1054,18 +1046,10 @@ def print_answer_table(
                     return f"✓ {ans[:max_answer_len]}"
             return f"✗ {ans[:max_answer_len]}"
 
-        rows.append(
-            [
-                question.qid,
-                question_text,
-                gold,
-                mark_answer(seq_ans, question.references),
-                mark_answer(batch_ans, question.references),
-                mark_answer(batch_ideal_ans, question.references),
-                mark_answer(parallel_ans, question.references),
-                mark_answer(parallel_ideal_ans, question.references),
-            ]
-        )
+        row = [question.qid, question_text, gold]
+        for res in strategies:
+            row.append(mark_answer(res.answers.get(question.qid, ""), question.references))
+        rows.append(row)
 
     widths = [max(len(str(cell)) for cell in column) for column in zip(headers, *rows)]
     header_line = " | ".join(h.ljust(widths[idx]) for idx, h in enumerate(headers))
@@ -1104,6 +1088,41 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print detailed prompts and responses for debugging.",
     )
+    parser.add_argument(
+        "--bert-model-name",
+        default="bert-base-uncased",
+        help="Encoder-only model for attention-based dependencies (default: bert-base-uncased).",
+    )
+    parser.add_argument(
+        "--bert-attention-threshold",
+        type=float,
+        default=0.05,
+        help="Minimum attention mass to create a candidate edge (default: 0.05).",
+    )
+    parser.add_argument(
+        "--bert-dependency-threshold",
+        type=float,
+        default=None,
+        help="Minimum confidence for selected BERT dependencies (defaults to attention threshold).",
+    )
+    parser.add_argument(
+        "--bert-max-question-tokens",
+        type=int,
+        default=64,
+        help="Max wordpiece tokens per question when packing for BERT (default: 64).",
+    )
+    parser.add_argument(
+        "--bert-max-seq-length",
+        type=int,
+        default=512,
+        help="Max total packed length for BERT attention encoding (default: 512).",
+    )
+    parser.add_argument(
+        "--bert-cost-weight",
+        type=float,
+        default=0.0,
+        help="Cost penalty weight for BERT-based dependency selection (default: 0.0).",
+    )
     return parser.parse_args()
 
 
@@ -1140,6 +1159,20 @@ def main() -> None:
     else:
         dep_generator = rq.LocalLLMDependencyGenerator(tokenizer, model)
         logging.info("Using local LLM dependency generator.")
+
+    bert_conf_threshold = args.bert_dependency_threshold or args.bert_attention_threshold
+    logging.info(
+        "Initializing BERT attention dependency generator (%s)", args.bert_model_name
+    )
+    try:
+        bert_dep_generator = BertAttentionDependencyGenerator(
+            model_name=args.bert_model_name,
+            attention_threshold=args.bert_attention_threshold,
+            max_question_tokens=args.bert_max_question_tokens,
+            max_total_tokens=args.bert_max_seq_length,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(f"Failed to initialize BERT dependency generator: {exc}") from exc
 
     overall_results: Dict[str, List[StrategyResult]] = {}
     serialized_contexts: List[dict] = []
@@ -1203,10 +1236,47 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
 
-        overall_results[title] = [seq_res, batch_res, batch_ideal_res, parallel_res, parallel_ideal_res]
+        parallel_bert_res = run_dependency_batch_strategy(
+            background,
+            questions,
+            bert_dep_generator,
+            tokenizer,
+            model,
+            cost_weight=args.bert_cost_weight,
+            min_confidence=bert_conf_threshold,
+            max_dependencies=args.max_dependencies,
+            total_cost_budget=args.total_cost_budget,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="parallel_bert",
+        )
+
+        parallel_bert_ideal_res = run_dependency_ideal_strategy(
+            background,
+            questions,
+            bert_dep_generator,
+            tokenizer,
+            model,
+            cost_weight=args.bert_cost_weight,
+            min_confidence=bert_conf_threshold,
+            max_dependencies=args.max_dependencies,
+            total_cost_budget=args.total_cost_budget,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="parallel_bert_ideal",
+        )
+
+        strategy_list = [
+            seq_res,
+            batch_res,
+            batch_ideal_res,
+            parallel_res,
+            parallel_ideal_res,
+            parallel_bert_res,
+            parallel_bert_ideal_res,
+        ]
+        overall_results[title] = strategy_list
         print(f"\n=== Context: {title} ===")
-        print(summarize_results([seq_res, batch_res, batch_ideal_res, parallel_res, parallel_ideal_res]))
-        print_answer_table(questions, seq_res, batch_res, batch_ideal_res, parallel_res, parallel_ideal_res)
+        print(summarize_results(strategy_list))
+        print_answer_table(questions, strategy_list)
         # Add gold answers for comparison
         gold_answers = {q.qid: q.references for q in questions}
 
@@ -1226,7 +1296,7 @@ def main() -> None:
                         "answers": res.answers,
                         "details": res.details,
                     }
-                    for res in (seq_res, batch_res, batch_ideal_res, parallel_res, parallel_ideal_res)
+                    for res in strategy_list
                 ],
             }
         )
