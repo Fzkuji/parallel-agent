@@ -210,6 +210,15 @@ def run_all_strategies(
 
 
 def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
+    preferred_order = [
+        "sequential",
+        "batch",
+        "batch_ideal",
+        "parallel",
+        "parallel_ideal",
+        "parallel_bert",
+        "parallel_bert_ideal",
+    ]
     strategy_totals: Dict[str, Dict[str, float]] = {}
     for results in overall_results.values():
         for res in results:
@@ -240,7 +249,13 @@ def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
     separator = "-" * len(header)
     summary_lines.extend([header, separator])
 
-    for name, stats in sorted(strategy_totals.items()):
+    ordered_names = preferred_order + [
+        name for name in strategy_totals.keys() if name not in preferred_order
+    ]
+    for name in ordered_names:
+        stats = strategy_totals.get(name)
+        if not stats:
+            continue
         count = stats["count"] or 1
         summary_lines.append(
             f"{name:<13} | "
