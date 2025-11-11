@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import textwrap
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -933,6 +934,8 @@ class BertAttentionDependencyGenerator(DependencyGraphGenerator):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.model.eval()
+        self.last_metrics: Dict[str, float] = {}
+        self._last_packed_token_count = 0
 
     def _pack_questions(self, questions: Sequence[Question]) -> Tuple[List[int], List[int]]:
         cls_id = self.tokenizer.cls_token_id
@@ -959,6 +962,7 @@ class BertAttentionDependencyGenerator(DependencyGraphGenerator):
             token_ids = token_ids[: self.max_total_tokens]
             owners = owners[: self.max_total_tokens]
 
+        self._last_packed_token_count = len(token_ids)
         return token_ids, owners
 
     def compute_question_attention_matrix(
@@ -1024,8 +1028,16 @@ class BertAttentionDependencyGenerator(DependencyGraphGenerator):
         questions: Sequence[Question],
         metadata: Optional[dict] = None,
     ) -> List[EdgeCandidate]:
+        start = time.perf_counter()
         scores = self.compute_question_attention_matrix(questions)
-        return self.build_edges_from_scores(questions, scores)
+        edges = self.build_edges_from_scores(questions, scores)
+        elapsed = time.perf_counter() - start
+        self.last_metrics = {
+            "latency": elapsed,
+            "prompt_tokens": float(self._last_packed_token_count),
+            "generated_tokens": 0.0,
+        }
+        return edges
 
     def build_edges_from_scores(
         self,
