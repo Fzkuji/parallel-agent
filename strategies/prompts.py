@@ -35,3 +35,16 @@ Background:
     user_lines.append(f"Question ({question.qid}): {question.text.strip()}")
     user_prompt = "\n".join(user_lines)
     return system_prompt, user_prompt
+
+
+def build_single_prompt(background: str, question: Question) -> Tuple[str, str]:
+    system_prompt = textwrap.dedent(
+        f"""You are a helpful assistant that answers questions given a background passage.
+Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
+
+Background:
+{background.strip()}
+"""
+    ).strip()
+    user_prompt = f"Question ({question.qid}): {question.text.strip()}"
+    return system_prompt, user_prompt

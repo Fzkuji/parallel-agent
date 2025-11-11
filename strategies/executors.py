@@ -19,7 +19,7 @@ from python import (
 )
 
 from .eval import evaluate_predictions
-from .prompts import build_dependency_prompt
+from .prompts import build_dependency_prompt, build_single_prompt
 from .results import StrategyResult
 
 
@@ -498,26 +498,12 @@ def run_independent_strategy(
     max_latency = 0.0
     detail_records: List[Dict[str, Any]] = []
 
-    system_message = textwrap.dedent(
-        f"""You are a helpful assistant that answers questions given a background passage.
-Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
-
-Background:
-{background.strip()}
-"""
-    ).strip()
-
     for question in questions:
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": f"Question ({question.qid}): {question.text.strip()}"},
-        ]
-
-        chat_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=(not rq.USE_THINK_TOKENS),
+        system_prompt, user_prompt = build_single_prompt(background, question)
+        chat_prompt = rq.build_chat_prompt(
+            tokenizer,
+            user_prompt,
+            system_prompt=system_prompt,
         )
 
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
@@ -598,17 +584,12 @@ def run_full_batch_strategy(
     total_latency = 0.0
 
     for question in questions:
-        prompt = textwrap.dedent(
-            f"""You are a helpful assistant that answers questions given a background passage.
-Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
-
-Background:
-{background.strip()}
-
-Question ({question.qid}): {question.text.strip()}
-"""
-        ).strip()
-        chat_prompt = rq.build_chat_prompt(tokenizer, prompt, system_prompt=None)
+        system_prompt, user_prompt = build_single_prompt(background, question)
+        chat_prompt = rq.build_chat_prompt(
+            tokenizer,
+            user_prompt,
+            system_prompt=system_prompt,
+        )
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[-1]
 
