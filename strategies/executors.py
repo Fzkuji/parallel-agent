@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -17,8 +19,21 @@ from python import (
 )
 
 from .eval import evaluate_predictions
-from .prompts import build_answer_prompt
+from .prompts import build_dependency_prompt
 from .results import StrategyResult
+
+
+DEFAULT_GENERATION_SEED = 13
+
+
+def _reset_generation_seed(seed: int = DEFAULT_GENERATION_SEED) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():  # pragma: no cover
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
+    torch.backends.cudnn.benchmark = False  # type: ignore[attr-defined]
 
 
 def run_dependency_ideal_strategy(
@@ -87,13 +102,20 @@ def run_dependency_ideal_strategy(
         for qid in batch.question_ids:
             question = question_lookup[qid]
             deps = sorted(question.dependencies)
-            prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
-            chat_prompt = rq.build_chat_prompt(tokenizer, prompt)
+            system_prompt, user_prompt = build_dependency_prompt(
+                background,
+                question,
+                answers_text,
+                deps,
+                question_lookup,
+            )
+            chat_prompt = rq.build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
 
             inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
             prompt_tokens = inputs["input_ids"].shape[-1]
 
             start = time.perf_counter()
+            _reset_generation_seed()
             with torch.no_grad():
                 generated = model.generate(
                     **inputs,
@@ -272,13 +294,20 @@ def run_dependency_batch_strategy(
         for qid in batch.question_ids:
             question = question_lookup[qid]
             deps = sorted(question.dependencies)
-            prompt = build_answer_prompt(background, question, answers_text, deps, question_lookup)
-            chat_prompt = rq.build_chat_prompt(tokenizer, prompt)
+            system_prompt, user_prompt = build_dependency_prompt(
+                background,
+                question,
+                answers_text,
+                deps,
+                question_lookup,
+            )
+            chat_prompt = rq.build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
 
             inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
             prompt_tokens = inputs["input_ids"].shape[-1]
 
             start = time.perf_counter()
+            _reset_generation_seed()
             with torch.no_grad():
                 generated = model.generate(
                     **inputs,
@@ -393,6 +422,7 @@ Background:
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[-1]
         start = time.perf_counter()
+        _reset_generation_seed()
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
@@ -493,6 +523,7 @@ Background:
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[-1]
         start = time.perf_counter()
+        _reset_generation_seed()
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
@@ -582,6 +613,7 @@ Question ({question.qid}): {question.text.strip()}
         prompt_tokens = inputs["input_ids"].shape[-1]
 
         start = time.perf_counter()
+        _reset_generation_seed()
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
