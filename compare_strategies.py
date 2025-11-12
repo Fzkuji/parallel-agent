@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-llm-deps", action="store_true", help="Force heuristic dependency generator.")
     parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
     parser.add_argument("--no-think-tokens", action="store_true", help="Disable <think></think> markers.")
+    parser.add_argument("--use-think-tokens", action="store_true", help="Enable <think></think> markers.")
     parser.add_argument("--verbose-debug", action="store_true", help="Print detailed prompts and responses.")
     parser.add_argument("--deterministic", action="store_true", help="Enable strong determinism (slower but stable).")
 
@@ -295,7 +296,9 @@ def maybe_dump_json(
 
 def main() -> None:
     args = parse_args()
-    rq.set_think_tokens(not args.no_think_tokens)
+    # Default: disable think tokens for batch compatibility; allow opt-in via --use-think-tokens
+    use_think = args.use_think_tokens and not args.no_think_tokens
+    rq.set_think_tokens(use_think)
     log_level = logging.DEBUG if args.verbose_debug else getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
 
