@@ -367,6 +367,7 @@ def run_dependency_batch_strategy(
         inputs = tokenizer(batch_text_prompts, return_tensors="pt", padding=True).to(model.device)
         attention = inputs["attention_mask"]
         input_lengths = attention.sum(dim=1).tolist()
+        prompt_window = inputs["input_ids"].shape[-1]
 
         start = time.perf_counter()
         _reset_generation_seed()
@@ -389,9 +390,9 @@ def run_dependency_batch_strategy(
         pad_id = tokenizer.pad_token_id or eos_id
 
         raw_texts = []
-        for seq, input_len in zip(sequences, input_lengths):
+        for seq in sequences:
             tokens = []
-            for token in seq[int(input_len):].tolist():
+            for token in seq[int(prompt_window):].tolist():
                 if token in (eos_id, pad_id):
                     break
                 tokens.append(token)
@@ -692,6 +693,7 @@ def run_full_batch_strategy(
     inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
     attention = inputs["attention_mask"]
     input_lengths = attention.sum(dim=1).tolist()
+    prompt_window = inputs["input_ids"].shape[-1]
 
     start = time.perf_counter()
     _reset_generation_seed()
@@ -715,9 +717,9 @@ def run_full_batch_strategy(
     raw_texts = []
     boxes = []
     generated_token_counts = []
-    for idx, (seq, input_len) in enumerate(zip(sequences, input_lengths)):
+    for idx, seq in enumerate(sequences):
         tokens = []
-        for token in seq[int(input_len):].tolist():
+        for token in seq[int(prompt_window):].tolist():
             if token in (eos_id, pad_id):
                 break
             tokens.append(token)
