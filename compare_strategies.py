@@ -257,15 +257,19 @@ def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
         if not stats:
             continue
         count = stats["count"] or 1
+        avg_prompt = int(round(stats["prompt_tokens"] / count))
+        avg_gen = int(round(stats["generated_tokens"] / count))
+        avg_latency = stats["latency"] / count
+        avg_batches = int(round(stats["batches"] / count))
         summary_lines.append(
             f"{name:<13} | "
             f"{stats['strict']/count:.3f} | "
             f"{stats['f1']/count:.3f} | "
             f"{stats['lenient']/count:.3f} | "
-            f"{int(stats['prompt_tokens'])} | "
-            f"{int(stats['generated_tokens'])} | "
-            f"{stats['latency']:.2f} | "
-            f"{int(stats['batches'])}"
+            f"{avg_prompt} | "
+            f"{avg_gen} | "
+            f"{avg_latency:.2f} | "
+            f"{avg_batches}"
         )
     return "\n".join(summary_lines)
 

@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
-Utility script to compare per-sample and batched generation outputs.
+Utility script to compare sequential (per-sample) vs batched generation outputs
+for the exact same set of prompts, and verify they are identical.
 
-Usage:
-    python debug_batch_vs_sequential.py \
-        --model-name sshleifer/tiny-gpt2 \
-        --max-new-tokens 32 \
-        --prompt "Question 1?" \
-        --prompt "Another question?"
+支持两种提示模式：
+- raw：直接把传入的字符串作为提示（与普通 `tokenizer(prompt)` 一致）
+- chat：使用 run_qwen_parallel.build_chat_prompt 封装 system/user 结构，和主流程一致
+
+示例：
+  python debug_batch_vs_sequential.py \
+    --model-name sshleifer/tiny-gpt2 \
+    --mode chat \
+    --background "..." \
+    --question "Q1: ...?" --question "Q2: ...?" \
+    --max-new-tokens 64 --seed 13
+
+或直接传 raw 提示：
+  python debug_batch_vs_sequential.py \
+    --model-name sshleifer/tiny-gpt2 \
+    --mode raw \
+    --prompt "Q1 ..." --prompt "Q2 ..."
 """
 
 from __future__ import annotations
 
 import argparse
 import random
-from typing import List
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+import run_qwen_parallel as rq
 
 
 def seed_everything(seed: int) -> None:
@@ -65,6 +79,7 @@ def generate_per_sample(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                num_beams=1,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.eos_token_id,
                 return_dict_in_generate=True,
@@ -90,6 +105,7 @@ def generate_batched(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            num_beams=1,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True,
@@ -99,24 +115,62 @@ def generate_batched(
     return trim_generation(tokenizer, sequences, prompt_lengths)
 
 
+def build_prompts(
+    mode: str,
+    tokenizer: AutoTokenizer,
+    *,
+    prompts: Optional[List[str]] = None,
+    background: str = "",
+    questions: Optional[List[str]] = None,
+    system: Optional[str] = None,
+    use_think_tokens: bool = False,
+) -> List[str]:
+    """Return final prompts ready for tokenization.
+
+    - raw: returns `prompts` as-is
+    - chat: builds chat-style prompts consistent with pipeline
+    """
+    rq.set_think_tokens(use_think_tokens)
+    system_msg = (system or "You are a helpful assistant that answers questions given a background passage.").strip()
+
+    if mode == "raw":
+        return prompts or []
+
+    if mode == "chat":
+        out: List[str] = []
+        qs = questions or []
+        for q in qs:
+            user_prompt = f"Background:\n{background.strip()}\n\n{q.strip()}"
+            out.append(rq.build_chat_prompt(tokenizer, user_prompt, system_prompt=system_msg))
+        if prompts:  # also support direct prompts in chat mode
+            for p in prompts:
+                out.append(rq.build_chat_prompt(tokenizer, p, system_prompt=system_msg))
+        return out
+
+    raise ValueError(f"Unknown mode: {mode}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare per-sample vs batch generation outputs.")
     parser.add_argument("--model-name", default="sshleifer/tiny-gpt2")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument(
-        "--prompt",
-        action="append",
-        dest="prompts",
-        help="Custom prompt(s). Provide multiple times to add more. Defaults to built-in samples.",
-    )
+    parser.add_argument("--mode", choices=["raw", "chat"], default="chat")
+    parser.add_argument("--system", type=str, default=None, help="System message for chat mode.")
+    parser.add_argument("--background", type=str, default="", help="Background text for chat mode.")
+    parser.add_argument("--question", action="append", dest="questions", help="Question(s) for chat mode.")
+    parser.add_argument("--prompt", action="append", dest="prompts", help="Raw prompt(s) or extra prompts in chat mode.")
+    parser.add_argument("--use-think-tokens", action="store_true")
+    parser.add_argument("--strict-exit", action="store_true", help="Exit 1 if any mismatch.")
     args = parser.parse_args()
 
-    prompts = args.prompts or [
-        "Q1: Where was the treaty signed?\nBackground: The treaty was signed in Paris.",
-        "Q2: Who signed the treaty?\nBackground: Representatives from both nations signed the treaty.",
-        "Q3: When was the treaty signed?\nBackground: It happened in 1895.",
+    # Defaults if nothing provided
+    default_questions = [
+        "Q1: Where was the treaty signed?",
+        "Q2: Who signed the treaty?",
+        "Q3: When was the treaty signed?",
     ]
+    default_background = "The treaty was signed in Paris in 1895 by representatives from both nations."
 
     seed_everything(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -128,15 +182,27 @@ def main() -> None:
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     ).eval()
 
-    single_outputs = generate_per_sample(tokenizer, model, prompts, max_new_tokens=args.max_new_tokens)
-    batched_outputs = generate_batched(tokenizer, model, prompts, max_new_tokens=args.max_new_tokens)
+    # Build final prompts list
+    prompts_list = build_prompts(
+        args.mode,
+        tokenizer,
+        prompts=args.prompts,
+        background=args.background or default_background,
+        questions=args.questions or default_questions,
+        system=args.system,
+        use_think_tokens=args.use_think_tokens,
+    )
+
+    single_outputs = generate_per_sample(tokenizer, model, prompts_list, max_new_tokens=args.max_new_tokens)
+    batched_outputs = generate_batched(tokenizer, model, prompts_list, max_new_tokens=args.max_new_tokens)
 
     all_match = True
-    for idx, (single, batched) in enumerate(zip(single_outputs, batched_outputs), 1):
+    for idx, (single, batched, ptext) in enumerate(zip(single_outputs, batched_outputs, prompts_list), 1):
         match = single == batched
         all_match = all_match and match
         status = "✓ MATCH" if match else "✗ DIFF"
         print(f"\nPrompt #{idx}: {status}")
+        print(f"Prompt text: {ptext[:160]}{'...' if len(ptext)>160 else ''}")
         print(f"Per-sample: {single or '<empty>'}")
         print(f"Batched   : {batched or '<empty>'}")
 
@@ -144,6 +210,8 @@ def main() -> None:
         print("\nAll outputs are identical.")
     else:
         print("\nOutputs differ. Adjust prompts/model/seed or inspect above diffs.")
+        if args.strict_exit:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
