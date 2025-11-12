@@ -56,6 +56,8 @@ def _strip_think_prefix(text: str) -> str:
             s = s.replace(open_tag, "")
             break
         s = s[:start] + s[end + len(close_tag):]
+    # 清理残余的开闭标签（例如只回显了闭合标签）
+    s = s.replace(open_tag, "").replace(close_tag, "")
     return s.strip()
 
 
@@ -514,7 +516,8 @@ Background:
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
         total_prompt_tokens += prompt_tokens
-        total_generated_tokens += len(trimmed_tokens)
+        # 使用清洗后的文本重新统计生成 token 数，避免 <think> 影响统计
+        total_generated_tokens += int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
         total_latency += elapsed
 
         detail_records.append(
@@ -528,7 +531,7 @@ Background:
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
-                "generated_tokens": len(trimmed_tokens),
+                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
             }
         )
 
@@ -595,12 +598,13 @@ def run_independent_strategy(
                 break
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+        raw_response = _strip_think_prefix(raw_response)
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
 
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
         total_prompt_tokens += prompt_tokens
-        total_generated_tokens += len(trimmed_tokens)
+        total_generated_tokens += int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
         max_latency = max(max_latency, elapsed)
 
         detail_records.append(
@@ -614,7 +618,7 @@ def run_independent_strategy(
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
-                "generated_tokens": len(trimmed_tokens),
+                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
             }
         )
 
@@ -693,10 +697,11 @@ def run_full_batch_strategy(
                 break
             tokens.append(token)
         raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+        raw_text = _strip_think_prefix(raw_text)
         raw_texts.append(raw_text)
         box = rq.extract_box_answer(raw_text)
         boxes.append(box)
-        generated_token_counts.append(len(tokens))
+        generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
 
     total_prompt_tokens = sum(int(length) for length in input_lengths)
     total_generated_tokens = sum(generated_token_counts)
