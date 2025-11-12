@@ -36,6 +36,29 @@ def _reset_generation_seed(seed: int = DEFAULT_GENERATION_SEED) -> None:
     torch.backends.cudnn.benchmark = False  # type: ignore[attr-defined]
 
 
+def _strip_think_prefix(text: str) -> str:
+    """Remove any <think>...</think> blocks (wherever they appear) from text.
+
+    一些模型会在生成开头或中间回显 <think>...</think>，我们在拼接时统一剔除，
+    避免对后续提示造成干扰，并保证不同实现路径（batch/ideal）的文本一致性。
+    """
+    s = text
+    # 粗暴但稳妥：反复剔除所有成对的 <think>...</think> 块
+    open_tag = "<think>"
+    close_tag = "</think>"
+    while True:
+        start = s.find(open_tag)
+        if start == -1:
+            break
+        end = s.find(close_tag, start)
+        if end == -1:
+            # 没有闭合，剔除起始标记以免影响后续解析
+            s = s.replace(open_tag, "")
+            break
+        s = s[:start] + s[end + len(close_tag):]
+    return s.strip()
+
+
 def run_dependency_ideal_strategy(
     background: str,
     questions: List[Question],
@@ -349,7 +372,9 @@ def run_dependency_batch_strategy(
                 if token in (eos_id, pad_id):
                     break
                 tokens.append(token)
-            raw_texts.append(tokenizer.decode(tokens, skip_special_tokens=True).strip())
+            rt = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            rt = _strip_think_prefix(rt)
+            raw_texts.append(rt)
         boxes = list(map(rq.extract_box_answer, raw_texts))
 
         gen_token_counts = [
@@ -481,6 +506,7 @@ Background:
                 break
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+        raw_response = _strip_think_prefix(raw_response)
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
 
         messages.append({"role": "assistant", "content": raw_response})
