@@ -96,8 +96,11 @@ def run_dependency_ideal_strategy(
     batch_details: List[Dict[str, Any]] = []
 
     for batch in schedule.batches:
-        batch_latencies: List[float] = []
-        batch_questions_data: List[Dict[str, Any]] = []
+        # Freeze answers within this batch to avoid cross-sample leakage
+        answers_snapshot = dict(answers_text)
+        batch_prompts: List[str] = []
+        batch_questions: List[Question] = []
+        batch_deps_rendered: List[List[Dict[str, str]]] = []
 
         for qid in batch.question_ids:
             question = question_lookup[qid]
@@ -105,13 +108,26 @@ def run_dependency_ideal_strategy(
             system_prompt, user_prompt = build_dependency_prompt(
                 background,
                 question,
-                answers_text,
+                answers_snapshot,
                 deps,
                 question_lookup,
             )
             chat_prompt = rq.build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+            batch_prompts.append(chat_prompt)
+            batch_questions.append(question)
+            batch_deps_rendered.append(
+                [
+                    {"question_id": dep_id, "answer": answers_snapshot.get(dep_id, "")}
+                    for dep_id in deps
+                ]
+            )
 
-            inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+        batch_latencies: List[float] = []
+        batch_questions_data: List[Dict[str, Any]] = []
+        new_answers: Dict[str, str] = {}
+
+        for prompt_text, question, deps_rendered in zip(batch_prompts, batch_questions, batch_deps_rendered):
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
             prompt_tokens = inputs["input_ids"].shape[-1]
 
             start = time.perf_counter()
@@ -132,18 +148,16 @@ def run_dependency_ideal_strategy(
             sequences = generated.sequences
             eos_id = tokenizer.eos_token_id
             pad_id = tokenizer.pad_token_id or eos_id
-
             tokens = []
             for token in sequences[0, prompt_tokens:].tolist():
                 if token in (eos_id, pad_id):
                     break
                 tokens.append(token)
-
             raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
             final_answer, strict_valid = rq.extract_box_answer(raw_text)
 
             answer_records[question.qid] = (final_answer, strict_valid)
-            answers_text[question.qid] = final_answer
+            new_answers[question.qid] = final_answer
             total_prompt_tokens += prompt_tokens
             total_generated_tokens += len(tokens)
             batch_latencies.append(elapsed)
@@ -151,11 +165,8 @@ def run_dependency_ideal_strategy(
             batch_questions_data.append(
                 {
                     "question": question,
-                    "dependencies": [
-                        {"question_id": dep_id, "answer": answers_text.get(dep_id, "")}
-                        for dep_id in deps
-                    ],
-                    "chat_prompt": chat_prompt,
+                    "dependencies": deps_rendered,
+                    "chat_prompt": prompt_text,
                     "raw_text": raw_text,
                     "final_answer": final_answer,
                     "strict_valid": strict_valid,
@@ -164,6 +175,9 @@ def run_dependency_ideal_strategy(
                     "generated_tokens": len(tokens),
                 }
             )
+
+        # Only after finishing the whole batch, publish answers
+        answers_text.update(new_answers)
 
         batch_latency = sum(batch_latencies) if batch_latencies else 0.0
         batch_details.append(
