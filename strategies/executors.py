@@ -61,6 +61,25 @@ def _strip_think_prefix(text: str) -> str:
     return s.strip()
 
 
+def _strip_assistant_prefix(text: str) -> str:
+    """Remove spurious leading 'assistant' echoes from model outputs.
+
+    Some batched paths may cause the model to echo an initial 'assistant' token
+    as plain text. Trim a single leading line like 'assistant' or 'assistant:'
+    (case-insensitive) plus following whitespace. Only affects the very start
+    of the response to avoid removing valid content later.
+    """
+    s = text.lstrip()
+    lower = s.lower()
+    # Strip common prefixes: 'assistant', 'assistant:', possibly followed by newlines/spaces
+    if lower.startswith("assistant:\n") or lower.startswith("assistant: "):
+        s = s.split(":", 1)[1].lstrip()
+    elif lower.startswith("assistant\n") or lower.startswith("assistant "):
+        # remove the word and following whitespace/newline
+        s = s[len("assistant"):].lstrip()
+    return s
+
+
 def run_dependency_ideal_strategy(
     background: str,
     questions: List[Question],
@@ -179,12 +198,14 @@ def run_dependency_ideal_strategy(
                     break
                 tokens.append(token)
             raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            raw_text = _strip_think_prefix(raw_text)
+            raw_text = _strip_assistant_prefix(raw_text)
             final_answer, strict_valid = rq.extract_box_answer(raw_text)
 
             answer_records[question.qid] = (final_answer, strict_valid)
             new_answers[question.qid] = final_answer
             total_prompt_tokens += prompt_tokens
-            total_generated_tokens += len(tokens)
+            total_generated_tokens += int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1])
             batch_latencies.append(elapsed)
 
             batch_questions_data.append(
@@ -376,11 +397,13 @@ def run_dependency_batch_strategy(
                 tokens.append(token)
             rt = tokenizer.decode(tokens, skip_special_tokens=True).strip()
             rt = _strip_think_prefix(rt)
+            rt = _strip_assistant_prefix(rt)
             raw_texts.append(rt)
         boxes = list(map(rq.extract_box_answer, raw_texts))
 
+        # Recount generated tokens by re-tokenizing the cleaned raw text
         gen_token_counts = [
-            sum(1 for token in sequences[idx, int(input_lengths[idx]):].tolist() if token not in (eos_id, pad_id))
+            int(tokenizer(raw_texts[idx], return_tensors="pt").input_ids.shape[1])
             for idx in range(len(batch_questions))
         ]
 
@@ -509,6 +532,7 @@ Background:
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
         raw_response = _strip_think_prefix(raw_response)
+        raw_response = _strip_assistant_prefix(raw_response)
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
 
         messages.append({"role": "assistant", "content": raw_response})
@@ -599,6 +623,7 @@ def run_independent_strategy(
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
         raw_response = _strip_think_prefix(raw_response)
+        raw_response = _strip_assistant_prefix(raw_response)
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
 
         answer_records[question.qid] = (final_answer, strict_valid)
@@ -698,6 +723,7 @@ def run_full_batch_strategy(
             tokens.append(token)
         raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
         raw_text = _strip_think_prefix(raw_text)
+        raw_text = _strip_assistant_prefix(raw_text)
         raw_texts.append(raw_text)
         box = rq.extract_box_answer(raw_text)
         boxes.append(box)

@@ -38,7 +38,12 @@ def build_chat_prompt(
     user_prompt: str,
     system_prompt: Optional[str] = DEFAULT_SYSTEM_PROMPT,
 ) -> str:
-    """Create a chat-style prompt with thinking disabled for Qwen3."""
+    """Create a chat-style prompt using the tokenizer's chat template.
+
+    Unifies assistant generation start handling across all strategies by
+    relying on add_generation_prompt=True. Thinking tags are controlled via
+    USE_THINK_TOKENS and the tokenizer's enable_thinking flag.
+    """
 
     messages: List[Dict[str, str]] = []
     system = (system_prompt or "").strip()
@@ -50,22 +55,12 @@ def build_chat_prompt(
         # Qwen3 quirk: enable_thinking parameter is inverted
         # - enable_thinking=False → adds <think>\n\n</think>\n\n to prompt
         # - enable_thinking=True  → no thinking tags
-        # We want tags when USE_THINK_TOKENS=True, so we use enable_thinking=False
-        #
-        # Note: Using add_generation_prompt=False and manually adding assistant start
-        # to avoid issues with left padding in batch inference (model regenerates the
-        # assistant tag when there's padding)
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=False,  # Manually add below to avoid left padding issues
+            add_generation_prompt=True,
             enable_thinking=(not USE_THINK_TOKENS),
         )
-        # Manually add assistant start token
-        prompt = prompt + "<|im_start|>assistant\n"
-        # Add thinking tags if enabled (empty tags to structure output without actual thinking)
-        if USE_THINK_TOKENS:
-            prompt = prompt + "<think>\n\n</think>\n\n"
     else:
         # Fallback for tokenizers without chat template support
         parts = []
@@ -74,10 +69,8 @@ def build_chat_prompt(
         parts.append(f"User: {user_prompt.strip()}")
         parts.append("Assistant:")
         prompt = "\n\n".join(parts)
-
-        # Manually add thinking tokens for fallback case
         if USE_THINK_TOKENS:
-            prompt = f"{prompt}<think></think>"
+            prompt = f"{prompt}\n<think>\n\n</think>\n\n"
 
     return prompt
 

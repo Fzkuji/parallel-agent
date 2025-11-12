@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
     parser.add_argument("--no-think-tokens", action="store_true", help="Disable <think></think> markers.")
     parser.add_argument("--verbose-debug", action="store_true", help="Print detailed prompts and responses.")
+    parser.add_argument("--deterministic", action="store_true", help="Enable strong determinism (slower but stable).")
 
     parser.add_argument("--bert-model-name", default="bert-base-uncased", help="Encoder-only model for attention DAGs.")
     parser.add_argument(
@@ -299,14 +300,33 @@ def main() -> None:
     logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
 
     logging.info("Loading tokenizer and model: %s", args.model_name)
+    if args.deterministic:
+        # Strong determinism: disable TF32, set deterministic algorithms
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.allow_tf32 = False  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        torch.use_deterministic_algorithms(True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Prefer float32 under deterministic mode to minimize divergence
+    load_dtype = torch.float32 if args.deterministic or not torch.cuda.is_available() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         device_map="auto",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=load_dtype,
     )
+    # Force eager attention if configurable (post-load best effort)
+    if args.deterministic and hasattr(model, "config") and hasattr(model.config, "attn_implementation"):
+        try:
+            model.config.attn_implementation = "eager"  # type: ignore[attr-defined]
+        except Exception:
+            pass
     model.eval()
 
     contexts = load_squad_groups(
