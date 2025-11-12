@@ -165,7 +165,7 @@ def run_dependency_ideal_strategy(
                 }
             )
 
-        batch_latency = max(batch_latencies) if batch_latencies else 0.0
+        batch_latency = sum(batch_latencies) if batch_latencies else 0.0
         batch_details.append(
             {
                 "batch_id": batch.batch_id,
