@@ -17,6 +17,7 @@ from python import (
     load_squad_groups,
 )
 from strategies import (
+    run_all_in_one_strategy,
     print_answer_table,
     run_dependency_batch_strategy,
     run_dependency_ideal_strategy,
@@ -131,6 +132,13 @@ def run_all_strategies(
     args: argparse.Namespace,
     bert_conf_threshold: float,
 ) -> List[StrategyResult]:
+    all_in_one = run_all_in_one_strategy(
+        background,
+        questions,
+        tokenizer,
+        model,
+        max_new_tokens=args.max_new_tokens,
+    )
     sequential = run_sequential_strategy(
         background,
         questions,
@@ -172,6 +180,7 @@ def run_all_strategies(
         strategy_name="parallel_bert",
     )
     strategies: List[StrategyResult] = [
+        all_in_one,
         sequential,
         batch,
         parallel,
@@ -219,6 +228,7 @@ def run_all_strategies(
 
 def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
     preferred_order = [
+        "all_in_one",
         "sequential",
         "batch",
         "batch_ideal",

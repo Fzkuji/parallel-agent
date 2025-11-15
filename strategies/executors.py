@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import time
 import textwrap
@@ -465,6 +466,120 @@ def run_dependency_batch_strategy(
             },
             "batches": batch_details,
         },
+    )
+
+
+def run_all_in_one_strategy(
+    background: str,
+    questions: List[Question],
+    tokenizer: AutoTokenizer,
+    model: AutoModelForCausalLM,
+    *,
+    max_new_tokens: int,
+) -> StrategyResult:
+    question_lookup = {q.qid: q for q in questions}
+    instructions = textwrap.dedent(
+        """You are a helpful assistant that answers questions given a background passage.
+You will receive multiple questions at once. Provide concise reasoning for each question, but you must answer them in the same order they are listed. For every question, end with a line of the form `Question (QID): \box{answer}` using the exact QID provided below. If a question is unanswerable, respond with \box{unknown} for that question. Do not skip any question and do not combine their answers."""
+    ).strip()
+    question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
+    user_message = textwrap.dedent(
+        f"""Background:
+{background.strip()}
+
+Questions:
+{os.linesep.join(question_lines)}
+"""
+    ).strip()
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": user_message},
+    ]
+    chat_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=(not rq.USE_THINK_TOKENS),
+    )
+
+    inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+    prompt_tokens = inputs["input_ids"].shape[-1]
+    start = time.perf_counter()
+    _reset_generation_seed()
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+    elapsed = time.perf_counter() - start
+    sequences = generated.sequences
+    generated_part = sequences[:, prompt_tokens:]
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+    trimmed_tokens: List[int] = []
+    for token in generated_part[0].tolist():
+        if token in (eos_id, pad_id):
+            break
+        trimmed_tokens.append(token)
+    raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+    raw_response = _strip_think_prefix(raw_response)
+    raw_response = _strip_assistant_prefix(raw_response)
+
+    matches = list(rq.BOX_PATTERN.finditer(raw_response))
+    segments: List[str] = []
+    prev = 0
+    for match in matches:
+        segments.append(raw_response[prev : match.end()].strip())
+        prev = match.end()
+    if len(segments) < len(questions):
+        segments.extend([raw_response] * (len(questions) - len(segments)))
+
+    answer_records: Dict[str, Tuple[str, bool]] = {}
+    answers_text: Dict[str, str] = {}
+    total_generated_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
+    detail_records: List[Dict[str, Any]] = []
+
+    for idx, question in enumerate(questions):
+        if idx < len(matches):
+            answer_text = matches[idx].group(1).strip()
+            strict_valid = True
+        else:
+            answer_text = segments[idx] if idx < len(segments) else raw_response
+            strict_valid = False
+        answer_records[question.qid] = (answer_text, strict_valid)
+        answers_text[question.qid] = answer_text
+        detail_records.append(
+            {
+                "question_id": question.qid,
+                "question": question.text.strip(),
+                "gold_answers": question.references,
+                "prompt": chat_prompt,
+                "raw_response": segments[idx] if idx < len(segments) else raw_response,
+                "final_answer": answer_text,
+                "strict_valid": strict_valid,
+                "latency": elapsed,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": total_generated_tokens,
+            }
+        )
+
+    metrics = evaluate_predictions(answer_records, question_lookup)
+    return StrategyResult(
+        name="all_in_one",
+        answers=answers_text,
+        prompt_tokens=prompt_tokens,
+        generated_tokens=total_generated_tokens,
+        latency=elapsed,
+        batches=1,
+        metrics=metrics,
+        details={"turns": detail_records, "raw_combined_response": raw_response},
     )
 
 
