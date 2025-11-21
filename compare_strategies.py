@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -83,6 +85,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Cost penalty weight for BERT-based dependency selection.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="Total shards/world size for data-parallel eval (defaults to WORLD_SIZE or 1).",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Shard index/rank (defaults to LOCAL_RANK or 0).",
     )
     return parser.parse_args()
 
@@ -269,6 +283,8 @@ def main() -> None:
     rq.set_think_tokens(use_think)
     log_level = logging.DEBUG if args.verbose_debug else getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
+    world_size = args.num_shards or int(os.environ.get("WORLD_SIZE", 1))
+    rank = args.shard_index if args.shard_index is not None else int(os.environ.get("LOCAL_RANK", 0))
 
     logging.info("Loading tokenizer and model: %s", args.model_name)
     if args.deterministic:
@@ -287,9 +303,12 @@ def main() -> None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     # Prefer float32 under deterministic mode to minimize divergence
     load_dtype = torch.float32 if args.deterministic or not torch.cuda.is_available() else torch.float16
+    device_map = "auto"
+    if world_size > 1:
+        device_map = {"": "cuda"}  # let torchrun pin each process to its own GPU
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        device_map="auto",
+        device_map=device_map,
         torch_dtype=load_dtype,
     )
     # Force eager attention if configurable (post-load best effort)
@@ -307,6 +326,9 @@ def main() -> None:
         max_contexts=args.context_count,
         seed=args.seed,
     )
+    if world_size > 1:
+        contexts = contexts[rank::world_size]
+        logging.info("Sharding contexts: rank %d/%d -> %d contexts", rank, world_size, len(contexts))
     logging.info("Loaded %d contexts (requested: %d)", len(contexts), args.context_count)
 
     dep_generator, bert_dep_generator, bert_conf_threshold = resolve_dependency_generators(args, tokenizer, model)
@@ -359,7 +381,28 @@ def main() -> None:
         )
 
     print(aggregate_overall(overall_results))
-    maybe_dump_json(args.json_out, serialized_contexts, args)
+    # Sharded output handling
+    if world_size > 1 and args.json_out:
+        shard_path = Path(f"{args.json_out}.shard{rank}of{world_size}")
+        maybe_dump_json(shard_path, serialized_contexts, args)
+        if rank == 0:
+            # Wait for other shards then merge
+            for r in range(world_size):
+                path = Path(f"{args.json_out}.shard{r}of{world_size}")
+                while not path.exists():
+                    time.sleep(1)
+            merged = []
+            for r in range(world_size):
+                path = Path(f"{args.json_out}.shard{r}of{world_size}")
+                with open(path, "r", encoding="utf-8") as fin:
+                    payload = json.load(fin)
+                    merged.extend(payload.get("contexts", []))
+            Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.json_out, "w", encoding="utf-8") as fout:
+                json.dump({"model": args.model_name, "contexts": merged}, fout, indent=2, ensure_ascii=False)
+            logging.info("Merged shards into %s", args.json_out)
+    else:
+        maybe_dump_json(args.json_out, serialized_contexts, args)
 
 
 if __name__ == "__main__":
