@@ -1,11 +1,11 @@
-"""Lightweight strategy facade that re-exports core implementations under src.strategies."""
+"""Utility modules for strategy execution, evaluation, and reporting."""
 
-from src.strategies.executors import (
+from src.results import StrategyResult
+from .executors import (
     run_all_in_one_strategy,
     run_dependency_batch_strategy,
     run_full_batch_strategy,
     run_sequential_strategy,
-    StrategyResult,
 )
 from src.report import print_answer_table, summarize_results
 

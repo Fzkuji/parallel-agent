@@ -20,13 +20,11 @@ from strategies import (
     run_all_in_one_strategy,
     print_answer_table,
     run_dependency_batch_strategy,
-    run_dependency_ideal_strategy,
     run_full_batch_strategy,
-    run_independent_strategy,
     run_sequential_strategy,
     summarize_results,
 )
-from strategies.results import StrategyResult
+from strategies import StrategyResult
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,11 +50,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
     parser.add_argument("--no-think-tokens", action="store_true", help="Disable <think></think> markers.")
     parser.add_argument("--use-think-tokens", action="store_true", help="Enable <think></think> markers.")
-    parser.add_argument(
-        "--run-ideal-strategies",
-        action="store_true",
-        help="Include *_ideal strategies (default skips them to save time).",
-    )
     parser.add_argument("--verbose-debug", action="store_true", help="Print detailed prompts and responses.")
     parser.add_argument("--deterministic", action="store_true", help="Enable strong determinism (slower but stable).")
 
@@ -179,7 +172,7 @@ def run_all_strategies(
         max_new_tokens=args.max_new_tokens,
         strategy_name="parallel_bert",
     )
-    strategies: List[StrategyResult] = [
+    return [
         all_in_one,
         sequential,
         batch,
@@ -187,55 +180,14 @@ def run_all_strategies(
         parallel_bert,
     ]
 
-    if args.run_ideal_strategies:
-        batch_ideal = run_independent_strategy(
-            background,
-            questions,
-            tokenizer,
-            model,
-            max_new_tokens=args.max_new_tokens,
-        )
-        parallel_ideal = run_dependency_ideal_strategy(
-            background,
-            questions,
-            dep_generator,
-            tokenizer,
-            model,
-            cost_weight=args.cost_weight,
-            min_confidence=args.min_confidence,
-            max_dependencies=args.max_dependencies,
-            total_cost_budget=args.total_cost_budget,
-            max_new_tokens=args.max_new_tokens,
-            strategy_name="parallel_ideal",
-        )
-        parallel_bert_ideal = run_dependency_ideal_strategy(
-            background,
-            questions,
-            bert_dep_generator,
-            tokenizer,
-            model,
-            cost_weight=args.bert_cost_weight,
-            min_confidence=bert_conf_threshold,
-            max_dependencies=args.max_dependencies,
-            total_cost_budget=args.total_cost_budget,
-            max_new_tokens=args.max_new_tokens,
-            strategy_name="parallel_bert_ideal",
-        )
-        strategies.extend([batch_ideal, parallel_ideal, parallel_bert_ideal])
-
-    return strategies
-
 
 def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
     preferred_order = [
         "all_in_one",
         "sequential",
         "batch",
-        "batch_ideal",
         "parallel",
-        "parallel_ideal",
         "parallel_bert",
-        "parallel_bert_ideal",
     ]
     strategy_totals: Dict[str, Dict[str, float]] = {}
     for results in overall_results.values():
