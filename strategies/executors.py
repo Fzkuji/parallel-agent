@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import time
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
@@ -479,8 +480,12 @@ def run_all_in_one_strategy(
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     instructions = textwrap.dedent(
-        """You are a helpful assistant that answers questions given a background passage.
-You will receive multiple questions at once. Provide concise reasoning for each question, but you must answer them in the same order they are listed. For every question, end with a line of the form `Question (QID): \box{answer}` using the exact QID provided below. If a question is unanswerable, respond with \box{unknown} for that question. Do not skip any question and do not combine their answers."""
+        """You are a helpful assistant that answers multiple questions from a single background.
+- Answer the questions in the exact order given.
+- For each question, output exactly one line in the strict format:
+  Question (QID): \box{answer}
+- Use the QID exactly as provided. If unknown, write \box{unknown}.
+- Produce one \box{...} per question (no extra boxes, no missing boxes). Do not merge answers."""
     ).strip()
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
     user_message = textwrap.dedent(
@@ -532,14 +537,18 @@ Questions:
     raw_response = _strip_think_prefix(raw_response)
     raw_response = _strip_assistant_prefix(raw_response)
 
-    matches = list(rq.BOX_PATTERN.finditer(raw_response))
-    segments: List[str] = []
-    prev = 0
-    for match in matches:
-        segments.append(raw_response[prev : match.end()].strip())
-        prev = match.end()
-    if len(segments) < len(questions):
-        segments.extend([raw_response] * (len(questions) - len(segments)))
+    qid_box_pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\\box\{([^}]*)\}", re.IGNORECASE)
+    matches = list(qid_box_pattern.finditer(raw_response))
+    first_hits: Dict[str, Tuple[str, str]] = {}
+    duplicate_qids: Dict[str, int] = {}
+    for m in matches:
+        qid = m.group(1)
+        ans = m.group(2).strip()
+        text_span = m.group(0).strip()
+        if qid in first_hits:
+            duplicate_qids[qid] = duplicate_qids.get(qid, 1) + 1
+            continue
+        first_hits[qid] = (ans, text_span)
 
     answer_records: Dict[str, Tuple[str, bool]] = {}
     answers_text: Dict[str, str] = {}
@@ -547,11 +556,13 @@ Questions:
     detail_records: List[Dict[str, Any]] = []
 
     for idx, question in enumerate(questions):
-        if idx < len(matches):
-            answer_text = matches[idx].group(1).strip()
+        qid = question.qid
+        if qid in first_hits:
+            answer_text, span_text = first_hits[qid]
             strict_valid = True
         else:
-            answer_text = segments[idx] if idx < len(segments) else raw_response
+            answer_text = "unknown"
+            span_text = ""
             strict_valid = False
         answer_records[question.qid] = (answer_text, strict_valid)
         answers_text[question.qid] = answer_text
@@ -561,7 +572,7 @@ Questions:
                 "question": question.text.strip(),
                 "gold_answers": question.references,
                 "prompt": chat_prompt,
-                "raw_response": segments[idx] if idx < len(segments) else raw_response,
+                "raw_response": span_text or raw_response,
                 "final_answer": answer_text,
                 "strict_valid": strict_valid,
                 "latency": elapsed,
