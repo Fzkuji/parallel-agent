@@ -341,7 +341,11 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
                 target = item["target"]
             except KeyError:
                 continue
-            confidence = float(item.get("confidence", 0.7))
+            val = item.get("confidence", 0.7)
+            try:
+                confidence = float(0.7 if val is None else val)
+            except (TypeError, ValueError):
+                confidence = 0.7
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
         return edges
 
