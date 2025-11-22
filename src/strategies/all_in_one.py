@@ -27,9 +27,9 @@ def run_all_in_one_strategy(
     instructions = textwrap.dedent(
         """You are a helpful assistant that answers multiple questions from a single background.
 - Answer the questions in the exact order given.
-- Output exactly one line per question in the format: Question (QID): \box{answer}
-- Use each QID exactly. If unknown, write \box{unknown}.
-- Produce one \box{...} per question (no extras)."""
+- For each question, output exactly: Question (QID): {answer}
+- Use braces { } around the answer. If unknown, put {unknown}.
+- One line per question; no extra text before or after these lines."""
     ).strip()
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
     user_message = textwrap.dedent(
@@ -81,25 +81,29 @@ Questions:
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = strip_think_prefix(strip_assistant_prefix(raw_response))
 
-    # Expect a single box containing semicolon-separated answers
-    match = rq.BOX_PATTERN.search(raw_response)
-    if match:
-        box_content = match.group(1).strip()
-        parts = [part.strip() for part in box_content.split(";")]
-    else:
-        parts = []
-
-    count_matches = len(parts) == len(questions)
+    pattern = re.compile(r"Question\\s*\\((Q\\d+)\\):\\s*\\{([^}]*)\\}", re.IGNORECASE)
+    matches = list(pattern.finditer(raw_response))
+    first_hits: Dict[str, Tuple[str, str]] = {}
+    for m in matches:
+        qid = m.group(1)
+        ans = m.group(2).strip()
+        span = m.group(0).strip()
+        if qid in first_hits:
+            continue
+        first_hits[qid] = (ans, span)
     answer_records: Dict[str, Tuple[str, bool]] = {}
     answers_text: Dict[str, str] = {}
     detail_records: List[Dict[str, Any]] = []
 
-    for idx, question in enumerate(questions):
-        if idx < len(parts):
-            answer_text = parts[idx]
+    for question in questions:
+        qid = question.qid
+        if qid in first_hits:
+            answer_text, span_text = first_hits[qid]
+            strict_valid = True
         else:
             answer_text = "unknown"
-        strict_valid = bool(match) and count_matches
+            span_text = ""
+            strict_valid = False
         answer_records[question.qid] = (answer_text, strict_valid)
         answers_text[question.qid] = answer_text
         detail_records.append(
@@ -108,13 +112,12 @@ Questions:
                 "question": question.text.strip(),
                 "gold_answers": question.references,
                 "prompt": chat_prompt,
-                "raw_response": raw_response,
+                "raw_response": span_text or raw_response,
                 "final_answer": answer_text,
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
                 "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
-                "box_count_match": count_matches,
             }
         )
 
