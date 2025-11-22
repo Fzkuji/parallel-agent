@@ -81,7 +81,7 @@ Questions:
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = strip_think_prefix(strip_assistant_prefix(raw_response))
 
-    pattern = re.compile(r"Question\\s*\\((Q\\d+)\\):\\s*\\{([^}]*)\\}", re.IGNORECASE)
+    pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\{([^}]*)\}", re.IGNORECASE)
     matches = list(pattern.finditer(raw_response))
     first_hits: Dict[str, Tuple[str, str]] = {}
     for m in matches:
