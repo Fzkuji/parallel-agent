@@ -298,14 +298,23 @@ def main() -> None:
         except Exception:
             pass
         torch.use_deterministic_algorithms(True)
+
+    # Bind each rank to a single GPU to avoid piling all processes on cuda:0
+    if torch.cuda.is_available():
+        num_devices = torch.cuda.device_count()
+        if num_devices == 0:
+            raise RuntimeError("CUDA_VISIBLE_DEVICES is set but no GPUs detected")
+        device_id = rank % num_devices
+        torch.cuda.set_device(device_id)
+        logging.info("Rank %d using cuda:%d (visible devices: %d)", rank, device_id, num_devices)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     # Prefer float32 under deterministic mode to minimize divergence
     load_dtype = torch.float32 if args.deterministic or not torch.cuda.is_available() else torch.float16
     device_map = "auto"
-    if world_size > 1:
-        device_map = {"": "cuda"}  # let torchrun pin each process to its own GPU
+    if world_size > 1 and torch.cuda.is_available():
+        device_map = {"": f"cuda:{torch.cuda.current_device()}"}
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         device_map=device_map,
