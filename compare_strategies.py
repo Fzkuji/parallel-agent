@@ -378,6 +378,9 @@ def main() -> None:
             args.split,
             subset=args.hotpot_subset,
             max_contexts=args.context_count,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            group_size=args.hotpot_group_size,
             seed=args.seed,
         )
     else:
