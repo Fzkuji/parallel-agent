@@ -24,6 +24,8 @@ def run_all_in_one_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
+    # Only count context tokens (once for this strategy)
+    background_tokens = tokenizer(background, return_tensors="pt").input_ids.shape[1]
     instructions = textwrap.dedent(
         """You are a helpful assistant that answers multiple questions from a single background.
 - Answer the questions in the exact order given.
@@ -79,7 +81,7 @@ Questions:
             break
         trimmed.append(token)
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
-    raw_response = strip_think_prefix(strip_assistant_prefix(raw_response))
+    raw_response = clean_model_text(raw_response)
 
     pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\{([^}]*)\}", re.IGNORECASE)
     matches = list(pattern.finditer(raw_response))
@@ -125,6 +127,7 @@ Questions:
     return StrategyResult(
         name="all_in_one",
         answers=answers_text,
+        # Count the single full prompt length (user + background + instructions)
         prompt_tokens=prompt_tokens,
         generated_tokens=int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
         latency=elapsed,

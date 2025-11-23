@@ -15,6 +15,8 @@ import run_qwen_parallel as rq
 from python import (
     BertAttentionDependencyGenerator,
     HeuristicDependencyGenerator,
+    load_hotpot_groups,
+    load_squad_random_questions,
     build_questions_from_group,
     load_squad_groups,
 )
@@ -34,12 +36,25 @@ def parse_args() -> argparse.Namespace:
         description="Compare sequential, batch, and dependency-aware QA strategies with optional BERT dependencies.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--dataset", choices=["squad", "hotpot"], default="squad", help="Dataset to evaluate.")
     parser.add_argument("--model-name", default="Qwen/Qwen3-4B", help="Hugging Face model identifier or local path.")
     parser.add_argument("--split", default="train", help="SQuAD split to sample.")
     parser.add_argument("--context-count", type=int, default=3, help="Number of contexts to process.")
     parser.add_argument("--min-questions", type=int, default=3, help="Minimum questions per context.")
     parser.add_argument("--max-questions", type=int, default=5, help="Maximum questions per context.")
     parser.add_argument("--seed", type=int, default=13, help="Random seed for sampling contexts.")
+    parser.add_argument(
+        "--squad-random-questions",
+        action="store_true",
+        help="For SQuAD, sample individual questions randomly instead of grouping by shared context.",
+    )
+    parser.add_argument("--hotpot-subset", default="distractor", help="HotpotQA subset (e.g., distractor).")
+    parser.add_argument(
+        "--hotpot-group-size",
+        type=int,
+        default=None,
+        help="Number of HotpotQA samples to bundle into one multi-question context (defaults to min-questions).",
+    )
 
     parser.add_argument("--cost-weight", type=float, default=0.01, help="Cost penalty weight for dependency selection.")
     parser.add_argument("--min-confidence", type=float, default=0.45, help="Minimum edge confidence.")
@@ -328,13 +343,29 @@ def main() -> None:
             pass
     model.eval()
 
-    contexts = load_squad_groups(
-        args.split,
-        min_questions=args.min_questions,
-        max_questions=args.max_questions,
-        max_contexts=args.context_count,
-        seed=args.seed,
-    )
+    if args.dataset == "hotpot":
+        contexts = load_hotpot_groups(
+            args.split,
+            subset=args.hotpot_subset,
+            group_size=args.hotpot_group_size or args.min_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
+    else:
+        if args.squad_random_questions:
+            contexts = load_squad_random_questions(
+                args.split,
+                max_contexts=args.context_count,
+                seed=args.seed,
+            )
+        else:
+            contexts = load_squad_groups(
+                args.split,
+                min_questions=args.min_questions,
+                max_questions=args.max_questions,
+                max_contexts=args.context_count,
+                seed=args.seed,
+            )
     if world_size > 1:
         contexts = contexts[rank::world_size]
         logging.info("Sharding contexts: rank %d/%d -> %d contexts", rank, world_size, len(contexts))

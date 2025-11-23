@@ -1198,6 +1198,118 @@ def load_squad_groups(
     return formatted
 
 
+def load_squad_random_questions(
+    split: str,
+    *,
+    max_contexts: int = 3,
+    seed: int = 13,
+) -> List[dict]:
+    """
+    Sample individual SQuAD questions without grouping by shared context.
+    Each question becomes its own context group.
+    """
+    if load_dataset is None:
+        raise RuntimeError("datasets package not available; install with `pip install datasets`.")  # pragma: no cover
+
+    raw_dataset = list(load_dataset("squad", split=split))
+    rng = random.Random(seed)
+    rng.shuffle(raw_dataset)
+    selected = raw_dataset[:max_contexts]
+
+    groups: List[dict] = []
+    for idx, row in enumerate(selected, start=1):
+        answers = row.get("answers", {}).get("text", [])
+        answer_text = answers[0].strip() if answers else ""
+        answer_tokens = max(estimate_tokens(answer_text), 12)
+        qid = "Q1"
+        groups.append(
+            {
+                "context": row["context"].strip(),
+                "title": row.get("title", f"SQuAD-{idx}"),
+                "questions": [
+                    {
+                        "qid": qid,
+                        "text": row["question"].strip(),
+                        "answer_tokens": answer_tokens,
+                        "references": answers,
+                    }
+                ],
+            }
+        )
+    return groups
+
+
+def _format_hotpot_context(row: dict) -> str:
+    titles = row.get("context", {}).get("title", [])
+    sentences = row.get("context", {}).get("sentences", [])
+    pieces: List[str] = []
+    for title, sent_list in zip(titles, sentences):
+        sent_text = " ".join(s.strip() for s in sent_list)
+        pieces.append(f"{title}: {sent_text}")
+    return "\n".join(pieces)
+
+
+def load_hotpot_groups(
+    split: str,
+    *,
+    subset: str = "distractor",
+    group_size: Optional[int] = None,
+    max_contexts: int = 3,
+    seed: int = 13,
+) -> List[dict]:
+    """
+    Build synthetic multi-question groups from HotpotQA rows.
+    Each group bundles `group_size` samples together, concatenating their contexts.
+    """
+    if load_dataset is None:
+        raise RuntimeError("datasets package not available; install with `pip install datasets`.")  # pragma: no cover
+
+    raw_dataset = list(load_dataset("hotpotqa/hotpot_qa", subset, split=split))
+    if not raw_dataset:
+        raise ValueError("Empty HotpotQA split.")
+
+    rng = random.Random(seed)
+    rng.shuffle(raw_dataset)
+
+    bundle = max(1, group_size or 3)
+    groups: List[dict] = []
+    idx = 0
+    while len(groups) < max_contexts and idx < len(raw_dataset):
+        chunk = raw_dataset[idx : idx + bundle]
+        idx += bundle
+        if len(chunk) < bundle:
+            break
+
+        background_sections = [_format_hotpot_context(row) for row in chunk]
+        background = "\n\n".join(background_sections).strip()
+
+        questions: List[dict] = []
+        for q_idx, row in enumerate(chunk):
+            qid = f"Q{q_idx + 1}"
+            answer_text = row.get("answer", "").strip()
+            answer_tokens = max(estimate_tokens(answer_text), 12)
+            questions.append(
+                {
+                    "qid": qid,
+                    "text": row.get("question", "").strip(),
+                    "answer_tokens": answer_tokens,
+                    "references": [answer_text] if answer_text else [],
+                }
+            )
+
+        groups.append(
+            {
+                "context": background,
+                "title": chunk[0].get("id", "HotpotQA"),
+                "questions": questions,
+            }
+        )
+
+    if not groups:
+        raise ValueError("No HotpotQA groups constructed; try smaller group_size or max_contexts.")
+    return groups
+
+
 def build_questions_from_group(group: dict) -> List[Question]:
     questions: List[Question] = []
     for payload in group["questions"]:

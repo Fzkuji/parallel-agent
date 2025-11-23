@@ -7,6 +7,17 @@ import numpy as np
 import torch
 
 
+def sanitize_box_tokens(text: str) -> str:
+    """Clean control chars and normalize stray box markers."""
+    import re
+
+    # Drop control chars except tab/newline/carriage return
+    text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
+    # Fix occurrences of "box{" without leading backslash
+    text = re.sub(r"(?<!\\)box\{", r"\\box{", text)
+    return text
+
+
 DEFAULT_GENERATION_SEED = 13
 
 
@@ -47,6 +58,11 @@ def strip_assistant_prefix(text: str) -> str:
     elif lower.startswith("assistant\n") or lower.startswith("assistant "):
         s = s[len("assistant") :].lstrip()
     return s
+
+
+def clean_model_text(text: str) -> str:
+    """Run all text cleaners in sequence."""
+    return sanitize_box_tokens(strip_assistant_prefix(strip_think_prefix(text)))
 
 
 def trim_after_prompt(tokens: List[int], eos_id: int, pad_id: int) -> List[int]:

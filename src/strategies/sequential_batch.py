@@ -12,7 +12,7 @@ from python import Question
 from src.eval import evaluate_predictions
 from src.prompts import build_single_prompt
 from src.results import StrategyResult
-from src.utils import DEFAULT_GENERATION_SEED, reset_generation_seed, strip_assistant_prefix, strip_think_prefix
+from src.utils import DEFAULT_GENERATION_SEED, reset_generation_seed, clean_model_text
 
 
 def run_sequential_strategy(
@@ -26,7 +26,7 @@ def run_sequential_strategy(
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
     answers_text: Dict[str, str] = {}
-    total_prompt_tokens = 0
+    prompt_token_lengths: List[int] = []
     total_generated_tokens = 0
     total_latency = 0.0
 
@@ -79,14 +79,14 @@ Background:
                 break
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
-        raw_response = strip_assistant_prefix(strip_think_prefix(raw_response))
+        raw_response = clean_model_text(raw_response)
         final_answer, strict_valid = rq.extract_box_answer(raw_response)
 
         messages.append({"role": "assistant", "content": raw_response})
 
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
-        total_prompt_tokens += prompt_tokens
+        prompt_token_lengths.append(prompt_tokens)
         total_generated_tokens += int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
         total_latency += elapsed
 
@@ -109,97 +109,11 @@ Background:
     return StrategyResult(
         name="sequential",
         answers=answers_text,
-        prompt_tokens=total_prompt_tokens,
+        # Sum of all prompts (history grows each turn)
+        prompt_tokens=sum(prompt_token_lengths),
         generated_tokens=total_generated_tokens,
         latency=total_latency,
         batches=len(questions),
-        metrics=metrics,
-        details={"turns": detail_records},
-    )
-
-
-def run_independent_strategy(
-    background: str,
-    questions: List[Question],
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
-    *,
-    max_new_tokens: int,
-) -> StrategyResult:
-    question_lookup = {q.qid: q for q in questions}
-    answer_records: Dict[str, Tuple[str, bool]] = {}
-    answers_text: Dict[str, str] = {}
-    total_prompt_tokens = 0
-    total_generated_tokens = 0
-    max_latency = 0.0
-    detail_records: List[Dict[str, Any]] = []
-
-    for question in questions:
-        system_prompt, user_prompt = build_single_prompt(background, question)
-        chat_prompt = rq.build_chat_prompt(
-            tokenizer,
-            user_prompt,
-            system_prompt=system_prompt,
-        )
-
-        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
-        prompt_tokens = inputs["input_ids"].shape[-1]
-        start = time.perf_counter()
-        reset_generation_seed(DEFAULT_GENERATION_SEED)
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_scores=False,
-            )
-        elapsed = time.perf_counter() - start
-        sequences = generated.sequences
-        generated_part = sequences[:, prompt_tokens:]
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id or eos_id
-        trimmed_tokens: List[int] = []
-        for token in generated_part[0].tolist():
-            if token in (eos_id, pad_id):
-                break
-            trimmed_tokens.append(token)
-        raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
-        raw_response = strip_assistant_prefix(strip_think_prefix(raw_response))
-        final_answer, strict_valid = rq.extract_box_answer(raw_response)
-
-        answer_records[question.qid] = (final_answer, strict_valid)
-        answers_text[question.qid] = final_answer
-        total_prompt_tokens += prompt_tokens
-        total_generated_tokens += int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
-        max_latency = max(max_latency, elapsed)
-
-        detail_records.append(
-            {
-                "question_id": question.qid,
-                "question": question.text.strip(),
-                "gold_answers": question.references,
-                "prompt": chat_prompt,
-                "raw_response": raw_response,
-                "final_answer": final_answer,
-                "strict_valid": strict_valid,
-                "latency": elapsed,
-                "prompt_tokens": prompt_tokens,
-                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
-            }
-        )
-
-    metrics = evaluate_predictions(answer_records, question_lookup)
-    return StrategyResult(
-        name="batch_ideal",
-        answers=answers_text,
-        prompt_tokens=total_prompt_tokens,
-        generated_tokens=total_generated_tokens,
-        latency=max_latency,
-        batches=1,
         metrics=metrics,
         details={"turns": detail_records},
     )
@@ -271,7 +185,8 @@ def run_full_batch_strategy(
         boxes.append(box)
         generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
 
-    total_prompt_tokens = sum(int(length) for length in input_lengths)
+    # Sum prompt lengths for all samples in the batch
+    total_prompt_tokens = sum(int(length) for length in input_lengths) if input_lengths else 0
     total_generated_tokens = sum(generated_token_counts)
     total_latency = elapsed
 
