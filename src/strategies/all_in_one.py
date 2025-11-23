@@ -33,7 +33,7 @@ def run_all_in_one_strategy(
     # Only count context tokens (once for this strategy)
     background_tokens = tokenizer(background, return_tensors="pt").input_ids.shape[1]
     instructions = textwrap.dedent(
-        """You are a helpful assistant that answers multiple questions from a single background.
+        r"""You are a helpful assistant that answers multiple questions from a single background.
 - Answer the questions in the exact order given.
 - For each question, output exactly: Question (QID): {answer}
 - Use braces { } around the answer. If unknown, put {unknown}.

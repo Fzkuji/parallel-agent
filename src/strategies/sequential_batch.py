@@ -38,13 +38,13 @@ def run_sequential_strategy(
 
     # Align prompt with the single-question template used elsewhere
     system_message = textwrap.dedent(
-        f"""You are a helpful assistant that answers questions given a background passage.
-Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
+        r"""You are a helpful assistant that answers questions given a background passage.
+Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{answer}. If the answer is unknown, return \\box{unknown}.
 
 Background:
-{background.strip()}
+{background}
 """
-    ).strip()
+    ).format(background=background.strip()).strip()
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
     detail_records: List[Dict[str, Any]] = []
