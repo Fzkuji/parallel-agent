@@ -19,13 +19,17 @@ from python import (
     load_squad_random_questions,
     build_questions_from_group,
     load_squad_groups,
+    Question,
 )
 from strategies import (
     run_all_in_one_strategy,
+    run_all_in_one_multi_strategy,
     print_answer_table,
     run_dependency_batch_strategy,
     run_full_batch_strategy,
     run_sequential_strategy,
+    run_batch_multi_strategy,
+    run_sequential_multi_strategy,
     summarize_results,
 )
 from strategies import StrategyResult
@@ -154,6 +158,32 @@ def run_all_strategies(
     args: argparse.Namespace,
     bert_conf_threshold: float,
 ) -> List[StrategyResult]:
+    # Multi-context mode: if questions is None and items provided, use items-based strategies
+    if background is None and isinstance(questions, list) and questions and isinstance(questions[0], dict) and "context" in questions[0]:
+        items = questions
+        all_in_one = run_all_in_one_multi_strategy(
+            items,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="all_in_one",
+        )
+        sequential = run_sequential_multi_strategy(
+            items,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="sequential",
+        )
+        batch = run_batch_multi_strategy(
+            items,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="batch",
+        )
+        return [all_in_one, sequential, batch]
+
     all_in_one = run_all_in_one_strategy(
         background,
         questions,
@@ -377,21 +407,47 @@ def main() -> None:
 
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
-        background = context_payload["context"]
-        questions = build_questions_from_group(context_payload)
-        logging.info("Processing context %d/%d: %s", idx, len(contexts), title)
-        logging.info("Background preview: %s", background[:200].replace("\n", " "))
+        if "items" in context_payload:
+            items = context_payload["items"]
+            logging.info("Processing multi-context group %d/%d: %s (items=%d)", idx, len(contexts), title, len(items))
+            strategy_list = run_all_strategies(
+                None,
+                items,
+                tokenizer=tokenizer,
+                model=model,
+                dep_generator=dep_generator,
+                bert_dep_generator=bert_dep_generator,
+                args=args,
+                bert_conf_threshold=bert_conf_threshold,
+            )
+            questions = [
+                Question(
+                    qid=item["qid"],
+                    text=item["question"],
+                    priority=1.0,
+                    answer_tokens=item.get("answer_tokens", 12),
+                    type_hint=None,
+                    references=item.get("references", []),
+                )
+                for item in items
+            ]
+            background = ""
+        else:
+            background = context_payload["context"]
+            questions = build_questions_from_group(context_payload)
+            logging.info("Processing context %d/%d: %s", idx, len(contexts), title)
+            logging.info("Background preview: %s", background[:200].replace("\n", " "))
 
-        strategy_list = run_all_strategies(
-            background,
-            questions,
-            tokenizer=tokenizer,
-            model=model,
-            dep_generator=dep_generator,
-            bert_dep_generator=bert_dep_generator,
-            args=args,
-            bert_conf_threshold=bert_conf_threshold,
-        )
+            strategy_list = run_all_strategies(
+                background,
+                questions,
+                tokenizer=tokenizer,
+                model=model,
+                dep_generator=dep_generator,
+                bert_dep_generator=bert_dep_generator,
+                args=args,
+                bert_conf_threshold=bert_conf_threshold,
+            )
         overall_results[title] = strategy_list
 
         print(f"\n=== Context: {title} ===")

@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import run_qwen_parallel as rq
+from python import Question
 from src.eval import evaluate_predictions
 from src.results import StrategyResult
 from src.utils import (
@@ -30,8 +31,6 @@ def run_all_in_one_strategy(
     max_new_tokens: int,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
-    # Only count context tokens (once for this strategy)
-    background_tokens = tokenizer(background, return_tensors="pt").input_ids.shape[1]
     instructions = textwrap.dedent(
         r"""You are a helpful assistant that answers multiple questions from a single background.
 - Answer the questions in the exact order given.
@@ -81,7 +80,7 @@ Questions:
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id or eos_id
     gen_tokens = sequences[:, prompt_tokens:]
-    trimmed = []
+    trimmed: List[int] = []
     for token in gen_tokens[0].tolist():
         if token in (eos_id, pad_id):
             break
@@ -90,38 +89,30 @@ Questions:
     raw_response = clean_model_text(raw_response)
 
     pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\{([^}]*)\}", re.IGNORECASE)
-    matches = list(pattern.finditer(raw_response))
-    first_hits: Dict[str, Tuple[str, str]] = {}
-    for m in matches:
-        qid = m.group(1)
-        ans = m.group(2).strip()
-        span = m.group(0).strip()
-        if qid in first_hits:
-            continue
-        first_hits[qid] = (ans, span)
-    answer_records: Dict[str, Tuple[str, bool]] = {}
+    matches = pattern.findall(raw_response)
+    found = {qid: ans.strip() for qid, ans in matches}
+
     answers_text: Dict[str, str] = {}
+    answer_records: Dict[str, Tuple[str, bool]] = {}
     detail_records: List[Dict[str, Any]] = []
 
     for question in questions:
         qid = question.qid
-        if qid in first_hits:
-            answer_text, span_text = first_hits[qid]
+        if qid in found:
+            ans_text = found[qid]
             strict_valid = True
         else:
-            answer_text = "unknown"
-            span_text = ""
-            strict_valid = False
-        answer_records[question.qid] = (answer_text, strict_valid)
-        answers_text[question.qid] = answer_text
+            ans_text, strict_valid = rq.extract_box_answer(raw_response)
+        answers_text[qid] = ans_text
+        answer_records[qid] = (ans_text, strict_valid)
         detail_records.append(
             {
-                "question_id": question.qid,
+                "question_id": qid,
                 "question": question.text.strip(),
                 "gold_answers": question.references,
                 "prompt": chat_prompt,
-                "raw_response": span_text or raw_response,
-                "final_answer": answer_text,
+                "raw_response": raw_response,
+                "final_answer": ans_text,
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
@@ -133,7 +124,126 @@ Questions:
     return StrategyResult(
         name="all_in_one",
         answers=answers_text,
-        # Count the single full prompt length (user + background + instructions)
+        prompt_tokens=prompt_tokens,
+        generated_tokens=int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+        latency=elapsed,
+        batches=1,
+        metrics=metrics,
+        details={"turns": detail_records, "raw_combined_response": raw_response},
+    )
+
+
+def run_all_in_one_multi_strategy(
+    items,
+    tokenizer: AutoTokenizer,
+    model: AutoModelForCausalLM,
+    *,
+    max_new_tokens: int,
+    strategy_name: str = "all_in_one",
+) -> StrategyResult:
+    question_lookup = {
+        item["qid"]: Question(
+            qid=item["qid"],
+            text=item["question"],
+            priority=1.0,
+            answer_tokens=item.get("answer_tokens", 12),
+            type_hint=None,
+            references=item.get("references", []),
+        )
+        for item in items
+    }
+    answers_text: Dict[str, str] = {}
+    answer_records: Dict[str, Tuple[str, bool]] = {}
+    detail_records: List[Dict[str, Any]] = []
+
+    instructions = textwrap.dedent(
+        r"""You are a helpful assistant that answers multiple questions.
+- Answer the questions in the exact order given.
+- For each question, output exactly: Question (QID): {answer}
+- Use braces { } around the answer. If unknown, put {unknown}.
+- One line per question; no extra text before or after these lines."""
+    ).strip()
+
+    blocks = []
+    for item in items:
+        blocks.append(f"Context ({item['qid']}):\n{item['context']}\nQuestion ({item['qid']}): {item['question']}")
+    user_message = "\n\n".join(blocks)
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": user_message},
+    ]
+    chat_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=(not rq.USE_THINK_TOKENS),
+    )
+
+    inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+    prompt_tokens = inputs["input_ids"].shape[-1]
+    start = time.perf_counter()
+    reset_generation_seed(DEFAULT_GENERATION_SEED)
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+    elapsed = time.perf_counter() - start
+
+    sequences = generated.sequences
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+    gen_tokens = sequences[:, prompt_tokens:]
+    trimmed: List[int] = []
+    for token in gen_tokens[0].tolist():
+        if token in (eos_id, pad_id):
+            break
+        trimmed.append(token)
+    raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
+    raw_response = clean_model_text(raw_response)
+
+    pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\{([^}]*)\}", re.IGNORECASE)
+    matches = pattern.findall(raw_response)
+
+    for item in items:
+        qid = item["qid"]
+        ans = ""
+        strict_valid = False
+        for m_qid, m_ans in matches:
+            if m_qid == qid:
+                ans = m_ans.strip()
+                strict_valid = True
+                break
+        if not strict_valid:
+            ans, strict_valid = rq.extract_box_answer(raw_response)
+        answers_text[qid] = ans
+        answer_records[qid] = (ans, strict_valid)
+        detail_records.append(
+            {
+                "question_id": qid,
+                "question": item["question"],
+                "gold_answers": item.get("references", []),
+                "prompt": chat_prompt,
+                "raw_response": raw_response,
+                "final_answer": ans,
+                "strict_valid": strict_valid,
+                "latency": elapsed,
+                "prompt_tokens": prompt_tokens,
+                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+            }
+        )
+
+    metrics = evaluate_predictions(answer_records, question_lookup)
+    return StrategyResult(
+        name=strategy_name,
+        answers=answers_text,
         prompt_tokens=prompt_tokens,
         generated_tokens=int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
         latency=elapsed,
