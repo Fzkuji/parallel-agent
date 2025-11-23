@@ -12,7 +12,13 @@ from python import Question
 from src.eval import evaluate_predictions
 from src.prompts import build_single_prompt
 from src.results import StrategyResult
-from src.utils import DEFAULT_GENERATION_SEED, reset_generation_seed, clean_model_text
+from src.utils import (
+    DEFAULT_GENERATION_SEED,
+    reset_generation_seed,
+    clean_model_text,
+    strip_assistant_prefix,
+    strip_think_prefix,
+)
 
 
 def run_sequential_strategy(
