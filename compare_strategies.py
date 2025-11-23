@@ -199,22 +199,28 @@ def run_all_strategies(
         parallel = run_dependency_batch_strategy(
             merged_background,
             dep_questions,
-            tokenizer,
-            model,
-            dep_generator=dep_generator,
-            bert_generator=None,
-            bert_conf_threshold=bert_conf_threshold,
+            generator=dep_generator,
+            tokenizer=tokenizer,
+            model=model,
+            cost_weight=args.cost_weight,
+            min_confidence=args.min_confidence,
+            max_dependencies=args.max_dependencies,
+            total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
+            strategy_name="parallel",
         )
         parallel_bert = run_dependency_batch_strategy(
             merged_background,
             dep_questions,
-            tokenizer,
-            model,
-            dep_generator=bert_dep_generator,
-            bert_generator=None,
-            bert_conf_threshold=bert_conf_threshold,
+            generator=bert_dep_generator,
+            tokenizer=tokenizer,
+            model=model,
+            cost_weight=args.cost_weight,
+            min_confidence=args.min_confidence,
+            max_dependencies=args.max_dependencies,
+            total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
+            strategy_name="parallel_bert",
         )
         return [all_in_one, sequential, batch, parallel, parallel_bert]
 
