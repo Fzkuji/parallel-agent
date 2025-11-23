@@ -12,7 +12,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import run_qwen_parallel as rq
 from src.eval import evaluate_predictions
 from src.results import StrategyResult
-from src.utils import DEFAULT_GENERATION_SEED, reset_generation_seed, strip_assistant_prefix, strip_think_prefix
+from src.utils import (
+    DEFAULT_GENERATION_SEED,
+    reset_generation_seed,
+    strip_assistant_prefix,
+    strip_think_prefix,
+    clean_model_text,
+)
 
 
 def run_all_in_one_strategy(
