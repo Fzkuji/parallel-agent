@@ -36,9 +36,10 @@ def run_sequential_strategy(
     total_generated_tokens = 0
     total_latency = 0.0
 
+    # Align prompt with the single-question template used elsewhere
     system_message = textwrap.dedent(
         f"""You are a helpful assistant that answers questions given a background passage.
-You will receive multiple questions one by one. Provide concise reasoning if helpful, but the final line of every response must be exactly \box{{answer}}. If the answer is unknown, return \box{{unknown}}.
+Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
 
 Background:
 {background.strip()}
