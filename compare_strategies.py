@@ -182,7 +182,41 @@ def run_all_strategies(
             max_new_tokens=args.max_new_tokens,
             strategy_name="batch",
         )
-        return [all_in_one, sequential, batch]
+        # For dependency strategies, synthesize a merged background so the model can decide relations.
+        merged_background_parts = [f"Context ({item['qid']}):\n{item['context']}" for item in items]
+        merged_background = "\n\n".join(merged_background_parts)
+        dep_questions = [
+            Question(
+                qid=item["qid"],
+                text=item["question"],
+                priority=1.0,
+                answer_tokens=item.get("answer_tokens", 12),
+                type_hint=None,
+                references=item.get("references", []),
+            )
+            for item in items
+        ]
+        parallel = run_dependency_batch_strategy(
+            merged_background,
+            dep_questions,
+            tokenizer,
+            model,
+            dep_generator=dep_generator,
+            bert_generator=None,
+            bert_conf_threshold=bert_conf_threshold,
+            max_new_tokens=args.max_new_tokens,
+        )
+        parallel_bert = run_dependency_batch_strategy(
+            merged_background,
+            dep_questions,
+            tokenizer,
+            model,
+            dep_generator=bert_dep_generator,
+            bert_generator=None,
+            bert_conf_threshold=bert_conf_threshold,
+            max_new_tokens=args.max_new_tokens,
+        )
+        return [all_in_one, sequential, batch, parallel, parallel_bert]
 
     all_in_one = run_all_in_one_strategy(
         background,

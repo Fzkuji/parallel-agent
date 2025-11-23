@@ -116,8 +116,8 @@ Background:
     return StrategyResult(
         name="sequential",
         answers=answers_text,
-        # Sum all prompt lengths to reflect total tokens processed across turns
-        prompt_tokens=sum(prompt_token_lengths) if prompt_token_lengths else 0,
+        # Count only the final prompt length (full history) once
+        prompt_tokens=prompt_token_lengths[-1] if prompt_token_lengths else 0,
         generated_tokens=total_generated_tokens,
         latency=total_latency,
         batches=len(questions),
@@ -445,7 +445,8 @@ Provide concise reasoning if helpful, but the final line of every response must 
     return StrategyResult(
         name=strategy_name,
         answers=answers_text,
-        prompt_tokens=sum(prompt_token_lengths) if prompt_token_lengths else 0,
+        # Count only the final prompt length (full history) once
+        prompt_tokens=prompt_token_lengths[-1] if prompt_token_lengths else 0,
         generated_tokens=total_generated_tokens,
         latency=total_latency,
         batches=len(items),
