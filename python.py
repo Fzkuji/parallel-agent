@@ -1253,13 +1253,11 @@ def load_hotpot_groups(
     split: str,
     *,
     subset: str = "distractor",
-    group_size: Optional[int] = None,
     max_contexts: int = 3,
     seed: int = 13,
 ) -> List[dict]:
     """
-    Build synthetic multi-question groups from HotpotQA rows.
-    Each group bundles `group_size` samples together, concatenating their contexts.
+    Load HotpotQA rows as independent contexts (one question per context).
     """
     if load_dataset is None:
         raise RuntimeError("datasets package not available; install with `pip install datasets`.")  # pragma: no cover
@@ -1271,42 +1269,30 @@ def load_hotpot_groups(
     rng = random.Random(seed)
     rng.shuffle(raw_dataset)
 
-    bundle = max(1, group_size or 3)
     groups: List[dict] = []
-    idx = 0
-    while len(groups) < max_contexts and idx < len(raw_dataset):
-        chunk = raw_dataset[idx : idx + bundle]
-        idx += bundle
-        if len(chunk) < bundle:
+    for idx, row in enumerate(raw_dataset):
+        if len(groups) >= max_contexts:
             break
-
-        background_sections = [_format_hotpot_context(row) for row in chunk]
-        background = "\n\n".join(background_sections).strip()
-
-        questions: List[dict] = []
-        for q_idx, row in enumerate(chunk):
-            qid = f"Q{q_idx + 1}"
-            answer_text = row.get("answer", "").strip()
-            answer_tokens = max(estimate_tokens(answer_text), 12)
-            questions.append(
-                {
-                    "qid": qid,
-                    "text": row.get("question", "").strip(),
-                    "answer_tokens": answer_tokens,
-                    "references": [answer_text] if answer_text else [],
-                }
-            )
-
+        background = _format_hotpot_context(row)
+        answer_text = row.get("answer", "").strip()
+        answer_tokens = max(estimate_tokens(answer_text), 12)
         groups.append(
             {
                 "context": background,
-                "title": chunk[0].get("id", "HotpotQA"),
-                "questions": questions,
+                "title": row.get("id", f"Hotpot-{idx+1}"),
+                "questions": [
+                    {
+                        "qid": "Q1",
+                        "text": row.get("question", "").strip(),
+                        "answer_tokens": answer_tokens,
+                        "references": [answer_text] if answer_text else [],
+                    }
+                ],
             }
         )
 
     if not groups:
-        raise ValueError("No HotpotQA groups constructed; try smaller group_size or max_contexts.")
+        raise ValueError("No HotpotQA groups constructed; check subset/split parameters.")
     return groups
 
 

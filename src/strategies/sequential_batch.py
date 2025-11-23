@@ -116,8 +116,8 @@ Background:
     return StrategyResult(
         name="sequential",
         answers=answers_text,
-        # Sum of all prompts (history grows each turn)
-        prompt_tokens=sum(prompt_token_lengths),
+        # Count only the final prompt length (full history) once
+        prompt_tokens=prompt_token_lengths[-1] if prompt_token_lengths else 0,
         generated_tokens=total_generated_tokens,
         latency=total_latency,
         batches=len(questions),

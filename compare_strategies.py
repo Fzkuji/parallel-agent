@@ -347,7 +347,6 @@ def main() -> None:
         contexts = load_hotpot_groups(
             args.split,
             subset=args.hotpot_subset,
-            group_size=args.hotpot_group_size or args.min_questions,
             max_contexts=args.context_count,
             seed=args.seed,
         )
