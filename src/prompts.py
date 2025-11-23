@@ -13,8 +13,8 @@ def build_dependency_prompt(
 ) -> Tuple[str, str]:
     system_prompt = textwrap.dedent(
         r"""You are a helpful assistant that answers questions given a background passage.
-You may reason freely, but give the final answer in the format \\box{...}. Example: \\box{42}
-If the answer is unknown, write \\box{unknown}.
+You may reason freely, but give the final answer in the format \\box{{...}}. Example: \\box{{42}}
+If the answer is unknown, write \\box{{unknown}}.
 
 Background:
 {background}
@@ -41,7 +41,7 @@ Background:
 def build_single_prompt(background: str, question: Question) -> Tuple[str, str]:
     system_prompt = textwrap.dedent(
         r"""You are a helpful assistant that answers questions given a background passage.
-Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{answer}. If the answer is unknown, return \\box{unknown}.
+Provide concise reasoning if helpful, but the final line of every response must be exactly \\box{{answer}}. If the answer is unknown, return \\box{{unknown}}.
 
 Background:
 {background}
