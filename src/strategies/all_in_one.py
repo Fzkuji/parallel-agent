@@ -33,16 +33,16 @@ def run_all_in_one_strategy(
     question_lookup = {q.qid: q for q in questions}
     instructions = textwrap.dedent(
         r"""You are a helpful assistant that answers multiple questions from a single background.
-Answer each question using exactly this format: QID: \box{answer}
+Answer each question using exactly this format: QID: <answer>text</answer>
 
 Example:
-Q1: \box{Paris}
-Q2: \box{42}
+Q1: <answer>Paris</answer>
+Q2: <answer>42</answer>
 
 Rules:
 - Use the exact question ID (e.g., Q1, Q2)
-- Put answer inside \box{}
-- If unknown, use \box{unknown}
+- Put answer inside <answer></answer> tags
+- If unknown, use <answer>unknown</answer>
 - One answer per line, no extra text"""
     ).strip()
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
@@ -95,8 +95,8 @@ Questions:
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = clean_model_text(raw_response)
 
-    # Match format: Q1: \box{answer} or Q1: {answer}
-    pattern = re.compile(r"(Q\d+)\s*:\s*\\?box\{([^}]*)\}", re.IGNORECASE)
+    # Match format: Q1: <answer>text</answer>
+    pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
     matches = pattern.findall(raw_response)
     found = {}
     for qid, ans in matches:
@@ -171,16 +171,16 @@ def run_all_in_one_multi_strategy(
 
     instructions = textwrap.dedent(
         r"""You are a helpful assistant that answers multiple questions.
-Answer each question using exactly this format: QID: \box{answer}
+Answer each question using exactly this format: QID: <answer>text</answer>
 
 Example:
-Q1: \box{Paris}
-Q2: \box{42}
+Q1: <answer>Paris</answer>
+Q2: <answer>42</answer>
 
 Rules:
 - Use the exact question ID (e.g., Q1, Q2)
-- Put answer inside \box{}
-- If unknown, use \box{unknown}
+- Put answer inside <answer></answer> tags
+- If unknown, use <answer>unknown</answer>
 - One answer per line, no extra text"""
     ).strip()
 
@@ -229,8 +229,8 @@ Rules:
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = clean_model_text(raw_response)
 
-    # Match format: Q1: \box{answer} or Q1: {answer}
-    pattern = re.compile(r"(Q\d+)\s*:\s*\\?box\{([^}]*)\}", re.IGNORECASE)
+    # Match format: Q1: <answer>text</answer>
+    pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
     matches = pattern.findall(raw_response)
 
     for item in items:

@@ -14,8 +14,8 @@ def build_dependency_prompt(
     system_prompt = (
         textwrap.dedent(
             r"""You are a helpful assistant that answers questions given background passages.
-You may reason freely, but give the final answer in the format \box{...}. Example: \box{42}
-If the answer is unknown, write \box{unknown}.
+You may reason freely, but give the final answer in the format <answer>...</answer>. Example: <answer>42</answer>
+If the answer is unknown, write <answer>unknown</answer>.
 
 Background:
 """
@@ -30,10 +30,9 @@ Background:
         for dep_id in dependencies:
             dep_question = question_lookup[dep_id]
             dep_answer = answers.get(dep_id, "").strip()
-            escaped = dep_answer.replace("}", "\\}")
             user_lines.append(f"{dep_id} - {dep_question.text.strip()}")
-            # Keep single backslash so the rendered prompt shows \box{answer}
-            user_lines.append(r"Answer: \box{%s}" % escaped)
+            # Show previous answer with <answer> tags
+            user_lines.append(f"Answer: <answer>{dep_answer}</answer>")
         user_lines.append("")
 
     user_lines.append(f"Question ({question.qid}): {question.text.strip()}")
@@ -45,7 +44,7 @@ def build_single_prompt(background: str, question: Question) -> Tuple[str, str]:
     system_prompt = (
         textwrap.dedent(
             r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format \box{answer}. If the answer is unknown, return \box{unknown}.
+Provide the answer with format <answer>text</answer>. If the answer is unknown, return <answer>unknown</answer>.
 
 Background:
 """

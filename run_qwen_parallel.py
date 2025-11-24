@@ -17,7 +17,7 @@ PLANNER_SYSTEM_PROMPT = (
     "You are an expert planner. Analyse the questions and output only a JSON object describing dependencies."
 )
 
-BOX_PATTERN = re.compile(r"\\box\{([^}]*)\}")
+BOX_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 
 # Control whether to add <think></think> tags in prompts
 # True: Add empty <think>\n\n</think>\n\n tags (prevents actual thinking, just provides structure)
@@ -129,7 +129,7 @@ def compute_contains(prediction: str, references: List[str]) -> float:
 
 
 def extract_box_answer(text: str) -> Tuple[str, bool]:
-    """Return the first \\box{...} content if present; otherwise fallback to raw text."""
+    """Return the first <answer>...</answer> content if present; otherwise fallback to raw text."""
     match = BOX_PATTERN.search(text)
     if match:
         return match.group(1).strip(), True
