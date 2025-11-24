@@ -40,7 +40,7 @@ def run_sequential_strategy(
     system_message = (
         textwrap.dedent(
             r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format \\box{answer}. If the answer is unknown, return \\box{unknown}.
+Provide the answer with format \box{answer}. If the answer is unknown, return \box{unknown}.
 
 Background:
 """
@@ -374,7 +374,7 @@ def run_sequential_multi_strategy(
 
     system_message = textwrap.dedent(
         r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format \\box{answer}. If the answer is unknown, return \\box{unknown}."""
+Provide the answer with format \box{answer}. If the answer is unknown, return \box{unknown}."""
     ).strip()
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]

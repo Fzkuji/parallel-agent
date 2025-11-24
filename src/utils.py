@@ -14,9 +14,9 @@ def sanitize_box_tokens(text: str) -> str:
     # Drop control chars except tab/newline/carriage return
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     # Rare case: control-char stripping can turn "\box{" into "ox{", normalize it back
-    text = re.sub(r"(?<!\\)ox\{", r"\\box{", text)
+    text = re.sub(r"(?<!\\)ox\{", r"\box{", text)
     # Fix occurrences of "box{" without leading backslash
-    text = re.sub(r"(?<!\\)box\{", r"\\box{", text)
+    text = re.sub(r"(?<!\\)box\{", r"\box{", text)
     return text
 
 
