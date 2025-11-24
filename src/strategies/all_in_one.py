@@ -33,10 +33,17 @@ def run_all_in_one_strategy(
     question_lookup = {q.qid: q for q in questions}
     instructions = textwrap.dedent(
         r"""You are a helpful assistant that answers multiple questions from a single background.
-- Answer the questions in the exact order given.
-- For each question, output exactly: Question (QID): \\box{answer}
-- If the answer is unknown, output \\box{unknown}
-- One line per question; no extra text before or after these lines."""
+Answer each question using exactly this format: QID: \\box{answer}
+
+Example:
+Q1: \\box{Paris}
+Q2: \\box{42}
+
+Rules:
+- Use the exact question ID (e.g., Q1, Q2)
+- Put answer inside \\box{}
+- If unknown, use \\box{unknown}
+- One answer per line, no extra text"""
     ).strip()
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
     user_message = textwrap.dedent(
@@ -88,9 +95,13 @@ Questions:
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = clean_model_text(raw_response)
 
-    pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\\box\{([^}]*)\}", re.IGNORECASE)
+    # Match format: Q1: \box{answer} or Q1: {answer}
+    pattern = re.compile(r"(Q\d+)\s*:\s*\\?box\{([^}]*)\}", re.IGNORECASE)
     matches = pattern.findall(raw_response)
-    found = {qid: ans.strip() for qid, ans in matches}
+    found = {}
+    for qid, ans in matches:
+        if qid not in found:
+            found[qid] = ans.strip()
 
     answers_text: Dict[str, str] = {}
     answer_records: Dict[str, Tuple[str, bool]] = {}
@@ -158,10 +169,17 @@ def run_all_in_one_multi_strategy(
 
     instructions = textwrap.dedent(
         r"""You are a helpful assistant that answers multiple questions.
-- Answer the questions in the exact order given.
-- For each question, output exactly: Question (QID): {answer}
-- Use braces { } around the answer. If unknown, put {unknown}.
-- One line per question; no extra text before or after these lines."""
+Answer each question using exactly this format: QID: \\box{answer}
+
+Example:
+Q1: \\box{Paris}
+Q2: \\box{42}
+
+Rules:
+- Use the exact question ID (e.g., Q1, Q2)
+- Put answer inside \\box{}
+- If unknown, use \\box{unknown}
+- One answer per line, no extra text"""
     ).strip()
 
     blocks = []
@@ -209,7 +227,8 @@ def run_all_in_one_multi_strategy(
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = clean_model_text(raw_response)
 
-    pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\{([^}]*)\}", re.IGNORECASE)
+    # Match format: Q1: \box{answer} or Q1: {answer}
+    pattern = re.compile(r"(Q\d+)\s*:\s*\\?box\{([^}]*)\}", re.IGNORECASE)
     matches = pattern.findall(raw_response)
 
     for item in items:

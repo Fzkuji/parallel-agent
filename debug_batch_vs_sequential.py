@@ -131,7 +131,7 @@ def build_prompts(
     - chat: builds chat-style prompts consistent with pipeline
     """
     rq.set_think_tokens(use_think_tokens)
-    system_msg = (system or "You are a helpful assistant that answers questions given a background passage.").strip()
+    system_msg = (system or "You are a helpful assistant that answers questions given background passages.").strip()
 
     if mode == "raw":
         return prompts or []

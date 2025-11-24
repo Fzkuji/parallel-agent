@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that answers questions given a background passage."
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that answers questions given background passages."
 PLANNER_SYSTEM_PROMPT = (
     "You are an expert planner. Analyse the questions and output only a JSON object describing dependencies."
 )
@@ -358,7 +358,7 @@ def build_answer_prompt(
     question_lookup: Dict[str, Question],
 ) -> str:
     prompt_parts = [
-        "You are a helpful assistant that answers questions given a background passage.",
+        "You are a helpful assistant that answers questions given background passages.",
         "You may reason step by step, but the final answer must appear exactly once as \\box{...}.",
         "If the answer is unknown, output \\box{unknown}. Do not omit the box.",
         "Place the \\box{...} on the last line by itself. Example: \\box{42}",
