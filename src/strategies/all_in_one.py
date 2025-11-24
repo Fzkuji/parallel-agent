@@ -34,8 +34,8 @@ def run_all_in_one_strategy(
     instructions = textwrap.dedent(
         r"""You are a helpful assistant that answers multiple questions from a single background.
 - Answer the questions in the exact order given.
-- For each question, output exactly: Question (QID): {answer}
-- Use braces { } around the answer. If unknown, put {unknown}.
+- For each question, output exactly: Question (QID): \\box{answer}
+- If the answer is unknown, output \\box{unknown}
 - One line per question; no extra text before or after these lines."""
     ).strip()
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
@@ -88,7 +88,7 @@ Questions:
     raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
     raw_response = clean_model_text(raw_response)
 
-    pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\{([^}]*)\}", re.IGNORECASE)
+    pattern = re.compile(r"Question\s*\((Q\d+)\):\s*\\box\{([^}]*)\}", re.IGNORECASE)
     matches = pattern.findall(raw_response)
     found = {qid: ans.strip() for qid, ans in matches}
 

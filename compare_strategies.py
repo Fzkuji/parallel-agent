@@ -182,13 +182,13 @@ def run_all_strategies(
             max_new_tokens=args.max_new_tokens,
             strategy_name="batch",
         )
-        # For dependency strategies, synthesize a merged background so the model can decide relations.
-        merged_background_parts = [f"Context ({item['qid']}):\n{item['context']}" for item in items]
-        merged_background = "\n\n".join(merged_background_parts)
+        # For dependency strategies, avoid duplicating all contexts per question.
+        # Embed each question's own context inline, and leave shared background empty.
+        merged_background = ""
         dep_questions = [
             Question(
                 qid=item["qid"],
-                text=item["question"],
+                text=f"Context:\n{item['context']}\nQuestion: {item['question']}",
                 priority=1.0,
                 answer_tokens=item.get("answer_tokens", 12),
                 type_hint=None,
