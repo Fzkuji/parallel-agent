@@ -11,15 +11,18 @@ def build_dependency_prompt(
     dependencies: List[str],
     question_lookup: Dict[str, Question],
 ) -> Tuple[str, str]:
-    system_prompt = textwrap.dedent(
-        r"""You are a helpful assistant that answers questions given background passages.
+    system_prompt = (
+        textwrap.dedent(
+            r"""You are a helpful assistant that answers questions given background passages.
 You may reason freely, but give the final answer in the format \\box{...}. Example: \\box{42}
 If the answer is unknown, write \\box{unknown}.
 
 Background:
-{background}
 """
-    ).format(background=background.strip()).strip()
+        ).strip()
+        + "\n"
+        + background.strip()
+    )
 
     user_lines: List[str] = []
     if dependencies:
@@ -39,13 +42,16 @@ Background:
 
 
 def build_single_prompt(background: str, question: Question) -> Tuple[str, str]:
-    system_prompt = textwrap.dedent(
-        r"""You are a helpful assistant that answers questions given background passages.
+    system_prompt = (
+        textwrap.dedent(
+            r"""You are a helpful assistant that answers questions given background passages.
 Provide the answer with format \\box{answer}. If the answer is unknown, return \\box{unknown}.
 
 Background:
-{background}
 """
-    ).format(background=background.strip()).strip()
+        ).strip()
+        + "\n"
+        + background.strip()
+    )
     user_prompt = f"Question ({question.qid}): {question.text.strip()}"
     return system_prompt, user_prompt
