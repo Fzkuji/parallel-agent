@@ -507,6 +507,13 @@ def main() -> None:
         device_id = rank % num_devices
         torch.cuda.set_device(device_id)
         logging.info("Rank %d using cuda:%d (visible devices: %d)", rank, device_id, num_devices)
+
+    # Initialize distributed backend for multi-GPU (required for gathering results)
+    if world_size > 1 and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        logging.info("Initialized distributed backend: %s (rank %d/%d)", backend, rank, world_size)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -647,29 +654,22 @@ def main() -> None:
 
     print(aggregate_overall(overall_results))
     # Distributed output handling: gather to rank0 and write a single file
-    if world_size > 1 and args.json_out:
-        if dist.is_available() and dist.is_initialized():
-            # Use torch.distributed to gather results
-            gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
-            dist.all_gather_object(gather_list, serialized_contexts)
-            if rank == 0:
-                merged = []
-                for ctx_list in gather_list:
-                    if ctx_list:
-                        merged.extend(ctx_list)
-                maybe_dump_json(args.json_out, merged, args, output_folder_name)
-        else:
-            # Distributed without torch.distributed initialized: only rank 0 saves its portion
-            # (other ranks' results will be lost - user should use proper distributed setup)
-            if rank == 0:
-                logging.warning(
-                    "Running distributed (world_size=%d) but torch.distributed not initialized. "
-                    "Only rank 0 results will be saved. Use torchrun for proper distributed gathering.",
-                    world_size,
-                )
-                maybe_dump_json(args.json_out, serialized_contexts, args, output_folder_name)
+    if world_size > 1 and args.json_out and dist.is_initialized():
+        # Use torch.distributed to gather results from all ranks
+        gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
+        dist.all_gather_object(gather_list, serialized_contexts)
+        if rank == 0:
+            merged = []
+            for ctx_list in gather_list:
+                if ctx_list:
+                    merged.extend(ctx_list)
+            maybe_dump_json(args.json_out, merged, args, output_folder_name)
     else:
         maybe_dump_json(args.json_out, serialized_contexts, args, output_folder_name)
+
+    # Cleanup distributed backend
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
