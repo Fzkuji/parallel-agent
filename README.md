@@ -42,9 +42,8 @@ Use the `--bert-*` flags (model name, thresholds, token caps, and cost weight) t
 - `--dataset {squad,hotpot}`: choose dataset. Hotpot enables multi-context mode (each question has its own context).
 - `--model-name`: HF model id or local path.
 - `--context-count`: number of sampled groups/steps.
-- `--min-questions / --max-questions`: number of questions per group (Hotpot uses this for bundle size when `--hotpot-group-size` is not set).
+- `--min-questions / --max-questions`: number of questions per group.
 - `--hotpot-subset`: HotpotQA split (e.g., `distractor`).
-- `--hotpot-group-size`: fixed number of Hotpot items per group (overrides min/max random size).
 - `--max-new-tokens`: generation cap.
 - `--json-out`: write summary JSON; on multi-GPU a single merged file is produced.
 - `--log-level`: logging verbosity.
@@ -74,9 +73,8 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --dataset hotpot \
   --hotpot-subset distractor \
-  --hotpot-group-size 10 \
   --model-name Qwen/Qwen2.5-14B-Instruct \
-  --context-count 10 \
+  --context-count 100 \
   --min-questions 3 \
   --max-questions 20 \
   --max-new-tokens 1024 \

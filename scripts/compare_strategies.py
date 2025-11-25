@@ -4,10 +4,14 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.eval import compute_em
 
@@ -58,12 +62,6 @@ def parse_args() -> argparse.Namespace:
         help="For SQuAD, sample individual questions randomly instead of grouping by shared context.",
     )
     parser.add_argument("--hotpot-subset", default="distractor", help="HotpotQA subset (e.g., distractor).")
-    parser.add_argument(
-        "--hotpot-group-size",
-        type=int,
-        default=None,
-        help="Number of HotpotQA samples to bundle into one multi-question context (defaults to min-questions).",
-    )
 
     parser.add_argument("--cost-weight", type=float, default=0.01, help="Cost penalty weight for dependency selection.")
     parser.add_argument("--min-confidence", type=float, default=0.45, help="Minimum edge confidence.")
@@ -535,7 +533,6 @@ def main() -> None:
             max_contexts=args.context_count,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
-            group_size=args.hotpot_group_size,
             seed=args.seed,
         )
     else:

@@ -140,7 +140,6 @@ def load_hotpot_groups(
     max_contexts: int = 3,
     min_questions: int = 1,
     max_questions: int = 3,
-    group_size: int | None = None,
     seed: int = 13,
 ) -> List[dict]:
     """
@@ -152,7 +151,6 @@ def load_hotpot_groups(
         max_contexts: Maximum number of context groups to return.
         min_questions: Minimum questions per group (for random sizing).
         max_questions: Maximum questions per group (for random sizing).
-        group_size: Fixed group size (overrides min/max).
         seed: Random seed for shuffling.
 
     Returns:
@@ -171,7 +169,7 @@ def load_hotpot_groups(
     groups: List[dict] = []
     cursor = 0
     while len(groups) < max_contexts and cursor < len(raw_dataset):
-        current_size = group_size or rng.randint(min_questions, max_questions)
+        current_size = rng.randint(min_questions, max_questions)
         batch_rows = raw_dataset[cursor : cursor + current_size]
         if not batch_rows:
             break

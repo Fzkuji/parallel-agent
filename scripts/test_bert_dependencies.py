@@ -42,7 +42,11 @@ import argparse
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Dict, List
+
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import (
     BertAttentionDependencyGenerator,

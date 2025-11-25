@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
