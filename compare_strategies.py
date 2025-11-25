@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import run_qwen_parallel as rq
@@ -519,26 +520,19 @@ def main() -> None:
         )
 
     print(aggregate_overall(overall_results))
-    # Sharded output handling
-    if world_size > 1 and args.json_out:
-        shard_path = Path(f"{args.json_out}.shard{rank}of{world_size}")
-        maybe_dump_json(shard_path, serialized_contexts, args)
+    # Distributed output handling: gather to rank0 and write a single file
+    if world_size > 1 and args.json_out and dist.is_available() and dist.is_initialized():
+        gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
+        dist.all_gather_object(gather_list, serialized_contexts)
         if rank == 0:
-            # Wait for other shards then merge
-            for r in range(world_size):
-                path = Path(f"{args.json_out}.shard{r}of{world_size}")
-                while not path.exists():
-                    time.sleep(1)
             merged = []
-            for r in range(world_size):
-                path = Path(f"{args.json_out}.shard{r}of{world_size}")
-                with open(path, "r", encoding="utf-8") as fin:
-                    payload = json.load(fin)
-                    merged.extend(payload.get("contexts", []))
+            for ctx_list in gather_list:
+                if ctx_list:
+                    merged.extend(ctx_list)
             Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
             with open(args.json_out, "w", encoding="utf-8") as fout:
                 json.dump({"model": args.model_name, "contexts": merged}, fout, indent=2, ensure_ascii=False)
-            logging.info("Merged shards into %s", args.json_out)
+            logging.info("Wrote merged results to %s", args.json_out)
     else:
         maybe_dump_json(args.json_out, serialized_contexts, args)
 

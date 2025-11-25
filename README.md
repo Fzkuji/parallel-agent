@@ -75,6 +75,36 @@ python compare_strategies.py \
 
 Additional flags mirror `run_qwen_parallel.py` (`--no-llm-deps`, `--max-dependencies`, `--cost-weight`, etc.).
 
+### SQuAD (multi-GPU)
+
+```bash
+torchrun --nproc_per_node=8 compare_strategies.py \
+  --dataset squad \
+  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --context-count 10 \
+  --min-questions 3 \
+  --max-questions 20 \
+  --max-new-tokens 1024 \
+  --json-out outputs_json/results_squad.json \
+  --log-level INFO
+```
+
+### HotpotQA (multi-GPU, multi-context)
+
+```bash
+torchrun --nproc_per_node=8 compare_strategies.py \
+  --dataset hotpot \
+  --hotpot-subset distractor \
+  --hotpot-group-size 10 \
+  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --context-count 10 \
+  --min-questions 3 \
+  --max-questions 20 \
+  --max-new-tokens 1024 \
+  --json-out outputs_json/results_hotpot.json \
+  --log-level INFO
+```
+
 ## Offline dependency experiments
 
 `test_bert_dependencies.py` now packs every question into a single BERT encoder pass, aggregates token-to-token attentions, and converts those weights into dependency confidences. This reproduces the “question A attends strongly to question B” signal without running the full Qwen pipeline.

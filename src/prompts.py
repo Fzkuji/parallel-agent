@@ -14,8 +14,7 @@ def build_dependency_prompt(
     system_prompt = (
         textwrap.dedent(
             r"""You are a helpful assistant that answers questions given background passages.
-You may reason freely, but give the final answer in the format <answer>...</answer>. Example: <answer>42</answer>
-If the answer is unknown, write <answer>unknown</answer>.
+Provide the answer with format <answer>text</answer>. If the answer is unknown, return <answer>unknown</answer>.
 
 Background:
 """
