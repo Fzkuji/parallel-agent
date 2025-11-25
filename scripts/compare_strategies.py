@@ -417,7 +417,13 @@ def filter_error_contexts(serialized_contexts: List[dict]) -> List[dict]:
 def create_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
     """Generate output folder name with timestamp and key parameters."""
     model_short = args.model_name.split("/")[-1]
-    return f"{timestamp}_{args.dataset}_{model_short}_ctx{args.context_count}_q{args.min_questions}-{args.max_questions}"
+    # Build dataset identifier: squad_train or hotpot_distractor_train
+    if args.dataset == "hotpot":
+        dataset_id = f"hotpot_{args.hotpot_subset}_{args.split}"
+    else:
+        dataset_id = f"squad_{args.split}"
+    # Format: timestamp_dataset_model_n{samples}_q{questions}
+    return f"{timestamp}_{dataset_id}_{model_short}_n{args.context_count}_q{args.min_questions}-{args.max_questions}"
 
 
 def maybe_dump_json(
@@ -447,6 +453,29 @@ def maybe_dump_json(
         "strategies": args.strategies,
         "timestamp": datetime.now().isoformat(),
     }
+    if args.dataset == "hotpot":
+        config["hotpot_subset"] = args.hotpot_subset
+
+    # Save config to readable txt file
+    config_txt_path = output_dir / "config.txt"
+    with open(config_txt_path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write("Experiment Configuration\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Model: {args.model_name}\n")
+        f.write(f"Dataset: {args.dataset}\n")
+        if args.dataset == "hotpot":
+            f.write(f"  - HuggingFace: hotpotqa/hotpot_qa ({args.hotpot_subset})\n")
+        else:
+            f.write(f"  - HuggingFace: rajpurkar/squad\n")
+        f.write(f"  - Split: {args.split}\n")
+        f.write(f"\nSamples: {args.context_count}\n")
+        f.write(f"Questions per sample: {args.min_questions}-{args.max_questions}\n")
+        f.write(f"Max new tokens: {args.max_new_tokens}\n")
+        f.write(f"Seed: {args.seed}\n")
+        f.write(f"Strategies: {args.strategies or 'all'}\n")
+        f.write(f"\nTimestamp: {config['timestamp']}\n")
+    logging.info("Wrote config to %s", config_txt_path)
 
     # Save full results
     full_payload = {
