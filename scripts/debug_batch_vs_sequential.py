@@ -5,7 +5,7 @@ for the exact same set of prompts, and verify they are identical.
 
 支持两种提示模式：
 - raw：直接把传入的字符串作为提示（与普通 `tokenizer(prompt)` 一致）
-- chat：使用 run_qwen_parallel.build_chat_prompt 封装 system/user 结构，和主流程一致
+- chat：使用 src.inference.build_chat_prompt 封装 system/user 结构，和主流程一致
 
 示例：
   python debug_batch_vs_sequential.py \
@@ -32,7 +32,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import run_qwen_parallel as rq
+from src.inference import build_chat_prompt, set_think_tokens
 
 
 def seed_everything(seed: int) -> None:
@@ -130,7 +130,7 @@ def build_prompts(
     - raw: returns `prompts` as-is
     - chat: builds chat-style prompts consistent with pipeline
     """
-    rq.set_think_tokens(use_think_tokens)
+    set_think_tokens(use_think_tokens)
     system_msg = (system or "You are a helpful assistant that answers questions given background passages.").strip()
 
     if mode == "raw":
@@ -141,10 +141,10 @@ def build_prompts(
         qs = questions or []
         for q in qs:
             user_prompt = f"Background:\n{background.strip()}\n\n{q.strip()}"
-            out.append(rq.build_chat_prompt(tokenizer, user_prompt, system_prompt=system_msg))
+            out.append(build_chat_prompt(tokenizer, user_prompt, system_prompt=system_msg))
         if prompts:  # also support direct prompts in chat mode
             for p in prompts:
-                out.append(rq.build_chat_prompt(tokenizer, p, system_prompt=system_msg))
+                out.append(build_chat_prompt(tokenizer, p, system_prompt=system_msg))
         return out
 
     raise ValueError(f"Unknown mode: {mode}")

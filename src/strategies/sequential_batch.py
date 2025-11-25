@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import run_qwen_parallel as rq
-from python import Question
+from src.models import Question
+from src.inference import USE_THINK_TOKENS, build_chat_prompt, extract_box_answer
 from src.eval import evaluate_predictions
 from src.prompts import build_single_prompt
 from src.results import StrategyResult
@@ -60,7 +60,7 @@ Background:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=(not rq.USE_THINK_TOKENS),
+            enable_thinking=(not USE_THINK_TOKENS),
         )
 
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
@@ -90,7 +90,7 @@ Background:
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
         raw_response = clean_model_text(raw_response)
-        final_answer, strict_valid = rq.extract_box_answer(raw_response)
+        final_answer, strict_valid = extract_box_answer(raw_response)
 
         messages.append({"role": "assistant", "content": raw_response})
 
@@ -146,7 +146,7 @@ def run_full_batch_strategy(
     for question in questions:
         system_prompt, user_prompt = build_single_prompt(background, question)
         batch_chat_prompts.append(
-            rq.build_chat_prompt(
+            build_chat_prompt(
                 tokenizer,
                 user_prompt,
                 system_prompt=system_prompt,
@@ -191,7 +191,7 @@ def run_full_batch_strategy(
         raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
         raw_text = strip_assistant_prefix(strip_think_prefix(raw_text))
         raw_texts.append(raw_text)
-        box = rq.extract_box_answer(raw_text)
+        box = extract_box_answer(raw_text)
         boxes.append(box)
         generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
 
@@ -260,7 +260,7 @@ def run_batch_multi_strategy(
         q = question_lookup[item["qid"]]
         system_prompt, user_prompt = build_single_prompt(item["context"], q)
         batch_chat_prompts.append(
-            rq.build_chat_prompt(
+            build_chat_prompt(
                 tokenizer,
                 user_prompt,
                 system_prompt=system_prompt,
@@ -305,7 +305,7 @@ def run_batch_multi_strategy(
         raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
         raw_text = clean_model_text(raw_text)
         raw_texts.append(raw_text)
-        box = rq.extract_box_answer(raw_text)
+        box = extract_box_answer(raw_text)
         boxes.append(box)
         generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
 
@@ -387,7 +387,7 @@ Provide the answer with format <answer>text</answer>. If the answer is unknown, 
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=(not rq.USE_THINK_TOKENS),
+            enable_thinking=(not USE_THINK_TOKENS),
         )
 
         inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
@@ -417,7 +417,7 @@ Provide the answer with format <answer>text</answer>. If the answer is unknown, 
             trimmed_tokens.append(token)
         raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
         raw_response = clean_model_text(raw_response)
-        final_answer, strict_valid = rq.extract_box_answer(raw_response)
+        final_answer, strict_valid = extract_box_answer(raw_response)
 
         messages.append({"role": "assistant", "content": raw_response})
 

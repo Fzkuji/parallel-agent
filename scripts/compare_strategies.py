@@ -12,17 +12,19 @@ import torch
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import run_qwen_parallel as rq
-from python import (
+from src import (
     BertAttentionDependencyGenerator,
     HeuristicDependencyGenerator,
+    LocalLLMDependencyGenerator,
     load_hotpot_groups,
     load_squad_random_questions,
     build_questions_from_group,
     load_squad_groups,
     Question,
+    set_think_tokens,
 )
-from strategies import (
+from src.strategies import (
+    StrategyResult,
     run_all_in_one_strategy,
     run_all_in_one_multi_strategy,
     print_answer_table,
@@ -33,7 +35,6 @@ from strategies import (
     run_sequential_multi_strategy,
     summarize_results,
 )
-from strategies import StrategyResult
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,7 +139,7 @@ def resolve_dependency_generators(
         dep_generator = HeuristicDependencyGenerator()
         logging.info("Using heuristic dependency generator.")
     else:
-        dep_generator = rq.LocalLLMDependencyGenerator(tokenizer, model)
+        dep_generator = LocalLLMDependencyGenerator(tokenizer, model)
         logging.info("Using local LLM dependency generator.")
 
     bert_conf_threshold = args.bert_dependency_threshold or args.bert_attention_threshold
@@ -389,7 +390,7 @@ def main() -> None:
     args = parse_args()
     # Default: disable think tokens for batch compatibility; allow opt-in via --use-think-tokens
     use_think = args.use_think_tokens and not args.no_think_tokens
-    rq.set_think_tokens(use_think)
+    set_think_tokens(use_think)
     log_level = logging.DEBUG if args.verbose_debug else getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
     world_size = args.num_shards or int(os.environ.get("WORLD_SIZE", 1))

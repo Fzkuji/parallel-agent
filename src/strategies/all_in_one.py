@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import run_qwen_parallel as rq
-from python import Question
+from src.models import Question
+from src.inference import USE_THINK_TOKENS
 from src.eval import evaluate_predictions
 from src.results import StrategyResult
 from src.utils import (
@@ -63,7 +63,7 @@ Questions:
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=(not rq.USE_THINK_TOKENS),
+        enable_thinking=(not USE_THINK_TOKENS),
     )
 
     inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
@@ -197,7 +197,7 @@ Rules:
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=(not rq.USE_THINK_TOKENS),
+        enable_thinking=(not USE_THINK_TOKENS),
     )
 
     inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)

@@ -1,7 +1,7 @@
 import textwrap
 from typing import Dict, List, Tuple
 
-from python import Question
+from src.models import Question
 
 
 def build_dependency_prompt(

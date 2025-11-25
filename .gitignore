@@ -1,3 +1,27 @@
-__pycache__/python.cpython-312.pyc
-__pycache__/run_qwen_parallel.cpython-312.pyc
-*.pyc
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Output directories
+outputs_html/
+outputs_json/
+
+# Misc
+.DS_Store
+*.log

@@ -7,13 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import run_qwen_parallel as rq
-from python import (
-    DependencyScheduler,
-    Question,
-    apply_dependencies,
-    select_dependency_edges,
-)
+from src.models import Question
+from src.inference import build_chat_prompt, extract_box_answer
+from src.scheduler import DependencyScheduler
+from src.selection import apply_dependencies, select_dependency_edges
 from src.eval import evaluate_predictions
 from src.prompts import build_dependency_prompt
 from src.results import StrategyResult
@@ -96,7 +93,7 @@ def run_dependency_batch_strategy(
                 deps,
                 question_lookup,
             )
-            chat_prompt = rq.build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+            chat_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
             batch_text_prompts.append(chat_prompt)
             batch_questions.append(question)
             dep_answers_per_question.append(
@@ -142,7 +139,7 @@ def run_dependency_batch_strategy(
             rt = tokenizer.decode(tokens, skip_special_tokens=True).strip()
             rt = clean_model_text(rt)
             raw_texts.append(rt)
-        boxes = list(map(rq.extract_box_answer, raw_texts))
+        boxes = list(map(extract_box_answer, raw_texts))
 
         gen_token_counts = [
             int(tokenizer(raw_texts[idx], return_tensors="pt").input_ids.shape[1])

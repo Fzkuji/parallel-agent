@@ -1,6 +1,6 @@
 from typing import List
 
-from python import Question
+from src.models import Question
 
 from .eval import normalize_answer
 from .results import StrategyResult

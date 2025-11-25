@@ -44,7 +44,7 @@ import logging
 import sys
 from typing import Dict, List
 
-from python import (
+from src import (
     BertAttentionDependencyGenerator,
     EdgeCandidate,
     Question,

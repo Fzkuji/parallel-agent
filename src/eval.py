@@ -1,7 +1,7 @@
 import re
 from typing import Dict, List, Tuple
 
-from python import Question
+from src.models import Question
 
 
 def normalize_answer(text: str) -> str:
