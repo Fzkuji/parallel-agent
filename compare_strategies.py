@@ -68,6 +68,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=96, help="Max new tokens for answer generation.")
 
     parser.add_argument("--log-level", default="INFO", help="Logging level.")
+    parser.add_argument(
+        "--strategies",
+        type=str,
+        default=None,
+        help="Comma-separated list of strategies to test (e.g., 'all_in_one,sequential,batch'). "
+             "Available: all_in_one, sequential, batch, parallel, parallel_bert. "
+             "If not specified, all strategies will be tested.",
+    )
     parser.add_argument("--no-llm-deps", action="store_true", help="Force heuristic dependency generator.")
     parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
     parser.add_argument("--no-think-tokens", action="store_true", help="Disable <think></think> markers.")
@@ -148,6 +156,9 @@ def resolve_dependency_generators(
     return dep_generator, bert_dep_generator, bert_conf_threshold
 
 
+ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "parallel", "parallel_bert"]
+
+
 def run_all_strategies(
     background: str,
     questions,
@@ -158,127 +169,139 @@ def run_all_strategies(
     bert_dep_generator,
     args: argparse.Namespace,
     bert_conf_threshold: float,
+    selected_strategies: Optional[List[str]] = None,
 ) -> List[StrategyResult]:
+    # Default to all strategies if none specified
+    if selected_strategies is None:
+        selected_strategies = ALL_STRATEGIES
+
+    results: List[StrategyResult] = []
+
     # Multi-context mode: if questions is None and items provided, use items-based strategies
     if background is None and isinstance(questions, list) and questions and isinstance(questions[0], dict) and "context" in questions[0]:
         items = questions
-        all_in_one = run_all_in_one_multi_strategy(
-            items,
-            tokenizer,
-            model,
-            max_new_tokens=args.max_new_tokens,
-            strategy_name="all_in_one",
-        )
-        sequential = run_sequential_multi_strategy(
-            items,
-            tokenizer,
-            model,
-            max_new_tokens=args.max_new_tokens,
-            strategy_name="sequential",
-        )
-        batch = run_batch_multi_strategy(
-            items,
-            tokenizer,
-            model,
-            max_new_tokens=args.max_new_tokens,
-            strategy_name="batch",
-        )
+        if "all_in_one" in selected_strategies:
+            results.append(run_all_in_one_multi_strategy(
+                items,
+                tokenizer,
+                model,
+                max_new_tokens=args.max_new_tokens,
+                strategy_name="all_in_one",
+            ))
+        if "sequential" in selected_strategies:
+            results.append(run_sequential_multi_strategy(
+                items,
+                tokenizer,
+                model,
+                max_new_tokens=args.max_new_tokens,
+                strategy_name="sequential",
+            ))
+        if "batch" in selected_strategies:
+            results.append(run_batch_multi_strategy(
+                items,
+                tokenizer,
+                model,
+                max_new_tokens=args.max_new_tokens,
+                strategy_name="batch",
+            ))
         # For dependency strategies, avoid duplicating all contexts per question.
         # Embed each question's own context inline, and leave shared background empty.
-        merged_background = ""
-        dep_questions = [
-            Question(
-                qid=item["qid"],
-                text=f"Context:\n{item['context']}\nQuestion: {item['question']}",
-                priority=1.0,
-                answer_tokens=item.get("answer_tokens", 12),
-                type_hint=None,
-                references=item.get("references", []),
-            )
-            for item in items
-        ]
-        parallel = run_dependency_batch_strategy(
-            merged_background,
-            dep_questions,
-            generator=dep_generator,
-            tokenizer=tokenizer,
-            model=model,
+        if "parallel" in selected_strategies or "parallel_bert" in selected_strategies:
+            merged_background = ""
+            dep_questions = [
+                Question(
+                    qid=item["qid"],
+                    text=f"Context:\n{item['context']}\nQuestion: {item['question']}",
+                    priority=1.0,
+                    answer_tokens=item.get("answer_tokens", 12),
+                    type_hint=None,
+                    references=item.get("references", []),
+                )
+                for item in items
+            ]
+            if "parallel" in selected_strategies:
+                results.append(run_dependency_batch_strategy(
+                    merged_background,
+                    dep_questions,
+                    generator=dep_generator,
+                    tokenizer=tokenizer,
+                    model=model,
+                    cost_weight=args.cost_weight,
+                    min_confidence=args.min_confidence,
+                    max_dependencies=args.max_dependencies,
+                    total_cost_budget=args.total_cost_budget,
+                    max_new_tokens=args.max_new_tokens,
+                    strategy_name="parallel",
+                ))
+            if "parallel_bert" in selected_strategies:
+                results.append(run_dependency_batch_strategy(
+                    merged_background,
+                    dep_questions,
+                    generator=bert_dep_generator,
+                    tokenizer=tokenizer,
+                    model=model,
+                    cost_weight=args.cost_weight,
+                    min_confidence=args.min_confidence,
+                    max_dependencies=args.max_dependencies,
+                    total_cost_budget=args.total_cost_budget,
+                    max_new_tokens=args.max_new_tokens,
+                    strategy_name="parallel_bert",
+                ))
+        return results
+
+    if "all_in_one" in selected_strategies:
+        results.append(run_all_in_one_strategy(
+            background,
+            questions,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+        ))
+    if "sequential" in selected_strategies:
+        results.append(run_sequential_strategy(
+            background,
+            questions,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+        ))
+    if "batch" in selected_strategies:
+        results.append(run_full_batch_strategy(
+            background,
+            questions,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+        ))
+    if "parallel" in selected_strategies:
+        results.append(run_dependency_batch_strategy(
+            background,
+            questions,
+            dep_generator,
+            tokenizer,
+            model,
             cost_weight=args.cost_weight,
             min_confidence=args.min_confidence,
             max_dependencies=args.max_dependencies,
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel",
-        )
-        parallel_bert = run_dependency_batch_strategy(
-            merged_background,
-            dep_questions,
-            generator=bert_dep_generator,
-            tokenizer=tokenizer,
-            model=model,
-            cost_weight=args.cost_weight,
-            min_confidence=args.min_confidence,
+        ))
+    if "parallel_bert" in selected_strategies:
+        results.append(run_dependency_batch_strategy(
+            background,
+            questions,
+            bert_dep_generator,
+            tokenizer,
+            model,
+            cost_weight=args.bert_cost_weight,
+            min_confidence=bert_conf_threshold,
             max_dependencies=args.max_dependencies,
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel_bert",
-        )
-        return [all_in_one, sequential, batch, parallel, parallel_bert]
-
-    all_in_one = run_all_in_one_strategy(
-        background,
-        questions,
-        tokenizer,
-        model,
-        max_new_tokens=args.max_new_tokens,
-    )
-    sequential = run_sequential_strategy(
-        background,
-        questions,
-        tokenizer,
-        model,
-        max_new_tokens=args.max_new_tokens,
-    )
-    batch = run_full_batch_strategy(
-        background,
-        questions,
-        tokenizer,
-        model,
-        max_new_tokens=args.max_new_tokens,
-    )
-    parallel = run_dependency_batch_strategy(
-        background,
-        questions,
-        dep_generator,
-        tokenizer,
-        model,
-        cost_weight=args.cost_weight,
-        min_confidence=args.min_confidence,
-        max_dependencies=args.max_dependencies,
-        total_cost_budget=args.total_cost_budget,
-        max_new_tokens=args.max_new_tokens,
-        strategy_name="parallel",
-    )
-    parallel_bert = run_dependency_batch_strategy(
-        background,
-        questions,
-        bert_dep_generator,
-        tokenizer,
-        model,
-        cost_weight=args.bert_cost_weight,
-        min_confidence=bert_conf_threshold,
-        max_dependencies=args.max_dependencies,
-        total_cost_budget=args.total_cost_budget,
-        max_new_tokens=args.max_new_tokens,
-        strategy_name="parallel_bert",
-    )
-    return [
-        all_in_one,
-        sequential,
-        batch,
-        parallel,
-        parallel_bert,
-    ]
+        ))
+    return results
 
 
 def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
@@ -446,6 +469,17 @@ def main() -> None:
 
     dep_generator, bert_dep_generator, bert_conf_threshold = resolve_dependency_generators(args, tokenizer, model)
 
+    # Parse selected strategies
+    selected_strategies = None
+    if args.strategies:
+        selected_strategies = [s.strip() for s in args.strategies.split(",")]
+        invalid = [s for s in selected_strategies if s not in ALL_STRATEGIES]
+        if invalid:
+            raise ValueError(f"Invalid strategies: {invalid}. Available: {ALL_STRATEGIES}")
+        logging.info("Running selected strategies: %s", selected_strategies)
+    else:
+        logging.info("Running all strategies: %s", ALL_STRATEGIES)
+
     overall_results: Dict[str, List[StrategyResult]] = {}
     serialized_contexts: List[dict] = []
 
@@ -463,6 +497,7 @@ def main() -> None:
                 bert_dep_generator=bert_dep_generator,
                 args=args,
                 bert_conf_threshold=bert_conf_threshold,
+                selected_strategies=selected_strategies,
             )
             questions = [
                 Question(
@@ -491,6 +526,7 @@ def main() -> None:
                 bert_dep_generator=bert_dep_generator,
                 args=args,
                 bert_conf_threshold=bert_conf_threshold,
+                selected_strategies=selected_strategies,
             )
         overall_results[title] = strategy_list
 

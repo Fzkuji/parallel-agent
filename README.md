@@ -12,68 +12,40 @@ Core library with:
 
 Use it as a toolkit; scripts import from here.
 
-## run_qwen_parallel.py
+## run_qwen_parallel.py (legacy)
 
-Dependency-aware pipeline:
-
-1. Load SQuAD contexts (group by `context`).
-2. Generate dependency graph (local Qwen by default; `--no-llm-deps` falls back to heuristics).
-3. Run cost-aware edge selection.
-4. Schedule batches per DAG layer; prompt Qwen per batch.
-5. Produce EM/F1 metrics and optional HTML visualisations.
-
-### Example
-
-```bash
-# Heuristic dependencies
-python run_qwen_parallel.py \
-  --model-name Qwen/Qwen3-4B \
-  --context-count 1 \
-  --min-questions 3 \
-  --max-questions 3 \
-  --no-llm-deps \
-  --max-new-tokens 128  # allow longer generations
-
-# LLM dependencies + HTML output
-python run_qwen_parallel.py \
-  --model-name Qwen/Qwen3-4B \
-  --context-count 5 \
-  --min-questions 3 \
-  --max-questions 5 \
-  --max-dependencies 2 \
-  --cost-weight 0.015 \
-  --max-new-tokens 128 \
-  --html-dir outputs_html
-```
+Kept for reference: single-context dependency pipeline (heuristic/LLM edges, cost-aware scheduling, optional HTML output). Prefer `compare_strategies.py` for current workflows.
 
 ## compare_strategies.py
 
-Runs three strategies side-by-side on sampled contexts:
+Runs multiple strategies side-by-side on sampled contexts:
 
-1. **sequential** – questions answered one-by-one (no reuse).
-2. **full_batch** – model answers all questions in a single prompt.
-3. **dependency_parallel** – DAG-driven batches (same as `run_qwen_parallel.py`).
-4. **parallel_ideal** – dependency DAG with theoretical infinite-parallel batches.
-5. **parallel_bert** – uses BERT self-attention weights to derive dependencies, then runs the same batch executor.
-6. **parallel_bert_ideal** – theoretical upper bound for the attention-derived DAG.
+1. **all_in_one** – single prompt with all questions (paired with their contexts).
+2. **sequential** – one question per turn (history grows).
+3. **batch** – all questions answered in one batch.
+4. **parallel** – dependency DAG (LLM edges).
+5. **parallel_bert** – dependency DAG (BERT attention edges).
 
-For each context it prints per-strategy strict accuracy (`answer` JSON matches gold exactly), lenient accuracy (answer text contains the gold span), prompt/generation token usage, latency, and batch count; averages are reported at the end.
+For SQuAD, questions share a background; for HotpotQA, each question has its own context and strategies switch to multi-context mode automatically. Metrics reported per strategy: strict/lenient accuracy, prompt/gen tokens, latency, and batch count; averages are shown at the end.
 
-Use the `--bert-*` flags (model name, attention/dependency thresholds, token caps, and cost weight) to tune the attention-based strategies without affecting the LLM-driven dependency runs.
+Use the `--bert-*` flags (model name, thresholds, token caps, and cost weight) to tune attention-based dependencies; `--no-llm-deps` disables LLM edge generation.
 
-### Example
+### Key arguments
 
-```bash
-python compare_strategies.py \
-  --model-name Qwen/Qwen3-4B \
-  --context-count 3 \
-  --min-questions 3 \
-  --max-questions 5 \
-  --max-new-tokens 128 \
-  --json-out outputs_json/results.json
-```
-
-Additional flags mirror `run_qwen_parallel.py` (`--no-llm-deps`, `--max-dependencies`, `--cost-weight`, etc.).
+- `--dataset {squad,hotpot}`: choose dataset. Hotpot enables multi-context mode (each question has its own context).
+- `--model-name`: HF model id or local path.
+- `--context-count`: number of sampled groups/steps.
+- `--min-questions / --max-questions`: number of questions per group (Hotpot uses this for bundle size when `--hotpot-group-size` is not set).
+- `--hotpot-subset`: HotpotQA split (e.g., `distractor`).
+- `--hotpot-group-size`: fixed number of Hotpot items per group (overrides min/max random size).
+- `--max-new-tokens`: generation cap.
+- `--json-out`: write summary JSON; on multi-GPU a single merged file is produced.
+- `--log-level`: logging verbosity.
+- `--strategies`: comma-separated list of strategies to test (e.g., `--strategies "all_in_one,sequential,batch"`). Available: `all_in_one`, `sequential`, `batch`, `parallel`, `parallel_bert`. If not specified, all strategies will be tested.
+- `--no-llm-deps`: disable LLM edge generation (parallel uses heuristics/attention only).
+- `--max-dependencies`: cap edges per target.
+- `--min-confidence`: minimum edge confidence.
+- `--cost-weight` / `--total-cost-budget`: tune dependency selection cost.
 
 ### SQuAD (multi-GPU)
 
