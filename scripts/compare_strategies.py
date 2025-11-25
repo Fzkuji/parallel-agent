@@ -306,8 +306,8 @@ def run_all_strategies(
     return results
 
 
-def aggregate_from_serialized(serialized_contexts: List[dict]) -> str:
-    """Compute aggregate metrics from serialized context data (used for multi-GPU gathering)."""
+def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
+    """Compute and format aggregate metrics across all contexts and strategies."""
     preferred_order = [
         "all_in_one",
         "sequential",
@@ -373,8 +373,8 @@ def aggregate_from_serialized(serialized_contexts: List[dict]) -> str:
     return "\n".join(summary_lines)
 
 
-def filter_error_contexts(serialized_contexts: List[dict]) -> List[dict]:
-    """Filter contexts to keep only questions where at least one strategy got wrong."""
+def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
+    """Extract contexts containing questions where at least one strategy answered incorrectly."""
     error_contexts = []
     for ctx in serialized_contexts:
         gold_answers = ctx.get("gold_answers", {})
@@ -414,8 +414,8 @@ def filter_error_contexts(serialized_contexts: List[dict]) -> List[dict]:
     return error_contexts
 
 
-def create_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
-    """Generate output folder name with timestamp and key parameters."""
+def generate_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
+    """Generate descriptive output folder name with timestamp and experiment parameters."""
     model_short = args.model_name.split("/")[-1]
     # Build dataset identifier: squad_train or hotpot_distractor_train
     if args.dataset == "hotpot":
@@ -426,17 +426,18 @@ def create_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
     return f"{timestamp}_{dataset_id}_{model_short}_n{args.context_count}_q{args.min_questions}-{args.max_questions}"
 
 
-def maybe_dump_json(
-    path: Optional[Path],
+def save_experiment_results(
+    output_path: Optional[Path],
     serialized_contexts: List[dict],
     args: argparse.Namespace,
     output_folder_name: str,
 ) -> None:
-    if not path:
+    """Save experiment results to JSON files and config.txt in the output folder."""
+    if not output_path:
         return
 
     # Create output folder with pre-determined name
-    base_path = Path(path).parent if Path(path).suffix == ".json" else Path(path)
+    base_path = Path(output_path).parent if Path(output_path).suffix == ".json" else Path(output_path)
     output_dir = base_path / output_folder_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -488,7 +489,7 @@ def maybe_dump_json(
     logging.info("Wrote full results to %s", full_path)
 
     # Save error-only results (questions where at least one strategy got wrong)
-    error_contexts = filter_error_contexts(serialized_contexts)
+    error_contexts = extract_error_cases(serialized_contexts)
     if error_contexts:
         error_payload = {
             "config": config,
@@ -517,7 +518,7 @@ def main() -> None:
     # Generate output folder name once at the start (same for all ranks)
     # Use a fixed timestamp based on seed to ensure all ranks use the same folder
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_folder_name = create_output_folder_name(args, run_timestamp) if args.json_out else ""
+    output_folder_name = generate_output_folder_name(args, run_timestamp) if args.json_out else ""
 
     logging.info("Loading tokenizer and model: %s", args.model_name)
     if args.deterministic:
@@ -696,12 +697,12 @@ def main() -> None:
                 if ctx_list:
                     merged.extend(ctx_list)
             # Print aggregate metrics from all ranks (only on rank 0)
-            print(aggregate_from_serialized(merged))
-            maybe_dump_json(args.json_out, merged, args, output_folder_name)
+            print(compute_aggregate_metrics(merged))
+            save_experiment_results(args.json_out, merged, args, output_folder_name)
     else:
         # Single process mode: print and save local results
-        print(aggregate_from_serialized(serialized_contexts))
-        maybe_dump_json(args.json_out, serialized_contexts, args, output_folder_name)
+        print(compute_aggregate_metrics(serialized_contexts))
+        save_experiment_results(args.json_out, serialized_contexts, args, output_folder_name)
 
     # Cleanup distributed backend
     if dist.is_initialized():
