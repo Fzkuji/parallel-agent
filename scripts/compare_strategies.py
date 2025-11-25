@@ -356,19 +356,19 @@ def aggregate_from_serialized(serialized_contexts: List[dict]) -> str:
         if not stats:
             continue
         count = stats["count"] or 1
-        avg_prompt = int(round(stats["prompt_tokens"] / count))
-        avg_gen = int(round(stats["generated_tokens"] / count))
+        avg_prompt = stats["prompt_tokens"] / count
+        avg_gen = stats["generated_tokens"] / count
         avg_latency = stats["latency"] / count
-        avg_batches = int(round(stats["batches"] / count))
+        avg_batches = stats["batches"] / count
         summary_lines.append(
             f"{name:<13} | "
             f"{stats['strict']/count:.3f} | "
             f"{stats['f1']/count:.3f} | "
             f"{stats['lenient']/count:.3f} | "
-            f"{avg_prompt} | "
-            f"{avg_gen} | "
+            f"{avg_prompt:.2f} | "
+            f"{avg_gen:.2f} | "
             f"{avg_latency:.2f} | "
-            f"{avg_batches}"
+            f"{avg_batches:.2f}"
         )
     return "\n".join(summary_lines)
 
@@ -643,10 +643,10 @@ def main() -> None:
                 "strategies": [
                     {
                         "name": res.name,
-                        "metrics": res.metrics,
+                        "metrics": {k: round(v, 2) for k, v in res.metrics.items()},
                         "prompt_tokens": res.prompt_tokens,
                         "generated_tokens": res.generated_tokens,
-                        "latency": res.latency,
+                        "latency": round(res.latency, 2),
                         "batches": res.batches,
                         "answers": res.answers,
                         "details": res.details,
