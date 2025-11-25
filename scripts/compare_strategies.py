@@ -306,7 +306,8 @@ def run_all_strategies(
     return results
 
 
-def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
+def aggregate_from_serialized(serialized_contexts: List[dict]) -> str:
+    """Compute aggregate metrics from serialized context data (used for multi-GPU gathering)."""
     preferred_order = [
         "all_in_one",
         "sequential",
@@ -315,10 +316,13 @@ def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
         "parallel_bert",
     ]
     strategy_totals: Dict[str, Dict[str, float]] = {}
-    for results in overall_results.values():
-        for res in results:
+
+    for ctx in serialized_contexts:
+        for strategy in ctx.get("strategies", []):
+            name = strategy.get("name", "unknown")
+            metrics = strategy.get("metrics", {})
             stats = strategy_totals.setdefault(
-                res.name,
+                name,
                 {
                     "strict": 0.0,
                     "f1": 0.0,
@@ -330,13 +334,13 @@ def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
                     "batches": 0,
                 },
             )
-            stats["strict"] += res.metrics["strict_acc"]
-            stats["f1"] += res.metrics["f1"]
-            stats["lenient"] += res.metrics["lenient_acc"]
-            stats["prompt_tokens"] += res.prompt_tokens
-            stats["generated_tokens"] += res.generated_tokens
-            stats["latency"] += res.latency
-            stats["batches"] += res.batches
+            stats["strict"] += metrics.get("strict_acc", 0.0)
+            stats["f1"] += metrics.get("f1", 0.0)
+            stats["lenient"] += metrics.get("lenient_acc", 0.0)
+            stats["prompt_tokens"] += strategy.get("prompt_tokens", 0)
+            stats["generated_tokens"] += strategy.get("generated_tokens", 0)
+            stats["latency"] += strategy.get("latency", 0.0)
+            stats["batches"] += strategy.get("batches", 0)
             stats["count"] += 1
 
     summary_lines = ["\n=== Aggregate Metrics ==="]
@@ -652,9 +656,8 @@ def main() -> None:
             }
         )
 
-    print(aggregate_overall(overall_results))
     # Distributed output handling: gather to rank0 and write a single file
-    if world_size > 1 and args.json_out and dist.is_initialized():
+    if world_size > 1 and dist.is_initialized():
         # Use torch.distributed to gather results from all ranks
         gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
         dist.all_gather_object(gather_list, serialized_contexts)
@@ -663,8 +666,12 @@ def main() -> None:
             for ctx_list in gather_list:
                 if ctx_list:
                     merged.extend(ctx_list)
+            # Print aggregate metrics from all ranks (only on rank 0)
+            print(aggregate_from_serialized(merged))
             maybe_dump_json(args.json_out, merged, args, output_folder_name)
     else:
+        # Single process mode: print and save local results
+        print(aggregate_from_serialized(serialized_contexts))
         maybe_dump_json(args.json_out, serialized_contexts, args, output_folder_name)
 
     # Cleanup distributed backend
