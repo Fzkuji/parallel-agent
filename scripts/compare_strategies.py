@@ -410,28 +410,25 @@ def filter_error_contexts(serialized_contexts: List[dict]) -> List[dict]:
     return error_contexts
 
 
-def create_output_folder(base_path: Path, args: argparse.Namespace) -> Path:
-    """Create output folder with timestamp and key parameters."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+def create_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
+    """Generate output folder name with timestamp and key parameters."""
     model_short = args.model_name.split("/")[-1]
-    folder_name = f"{timestamp}_{args.dataset}_{model_short}_ctx{args.context_count}_q{args.min_questions}-{args.max_questions}"
-
-    output_dir = base_path / folder_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+    return f"{timestamp}_{args.dataset}_{model_short}_ctx{args.context_count}_q{args.min_questions}-{args.max_questions}"
 
 
 def maybe_dump_json(
     path: Optional[Path],
     serialized_contexts: List[dict],
     args: argparse.Namespace,
+    output_folder_name: str,
 ) -> None:
     if not path:
         return
 
-    # Create output folder with timestamp and parameters
+    # Create output folder with pre-determined name
     base_path = Path(path).parent if Path(path).suffix == ".json" else Path(path)
-    output_dir = create_output_folder(base_path, args)
+    output_dir = base_path / output_folder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save config/parameters
     config = {
@@ -483,6 +480,11 @@ def main() -> None:
     logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
     world_size = args.num_shards or int(os.environ.get("WORLD_SIZE", 1))
     rank = args.shard_index if args.shard_index is not None else int(os.environ.get("LOCAL_RANK", 0))
+
+    # Generate output folder name once at the start (same for all ranks)
+    # Use a fixed timestamp based on seed to ensure all ranks use the same folder
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_folder_name = create_output_folder_name(args, run_timestamp) if args.json_out else ""
 
     logging.info("Loading tokenizer and model: %s", args.model_name)
     if args.deterministic:
@@ -645,18 +647,29 @@ def main() -> None:
 
     print(aggregate_overall(overall_results))
     # Distributed output handling: gather to rank0 and write a single file
-    if world_size > 1 and args.json_out and dist.is_available() and dist.is_initialized():
-        gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
-        dist.all_gather_object(gather_list, serialized_contexts)
-        if rank == 0:
-            merged = []
-            for ctx_list in gather_list:
-                if ctx_list:
-                    merged.extend(ctx_list)
-            # Use the same folder-based output as single-process mode
-            maybe_dump_json(args.json_out, merged, args)
+    if world_size > 1 and args.json_out:
+        if dist.is_available() and dist.is_initialized():
+            # Use torch.distributed to gather results
+            gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
+            dist.all_gather_object(gather_list, serialized_contexts)
+            if rank == 0:
+                merged = []
+                for ctx_list in gather_list:
+                    if ctx_list:
+                        merged.extend(ctx_list)
+                maybe_dump_json(args.json_out, merged, args, output_folder_name)
+        else:
+            # Distributed without torch.distributed initialized: only rank 0 saves its portion
+            # (other ranks' results will be lost - user should use proper distributed setup)
+            if rank == 0:
+                logging.warning(
+                    "Running distributed (world_size=%d) but torch.distributed not initialized. "
+                    "Only rank 0 results will be saved. Use torchrun for proper distributed gathering.",
+                    world_size,
+                )
+                maybe_dump_json(args.json_out, serialized_contexts, args, output_folder_name)
     else:
-        maybe_dump_json(args.json_out, serialized_contexts, args)
+        maybe_dump_json(args.json_out, serialized_contexts, args, output_folder_name)
 
 
 if __name__ == "__main__":
