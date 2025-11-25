@@ -59,10 +59,10 @@ Use the `--bert-*` flags (model name, thresholds, token caps, and cost weight) t
 ```bash
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --dataset squad \
-  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
   --context-count 10 \
-  --min-questions 3 \
-  --max-questions 20 \
+  --min-questions 8 \
+  --max-questions 8 \
   --max-new-tokens 1024 \
   --json-out outputs_json/results_squad.json \
   --log-level INFO

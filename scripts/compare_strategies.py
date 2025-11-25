@@ -5,8 +5,11 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from src.eval import compute_em
 
 import torch
 import torch.distributed as dist
@@ -368,6 +371,58 @@ def aggregate_overall(overall_results: Dict[str, List[StrategyResult]]) -> str:
     return "\n".join(summary_lines)
 
 
+def filter_error_contexts(serialized_contexts: List[dict]) -> List[dict]:
+    """Filter contexts to keep only questions where at least one strategy got wrong."""
+    error_contexts = []
+    for ctx in serialized_contexts:
+        gold_answers = ctx.get("gold_answers", {})
+        strategies = ctx.get("strategies", [])
+
+        # Check each question
+        error_questions = {}
+        for qid, refs in gold_answers.items():
+            # Check if all strategies got this question correct
+            all_correct = True
+            for strategy in strategies:
+                answer = strategy.get("answers", {}).get(qid, "")
+                if compute_em(answer, refs) < 1.0:
+                    all_correct = False
+                    break
+
+            if not all_correct:
+                error_questions[qid] = refs
+
+        # If any question has errors, include this context (filtered)
+        if error_questions:
+            filtered_ctx = {
+                "context": ctx.get("context"),
+                "questions_text": {qid: ctx.get("questions_text", {}).get(qid, "") for qid in error_questions},
+                "gold_answers": error_questions,
+                "strategies": [
+                    {
+                        "name": s.get("name"),
+                        "answers": {qid: s.get("answers", {}).get(qid, "") for qid in error_questions},
+                        "metrics": s.get("metrics"),
+                    }
+                    for s in strategies
+                ],
+            }
+            error_contexts.append(filtered_ctx)
+
+    return error_contexts
+
+
+def create_output_folder(base_path: Path, args: argparse.Namespace) -> Path:
+    """Create output folder with timestamp and key parameters."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_short = args.model_name.split("/")[-1]
+    folder_name = f"{timestamp}_{args.dataset}_{model_short}_ctx{args.context_count}_q{args.min_questions}-{args.max_questions}"
+
+    output_dir = base_path / folder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def maybe_dump_json(
     path: Optional[Path],
     serialized_contexts: List[dict],
@@ -375,15 +430,50 @@ def maybe_dump_json(
 ) -> None:
     if not path:
         return
-    payload = {
+
+    # Create output folder with timestamp and parameters
+    base_path = Path(path).parent if Path(path).suffix == ".json" else Path(path)
+    output_dir = create_output_folder(base_path, args)
+
+    # Save config/parameters
+    config = {
         "model": args.model_name,
+        "dataset": args.dataset,
+        "split": args.split,
+        "context_count": args.context_count,
+        "min_questions": args.min_questions,
+        "max_questions": args.max_questions,
+        "max_new_tokens": args.max_new_tokens,
+        "seed": args.seed,
+        "strategies": args.strategies,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # Save full results
+    full_payload = {
+        "config": config,
         "contexts": serialized_contexts,
     }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fout:
-        json.dump(payload, fout, indent=2, ensure_ascii=False)
-    logging.info("Wrote JSON summary to %s", path)
+    full_path = output_dir / "full_results.json"
+    with open(full_path, "w", encoding="utf-8") as fout:
+        json.dump(full_payload, fout, indent=2, ensure_ascii=False)
+    logging.info("Wrote full results to %s", full_path)
+
+    # Save error-only results (questions where at least one strategy got wrong)
+    error_contexts = filter_error_contexts(serialized_contexts)
+    if error_contexts:
+        error_payload = {
+            "config": config,
+            "description": "Questions where at least one strategy produced incorrect answer",
+            "total_error_contexts": len(error_contexts),
+            "contexts": error_contexts,
+        }
+        error_path = output_dir / "errors.json"
+        with open(error_path, "w", encoding="utf-8") as fout:
+            json.dump(error_payload, fout, indent=2, ensure_ascii=False)
+        logging.info("Wrote error analysis to %s (%d contexts with errors)", error_path, len(error_contexts))
+    else:
+        logging.info("No errors found - all strategies answered all questions correctly")
 
 
 def main() -> None:
@@ -566,10 +656,8 @@ def main() -> None:
             for ctx_list in gather_list:
                 if ctx_list:
                     merged.extend(ctx_list)
-            Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
-            with open(args.json_out, "w", encoding="utf-8") as fout:
-                json.dump({"model": args.model_name, "contexts": merged}, fout, indent=2, ensure_ascii=False)
-            logging.info("Wrote merged results to %s", args.json_out)
+            # Use the same folder-based output as single-process mode
+            maybe_dump_json(args.json_out, merged, args)
     else:
         maybe_dump_json(args.json_out, serialized_contexts, args)
 
