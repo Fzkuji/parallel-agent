@@ -74,9 +74,9 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --dataset hotpot \
   --hotpot-subset distractor \
   --model-name Qwen/Qwen2.5-14B-Instruct \
-  --context-count 100 \
-  --min-questions 3 \
-  --max-questions 20 \
+  --context-count 1000 \
+  --min-questions 4 \
+  --max-questions 4 \
   --max-new-tokens 1024 \
   --json-out outputs_json/results_hotpot.json \
   --log-level INFO

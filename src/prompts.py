@@ -11,6 +11,8 @@ def build_dependency_prompt(
     dependencies: List[str],
     question_lookup: Dict[str, Question],
 ) -> Tuple[str, str]:
+    # Use question-specific context if available, otherwise use shared background
+    effective_background = question.context if question.context else background
     system_prompt = (
         textwrap.dedent(
             r"""You are a helpful assistant that answers questions given background passages.
@@ -20,7 +22,7 @@ Background:
 """
         ).strip()
         + "\n"
-        + background.strip()
+        + effective_background.strip()
     )
 
     user_lines: List[str] = []
@@ -40,6 +42,8 @@ Background:
 
 
 def build_single_prompt(background: str, question: Question) -> Tuple[str, str]:
+    # Use question-specific context if available, otherwise use shared background
+    effective_background = question.context if question.context else background
     system_prompt = (
         textwrap.dedent(
             r"""You are a helpful assistant that answers questions given background passages.
@@ -49,7 +53,7 @@ Background:
 """
         ).strip()
         + "\n"
-        + background.strip()
+        + effective_background.strip()
     )
     user_prompt = f"Question ({question.qid}): {question.text.strip()}"
     return system_prompt, user_prompt

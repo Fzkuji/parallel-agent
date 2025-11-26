@@ -206,24 +206,24 @@ def run_all_strategies(
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="batch",
             ))
-        # For dependency strategies, avoid duplicating all contexts per question.
-        # Embed each question's own context inline, and leave shared background empty.
+        # For dependency strategies in multi-context mode, store context per question
+        # This ensures consistent prompt format with batch strategy (context in system message)
         if "parallel" in selected_strategies or "parallel_bert" in selected_strategies:
-            merged_background = ""
             dep_questions = [
                 Question(
                     qid=item["qid"],
-                    text=f"Context:\n{item['context']}\nQuestion: {item['question']}",
+                    text=item["question"],
                     priority=1.0,
                     answer_tokens=item.get("answer_tokens", 12),
                     type_hint=None,
                     references=item.get("references", []),
+                    context=item["context"],  # Store context per question
                 )
                 for item in items
             ]
             if "parallel" in selected_strategies:
                 results.append(run_dependency_batch_strategy(
-                    merged_background,
+                    "",  # Empty shared background; each question has its own context
                     dep_questions,
                     generator=dep_generator,
                     tokenizer=tokenizer,
@@ -237,7 +237,7 @@ def run_all_strategies(
                 ))
             if "parallel_bert" in selected_strategies:
                 results.append(run_dependency_batch_strategy(
-                    merged_background,
+                    "",  # Empty shared background; each question has its own context
                     dep_questions,
                     generator=bert_dep_generator,
                     tokenizer=tokenizer,

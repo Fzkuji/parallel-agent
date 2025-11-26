@@ -27,6 +27,7 @@ class Question:
     tokens: int = field(init=False)
     dependencies: Set[str] = field(default_factory=set, init=False)
     references: List[str] = field(default_factory=list)
+    context: Optional[str] = None  # Per-question context for multi-context mode
 
     def __post_init__(self) -> None:
         self.tokens = estimate_tokens(self.text)
