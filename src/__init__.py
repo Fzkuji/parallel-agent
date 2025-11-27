@@ -10,7 +10,7 @@ from .models import (
 )
 
 # Evaluation metrics
-from .eval import (
+from .evaluation import (
     DATASET_METRICS,
     compute_bleu4,
     compute_contains,
@@ -57,7 +57,7 @@ from .selection import (
 )
 
 # Data loaders
-from .loaders import (
+from .datasets import (
     build_questions_from_group,
     load_cmb_groups,
     load_hotpot_groups,

@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.eval import (
+from src.evaluation import (
     compute_em,
     get_dataset_metrics,
     get_metric_names,
@@ -203,6 +203,7 @@ def run_all_strategies(
                 model,
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="all_in_one",
+                dataset=args.dataset,
             ))
         if "sequential" in selected_strategies:
             results.append(run_sequential_multi_strategy(
@@ -211,6 +212,7 @@ def run_all_strategies(
                 model,
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="sequential",
+                dataset=args.dataset,
             ))
         if "batch" in selected_strategies:
             results.append(run_batch_multi_strategy(
@@ -219,6 +221,7 @@ def run_all_strategies(
                 model,
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="batch",
+                dataset=args.dataset,
             ))
         # For dependency strategies in multi-context mode, store context per question
         # This ensures consistent prompt format with batch strategy (context in system message)
@@ -248,6 +251,7 @@ def run_all_strategies(
                     total_cost_budget=args.total_cost_budget,
                     max_new_tokens=args.max_new_tokens,
                     strategy_name="parallel",
+                    dataset=args.dataset,
                 ))
             if "parallel_bert" in selected_strategies:
                 results.append(run_dependency_batch_strategy(
@@ -262,6 +266,7 @@ def run_all_strategies(
                     total_cost_budget=args.total_cost_budget,
                     max_new_tokens=args.max_new_tokens,
                     strategy_name="parallel_bert",
+                    dataset=args.dataset,
                 ))
         return results
 
@@ -272,6 +277,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
+            dataset=args.dataset,
         ))
     if "sequential" in selected_strategies:
         results.append(run_sequential_strategy(
@@ -280,6 +286,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
+            dataset=args.dataset,
         ))
     if "batch" in selected_strategies:
         results.append(run_full_batch_strategy(
@@ -288,6 +295,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
+            dataset=args.dataset,
         ))
     if "parallel" in selected_strategies:
         results.append(run_dependency_batch_strategy(
@@ -302,6 +310,7 @@ def run_all_strategies(
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel",
+            dataset=args.dataset,
         ))
     if "parallel_bert" in selected_strategies:
         results.append(run_dependency_batch_strategy(
@@ -316,6 +325,7 @@ def run_all_strategies(
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel_bert",
+            dataset=args.dataset,
         ))
     return results
 
@@ -740,7 +750,7 @@ def main() -> None:
     llm_evaluator = None
     if args.eval_model:
         try:
-            from src.llm_eval import OpenRouterEvaluator
+            from src.evaluation.llm import OpenRouterEvaluator
             llm_evaluator = OpenRouterEvaluator(model=args.eval_model)
             logging.info("Initialized LLM evaluator with model: %s", args.eval_model)
         except Exception as e:
@@ -840,7 +850,7 @@ def main() -> None:
             # Compute LLM evaluation metrics if evaluator is available
             if llm_evaluator:
                 try:
-                    from src.llm_eval import compute_llm_metrics
+                    from src.evaluation.llm import compute_llm_metrics
                     eval_items = []
                     for q in questions:
                         pred = res.answers.get(q.qid, "")

@@ -115,7 +115,7 @@ For domain-specific tasks (like CMB medical QA), use external LLM evaluation:
 - **Proficiency**: Medical accuracy and terminology (1-5)
 
 ```python
-from src.llm_eval import OpenRouterEvaluator, compute_llm_metrics
+from src.evaluation.llm import OpenRouterEvaluator, compute_llm_metrics
 evaluator = OpenRouterEvaluator(model="openai/gpt-4o")
 result = evaluator.evaluate_single(context, question, reference, prediction)
 # result.fluency, result.relevance, result.completeness, result.proficiency, result.average
@@ -209,7 +209,7 @@ result = run_all_in_one_strategy(background, questions, tokenizer, model, max_ne
 
 ### Evaluating Answers
 ```python
-from src.eval import compute_em, compute_f1, evaluate_predictions
+from src.evaluation import compute_em, compute_f1, evaluate_predictions
 
 em = compute_em(prediction, references)  # 0.0 or 1.0
 f1 = compute_f1(prediction, references)  # 0.0 to 1.0

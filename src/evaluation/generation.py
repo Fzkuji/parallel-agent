@@ -9,27 +9,31 @@ Metrics:
 - ROUGE-2: Bigram overlap F1
 - ROUGE-L: Longest common subsequence F1
 
-Note: For Chinese text, character-level tokenization is used since
-Chinese does not use whitespace between words.
+For Chinese text, uses rouge-chinese with jieba word segmentation when available.
+Falls back to character-level tokenization if not installed.
 """
 from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import List, Optional
+from typing import List
 
-# Optional imports for BLEU and ROUGE
+# Optional NLTK import for BLEU
 try:
     from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
     NLTK_AVAILABLE = True
 except ImportError:
     NLTK_AVAILABLE = False
 
+# Optional rouge-chinese with jieba for Chinese text
 try:
-    from rouge_score import rouge_scorer
-    ROUGE_AVAILABLE = True
+    from rouge_chinese import Rouge as RougeChinese
+    import jieba
+    jieba.setLogLevel(jieba.logging.WARNING)  # Suppress jieba logs
+    ROUGE_CHINESE_AVAILABLE = True
 except ImportError:
-    ROUGE_AVAILABLE = False
+    ROUGE_CHINESE_AVAILABLE = False
+
 
 
 def _is_chinese_text(text: str) -> bool:
@@ -226,18 +230,43 @@ def _compute_rouge_fallback(
     return best_f1
 
 
-# Cached ROUGE scorer instance
-_rouge_scorer_instance: Optional["rouge_scorer.RougeScorer"] = None
+# Cached rouge-chinese scorer instance
+_rouge_chinese_instance: "RougeChinese | None" = None
 
 
-def _get_rouge_scorer() -> "rouge_scorer.RougeScorer":
-    """Get or create cached ROUGE scorer."""
-    global _rouge_scorer_instance
-    if _rouge_scorer_instance is None:
-        _rouge_scorer_instance = rouge_scorer.RougeScorer(
-            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
-        )
-    return _rouge_scorer_instance
+def _get_rouge_chinese() -> "RougeChinese":
+    """Get or create cached rouge-chinese scorer."""
+    global _rouge_chinese_instance
+    if _rouge_chinese_instance is None:
+        _rouge_chinese_instance = RougeChinese()
+    return _rouge_chinese_instance
+
+
+def _compute_rouge_chinese(
+    prediction: str,
+    references: List[str],
+    rouge_type: str,
+) -> float:
+    """Compute ROUGE using rouge-chinese with jieba segmentation."""
+    # Segment with jieba
+    pred_segmented = " ".join(jieba.cut(prediction))
+
+    scorer = _get_rouge_chinese()
+    best_score = 0.0
+
+    for ref in references:
+        if not ref.strip():
+            continue
+        ref_segmented = " ".join(jieba.cut(ref))
+        try:
+            scores = scorer.get_scores(pred_segmented, ref_segmented)[0]
+            # rouge_type is "rouge1", "rouge2", or "rougeL" -> map to "rouge-1", "rouge-2", "rouge-l"
+            key = rouge_type.replace("rouge", "rouge-").lower()
+            best_score = max(best_score, scores[key]["f"])
+        except Exception:
+            continue
+
+    return best_score
 
 
 def compute_rouge1(prediction: str, references: List[str]) -> float:
@@ -255,21 +284,9 @@ def compute_rouge1(prediction: str, references: List[str]) -> float:
     if not prediction.strip() or not references:
         return 0.0
 
-    # Use fallback for Chinese text (char-level tokenization)
-    if _is_chinese_text(prediction) or any(_is_chinese_text(r) for r in references):
-        return _compute_rouge_fallback(prediction, references, "rouge1")
-
-    if ROUGE_AVAILABLE:
-        scorer = _get_rouge_scorer()
-        best_score = 0.0
-        for ref in references:
-            if not ref.strip():
-                continue
-            scores = scorer.score(ref, prediction)
-            best_score = max(best_score, scores["rouge1"].fmeasure)
-        return best_score
-    else:
-        return _compute_rouge_fallback(prediction, references, "rouge1")
+    if ROUGE_CHINESE_AVAILABLE:
+        return _compute_rouge_chinese(prediction, references, "rouge1")
+    return _compute_rouge_fallback(prediction, references, "rouge1")
 
 
 def compute_rouge2(prediction: str, references: List[str]) -> float:
@@ -287,21 +304,9 @@ def compute_rouge2(prediction: str, references: List[str]) -> float:
     if not prediction.strip() or not references:
         return 0.0
 
-    # Use fallback for Chinese text (char-level tokenization)
-    if _is_chinese_text(prediction) or any(_is_chinese_text(r) for r in references):
-        return _compute_rouge_fallback(prediction, references, "rouge2")
-
-    if ROUGE_AVAILABLE:
-        scorer = _get_rouge_scorer()
-        best_score = 0.0
-        for ref in references:
-            if not ref.strip():
-                continue
-            scores = scorer.score(ref, prediction)
-            best_score = max(best_score, scores["rouge2"].fmeasure)
-        return best_score
-    else:
-        return _compute_rouge_fallback(prediction, references, "rouge2")
+    if ROUGE_CHINESE_AVAILABLE:
+        return _compute_rouge_chinese(prediction, references, "rouge2")
+    return _compute_rouge_fallback(prediction, references, "rouge2")
 
 
 def compute_rouge_l(prediction: str, references: List[str]) -> float:
@@ -319,18 +324,6 @@ def compute_rouge_l(prediction: str, references: List[str]) -> float:
     if not prediction.strip() or not references:
         return 0.0
 
-    # Use fallback for Chinese text (char-level tokenization)
-    if _is_chinese_text(prediction) or any(_is_chinese_text(r) for r in references):
-        return _compute_rouge_fallback(prediction, references, "rougeL")
-
-    if ROUGE_AVAILABLE:
-        scorer = _get_rouge_scorer()
-        best_score = 0.0
-        for ref in references:
-            if not ref.strip():
-                continue
-            scores = scorer.score(ref, prediction)
-            best_score = max(best_score, scores["rougeL"].fmeasure)
-        return best_score
-    else:
-        return _compute_rouge_fallback(prediction, references, "rougeL")
+    if ROUGE_CHINESE_AVAILABLE:
+        return _compute_rouge_chinese(prediction, references, "rougeL")
+    return _compute_rouge_fallback(prediction, references, "rougeL")

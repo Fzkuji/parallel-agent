@@ -9,7 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.models import Question
 from src.inference import USE_THINK_TOKENS, build_chat_prompt, extract_box_answer
-from src.eval import evaluate_predictions
+from src.evaluation import evaluate_predictions
 from src.prompts import build_single_prompt
 from src.results import StrategyResult
 from src.utils import (
@@ -28,6 +28,7 @@ def run_sequential_strategy(
     model: AutoModelForCausalLM,
     *,
     max_new_tokens: int,
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
@@ -115,7 +116,7 @@ Background:
             }
         )
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name="sequential",
         answers=answers_text,
@@ -136,6 +137,7 @@ def run_full_batch_strategy(
     model: AutoModelForCausalLM,
     *,
     max_new_tokens: int,
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
@@ -219,7 +221,7 @@ def run_full_batch_strategy(
             }
         )
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name="batch",
         answers=answers_text,
@@ -239,6 +241,7 @@ def run_batch_multi_strategy(
     *,
     max_new_tokens: int,
     strategy_name: str = "batch",
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {
         item["qid"]: Question(
@@ -333,7 +336,7 @@ def run_batch_multi_strategy(
             }
         )
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name=strategy_name,
         answers=answers_text,
@@ -353,6 +356,7 @@ def run_sequential_multi_strategy(
     *,
     max_new_tokens: int,
     strategy_name: str = "sequential",
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {
         item["qid"]: Question(
@@ -444,7 +448,7 @@ Provide the answer with format <answer>text</answer>. If the answer is unknown, 
             }
         )
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name=strategy_name,
         answers=answers_text,

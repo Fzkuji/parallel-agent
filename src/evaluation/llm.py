@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 try:
     import httpx
     HTTPX_AVAILABLE = True
+    # Suppress httpx INFO logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 except ImportError:
     HTTPX_AVAILABLE = False
 

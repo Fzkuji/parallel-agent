@@ -29,7 +29,9 @@ from .llm import (
 from .config import (
     DATASET_METRICS,
     get_dataset_metrics,
+    get_metric_names,
     evaluate_for_dataset,
+    evaluate_predictions,
 )
 
 __all__ = [
@@ -50,5 +52,7 @@ __all__ = [
     # Dataset-specific evaluation
     "DATASET_METRICS",
     "get_dataset_metrics",
+    "get_metric_names",
     "evaluate_for_dataset",
+    "evaluate_predictions",
 ]

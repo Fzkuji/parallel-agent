@@ -2,7 +2,7 @@ from typing import List, Optional
 
 from src.models import Question
 
-from .eval import normalize_answer, compute_rouge_l, get_metric_names
+from .evaluation import normalize_answer, compute_rouge_l, get_metric_names
 from .results import StrategyResult
 
 # Display names for metrics (shorter names for table headers)

@@ -11,7 +11,7 @@ from src.models import Question
 from src.inference import build_chat_prompt, extract_box_answer
 from src.scheduler import DependencyScheduler
 from src.selection import apply_dependencies, select_dependency_edges
-from src.eval import evaluate_predictions
+from src.evaluation import evaluate_predictions
 from src.prompts import build_dependency_prompt
 from src.results import StrategyResult
 from src.utils import DEFAULT_GENERATION_SEED, reset_generation_seed, clean_model_text
@@ -30,6 +30,7 @@ def run_dependency_batch_strategy(
     total_cost_budget: Optional[int],
     max_new_tokens: int,
     strategy_name: str = "parallel",
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     # Per requirement: build dependency edges using only the questions (ignore background passages)
@@ -187,7 +188,7 @@ def run_dependency_batch_strategy(
         total_latency += elapsed
         batch_details.append(batch_info)
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name=strategy_name,
         answers=answers_text,

@@ -137,7 +137,7 @@ python scripts/test_bert_dependencies.py \
 - Requires `transformers`, `datasets`, `torch`.
 - Optional dependencies:
   - `nltk` for BLEU-4 metric (fallback implementation available)
-  - `rouge_score` for ROUGE metrics (fallback implementation available)
+  - `rouge-chinese` + `jieba` for Chinese ROUGE metrics (fallback implementation available)
   - `httpx` or `requests` for LLM-based evaluation via OpenRouter API
 - Ensure you have enough GPU RAM (Qwen3-4B needs ~10 GB).
 - Fallback heuristics trigger automatically if the LLM fails to return valid JSON.

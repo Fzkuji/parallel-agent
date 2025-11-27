@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.models import Question
 from src.inference import USE_THINK_TOKENS
-from src.eval import evaluate_predictions
+from src.evaluation import evaluate_predictions
 from src.results import StrategyResult
 from src.utils import (
     DEFAULT_GENERATION_SEED,
@@ -29,6 +29,7 @@ def run_all_in_one_strategy(
     model: AutoModelForCausalLM,
     *,
     max_new_tokens: int,
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     instructions = textwrap.dedent(
@@ -133,7 +134,7 @@ Questions:
             }
         )
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name="all_in_one",
         answers=answers_text,
@@ -153,6 +154,7 @@ def run_all_in_one_multi_strategy(
     *,
     max_new_tokens: int,
     strategy_name: str = "all_in_one",
+    dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {
         item["qid"]: Question(
@@ -262,7 +264,7 @@ Rules:
             }
         )
 
-    metrics = evaluate_predictions(answer_records, question_lookup)
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
         name=strategy_name,
         answers=answers_text,
