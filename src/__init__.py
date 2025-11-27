@@ -9,6 +9,22 @@ from .models import (
     estimate_tokens,
 )
 
+# Evaluation metrics
+from .eval import (
+    DATASET_METRICS,
+    compute_bleu4,
+    compute_contains,
+    compute_em,
+    compute_f1,
+    compute_rouge1,
+    compute_rouge2,
+    compute_rouge_l,
+    evaluate_for_dataset,
+    evaluate_predictions,
+    get_dataset_metrics,
+    get_metric_names,
+)
+
 # Text utilities
 from .text_utils import (
     AGGREGATE_KEYWORDS,
@@ -70,6 +86,19 @@ __all__ = [
     "BatchAssignment",
     "ScheduleResult",
     "estimate_tokens",
+    # Evaluation metrics
+    "compute_em",
+    "compute_f1",
+    "compute_contains",
+    "compute_bleu4",
+    "compute_rouge1",
+    "compute_rouge2",
+    "compute_rouge_l",
+    "evaluate_predictions",
+    "evaluate_for_dataset",
+    "get_dataset_metrics",
+    "get_metric_names",
+    "DATASET_METRICS",
     # Text utils
     "STOPWORDS",
     "REFERENCE_KEYWORDS",

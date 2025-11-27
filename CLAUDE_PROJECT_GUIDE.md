@@ -90,6 +90,7 @@ class StrategyResult:
 
 ## Evaluation Metrics (src/eval.py)
 
+### Short-form QA Metrics
 | Metric | Function | Description |
 |--------|----------|-------------|
 | **EM (Strict)** | `compute_em()` | Exact match after normalization |
@@ -97,6 +98,28 @@ class StrategyResult:
 | **Lenient** | `compute_contains()` | Bidirectional substring containment |
 
 **Normalization**: lowercase, remove punctuation, remove articles (a/an/the)
+
+### Long-form Generation Metrics (for CMB)
+| Metric | Function | Description |
+|--------|----------|-------------|
+| **BLEU-4** | `compute_bleu4()` | 4-gram precision with brevity penalty |
+| **ROUGE-1** | `compute_rouge1()` | Unigram overlap F1 |
+| **ROUGE-2** | `compute_rouge2()` | Bigram overlap F1 |
+| **ROUGE-L** | `compute_rouge_l()` | Longest common subsequence F1 |
+
+### LLM-based Evaluation (src/llm_eval.py)
+For domain-specific tasks (like CMB medical QA), use external LLM evaluation:
+- **Fluency**: Language quality and readability (1-5)
+- **Relevance**: How well the answer addresses the question (1-5)
+- **Completeness**: Coverage of key information (1-5)
+- **Proficiency**: Medical accuracy and terminology (1-5)
+
+```python
+from src.llm_eval import OpenRouterEvaluator, compute_llm_metrics
+evaluator = OpenRouterEvaluator(model="openai/gpt-4o")
+result = evaluator.evaluate_single(context, question, reference, prediction)
+# result.fluency, result.relevance, result.completeness, result.proficiency, result.average
+```
 
 ## Dependency Detection Methods
 
@@ -117,7 +140,7 @@ class StrategyResult:
 
 ### Key Arguments
 ```bash
---dataset {squad,hotpot,cmb} # Dataset choice
+--dataset {squad,hotpot,cmb} # Dataset choice (metrics auto-selected per dataset)
 --model-name <hf_model>      # HuggingFace model ID
 --context-count N            # Number of context groups
 --min-questions M            # Min questions per group
@@ -125,6 +148,7 @@ class StrategyResult:
 --strategies "s1,s2,..."     # Comma-separated strategy list
 --json-out <path>            # Output directory for results
 --cmb-subset CMB-Clin        # CMB subset (default: CMB-Clin)
+--eval-model <model>         # OpenRouter model for LLM evaluation (optional)
 ```
 
 ### Multi-GPU Support
@@ -213,5 +237,6 @@ f1 = compute_f1(prediction, references)  # 0.0 to 1.0
 1. `scripts/compare_strategies.py` - Main entry point, orchestrates everything
 2. `src/models.py` - Core data structures
 3. `src/strategies/executors.py` - Strategy implementations
-4. `src/eval.py` - Evaluation metrics
-5. `src/inference.py` - LLM inference utilities
+4. `src/eval.py` - Evaluation metrics (EM, F1, BLEU-4, ROUGE)
+5. `src/llm_eval.py` - LLM-based evaluation via OpenRouter API
+6. `src/inference.py` - LLM inference utilities

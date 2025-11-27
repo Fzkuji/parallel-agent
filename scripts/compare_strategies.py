@@ -13,7 +13,11 @@ from typing import Dict, List, Optional
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.eval import compute_em
+from src.eval import (
+    compute_em,
+    get_dataset_metrics,
+    get_metric_names,
+)
 
 import torch
 import torch.distributed as dist
@@ -129,6 +133,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Shard index/rank (defaults to LOCAL_RANK or 0).",
+    )
+    # LLM-based evaluation via OpenRouter API
+    parser.add_argument(
+        "--eval-model",
+        type=str,
+        default=None,
+        help="OpenRouter model ID for LLM-based evaluation (e.g., 'openai/gpt-4o'). "
+             "Requires OPENROUTER_API_KEY env var.",
     )
     return parser.parse_args()
 
@@ -308,8 +320,16 @@ def run_all_strategies(
     return results
 
 
-def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
-    """Compute and format aggregate metrics across all contexts and strategies."""
+def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "squad") -> str:
+    """Compute and format aggregate metrics across all contexts and strategies.
+
+    Args:
+        serialized_contexts: List of serialized context results
+        dataset: Dataset name to determine which metrics to display
+
+    Returns:
+        Formatted string with aggregate metrics
+    """
     preferred_order = [
         "all_in_one",
         "sequential",
@@ -317,6 +337,11 @@ def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
         "parallel",
         "parallel_bert",
     ]
+
+    # Get the metric names for this dataset
+    metric_names = get_metric_names(dataset)
+    llm_metric_names = ["llm_fluency", "llm_relevance", "llm_completeness", "llm_proficiency", "llm_average"]
+
     strategy_totals: Dict[str, Dict[str, float]] = {}
 
     for ctx in serialized_contexts:
@@ -329,22 +354,28 @@ def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
 
         for name, strategy in strategy_items:
             metrics = strategy.get("metrics", {})
-            stats = strategy_totals.setdefault(
-                name,
-                {
-                    "strict": 0.0,
-                    "f1": 0.0,
-                    "lenient": 0.0,
+            if name not in strategy_totals:
+                strategy_totals[name] = {
                     "prompt_tokens": 0,
                     "generated_tokens": 0,
                     "latency": 0.0,
                     "count": 0,
                     "batches": 0,
-                },
-            )
-            stats["strict"] += metrics.get("strict_acc", 0.0)
-            stats["f1"] += metrics.get("f1", 0.0)
-            stats["lenient"] += metrics.get("lenient_acc", 0.0)
+                }
+                # Initialize dataset-specific metrics
+                for m in metric_names:
+                    strategy_totals[name][m] = 0.0
+                # Initialize LLM metrics
+                for m in llm_metric_names:
+                    strategy_totals[name][m] = 0.0
+
+            stats = strategy_totals[name]
+            # Accumulate dataset-specific metrics
+            for m in metric_names:
+                stats[m] += metrics.get(m, 0.0)
+            # Accumulate LLM metrics
+            for m in llm_metric_names:
+                stats[m] += metrics.get(m, 0.0)
             stats["prompt_tokens"] += strategy.get("prompt_tokens", 0)
             stats["generated_tokens"] += strategy.get("generated_tokens", 0)
             stats["latency"] += strategy.get("latency", 0.0)
@@ -352,7 +383,21 @@ def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
             stats["count"] += 1
 
     summary_lines = ["\n=== Aggregate Metrics ==="]
-    header = "Strategy | EM | F1 | Lenient | PromptTok | GenTok | Latency(s) | Batches"
+
+    # Check if we have LLM metrics
+    has_llm_metrics = any(
+        strategy_totals.get(n, {}).get("llm_average", 0) > 0
+        for n in strategy_totals
+    )
+
+    # Build header based on dataset metrics
+    if dataset == "cmb":
+        if has_llm_metrics:
+            header = "Strategy | BLEU-4 | R-1 | R-2 | R-L | LLM-Avg | Latency(s) | Batches"
+        else:
+            header = "Strategy | BLEU-4 | R-1 | R-2 | R-L | PromptTok | GenTok | Latency(s) | Batches"
+    else:
+        header = "Strategy | EM | F1 | Lenient | PromptTok | GenTok | Latency(s) | Batches"
     separator = "-" * len(header)
     summary_lines.extend([header, separator])
 
@@ -368,16 +413,62 @@ def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
         avg_gen = stats["generated_tokens"] / count
         avg_latency = stats["latency"] / count
         avg_batches = stats["batches"] / count
-        summary_lines.append(
-            f"{name:<13} | "
-            f"{stats['strict']/count:.3f} | "
-            f"{stats['f1']/count:.3f} | "
-            f"{stats['lenient']/count:.3f} | "
-            f"{avg_prompt:.2f} | "
-            f"{avg_gen:.2f} | "
-            f"{avg_latency:.2f} | "
-            f"{avg_batches:.2f}"
-        )
+
+        if dataset == "cmb":
+            if has_llm_metrics:
+                summary_lines.append(
+                    f"{name:<13} | "
+                    f"{stats['bleu4']/count:.3f} | "
+                    f"{stats['rouge1']/count:.3f} | "
+                    f"{stats['rouge2']/count:.3f} | "
+                    f"{stats['rougeL']/count:.3f} | "
+                    f"{stats['llm_average']/count:.2f} | "
+                    f"{avg_latency:.2f} | "
+                    f"{avg_batches:.2f}"
+                )
+            else:
+                summary_lines.append(
+                    f"{name:<13} | "
+                    f"{stats['bleu4']/count:.3f} | "
+                    f"{stats['rouge1']/count:.3f} | "
+                    f"{stats['rouge2']/count:.3f} | "
+                    f"{stats['rougeL']/count:.3f} | "
+                    f"{avg_prompt:.2f} | "
+                    f"{avg_gen:.2f} | "
+                    f"{avg_latency:.2f} | "
+                    f"{avg_batches:.2f}"
+                )
+        else:
+            summary_lines.append(
+                f"{name:<13} | "
+                f"{stats['strict_acc']/count:.3f} | "
+                f"{stats['f1']/count:.3f} | "
+                f"{stats['lenient_acc']/count:.3f} | "
+                f"{avg_prompt:.2f} | "
+                f"{avg_gen:.2f} | "
+                f"{avg_latency:.2f} | "
+                f"{avg_batches:.2f}"
+            )
+
+    # If LLM metrics present, add detailed breakdown
+    if has_llm_metrics:
+        summary_lines.append("\n--- LLM Evaluation Details ---")
+        summary_lines.append("Strategy | Fluency | Relevance | Completeness | Proficiency | Average")
+        summary_lines.append("-" * 70)
+        for name in ordered_names:
+            stats = strategy_totals.get(name)
+            if not stats:
+                continue
+            count = stats["count"] or 1
+            summary_lines.append(
+                f"{name:<13} | "
+                f"{stats['llm_fluency']/count:.2f} | "
+                f"{stats['llm_relevance']/count:.2f} | "
+                f"{stats['llm_completeness']/count:.2f} | "
+                f"{stats['llm_proficiency']/count:.2f} | "
+                f"{stats['llm_average']/count:.2f}"
+            )
+
     return "\n".join(summary_lines)
 
 
@@ -645,6 +736,16 @@ def main() -> None:
 
     dep_generator, bert_dep_generator, bert_conf_threshold = resolve_dependency_generators(args, tokenizer, model)
 
+    # Initialize LLM evaluator if requested
+    llm_evaluator = None
+    if args.eval_model:
+        try:
+            from src.llm_eval import OpenRouterEvaluator
+            llm_evaluator = OpenRouterEvaluator(model=args.eval_model)
+            logging.info("Initialized LLM evaluator with model: %s", args.eval_model)
+        except Exception as e:
+            logging.warning("Failed to initialize LLM evaluator: %s", e)
+
     # Parse selected strategies
     selected_strategies = None
     if args.strategies:
@@ -716,11 +817,44 @@ def main() -> None:
             for q in questions
         }
 
+        # Get dataset-specific metrics
+        dataset_metrics = get_dataset_metrics(args.dataset)
+
         strategies_data = {}
         for res in strategy_list:
+            # Start with base metrics from strategy result
+            metrics_dict = {k: round(v, 4) for k, v in res.metrics.items()}
+
+            # Compute dataset-specific metrics
+            metric_sums = {name: 0.0 for name in dataset_metrics}
+            for q in questions:
+                pred = res.answers.get(q.qid, "")
+                refs = q.references
+                for metric_name, metric_func in dataset_metrics.items():
+                    metric_sums[metric_name] += metric_func(pred, refs)
+
+            n_questions = len(questions) or 1
+            for metric_name, total in metric_sums.items():
+                metrics_dict[metric_name] = round(total / n_questions, 4)
+
+            # Compute LLM evaluation metrics if evaluator is available
+            if llm_evaluator:
+                try:
+                    from src.llm_eval import compute_llm_metrics
+                    eval_items = []
+                    for q in questions:
+                        pred = res.answers.get(q.qid, "")
+                        ref = q.references[0] if q.references else ""
+                        eval_items.append((background, q.text, ref, pred))
+                    llm_results = llm_evaluator.evaluate_batch(eval_items, show_progress=False)
+                    llm_metrics = compute_llm_metrics(llm_results)
+                    metrics_dict.update({k: round(v, 4) for k, v in llm_metrics.items()})
+                except Exception as e:
+                    logging.warning("LLM evaluation failed for strategy %s: %s", res.name, e)
+
             strategy_entry = {
                 "answers": res.answers,
-                "metrics": {k: round(v, 2) for k, v in res.metrics.items()},
+                "metrics": metrics_dict,
                 "prompt_tokens": res.prompt_tokens,
                 "generated_tokens": res.generated_tokens,
                 "latency": round(res.latency, 2),
@@ -757,11 +891,11 @@ def main() -> None:
                 if ctx_list:
                     merged.extend(ctx_list)
             # Print aggregate metrics from all ranks (only on rank 0)
-            print(compute_aggregate_metrics(merged))
+            print(compute_aggregate_metrics(merged, dataset=args.dataset))
             save_experiment_results(args.json_out, merged, args, output_folder_name)
     else:
         # Single process mode: print and save local results
-        print(compute_aggregate_metrics(serialized_contexts))
+        print(compute_aggregate_metrics(serialized_contexts, dataset=args.dataset))
         save_experiment_results(args.json_out, serialized_contexts, args, output_folder_name)
 
     # Cleanup distributed backend

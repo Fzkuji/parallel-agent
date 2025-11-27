@@ -1,66 +1,72 @@
-import re
+"""Evaluation metrics for question answering tasks.
+
+This module re-exports from src/evaluation/ for backward compatibility.
+For new code, prefer importing directly from src.evaluation.
+"""
+from __future__ import annotations
+
 from typing import Dict, List, Tuple
 
-from src.models import Question
-
-
-def normalize_answer(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\b(a|an|the)\b", " ", text)
-    return " ".join(text.split())
-
-
-def compute_contains(prediction: str, references: List[str]) -> float:
-    pred_norm = normalize_answer(prediction)
-    for ref in references:
-        ref_norm = normalize_answer(ref)
-        if not ref_norm:
-            continue
-        if ref_norm in pred_norm or pred_norm in ref_norm:
-            return 1.0
-    return 0.0
-
-
-def compute_em(prediction: str, references: List[str]) -> float:
-    pred_norm = normalize_answer(prediction)
-    for ref in references:
-        if normalize_answer(ref) == pred_norm:
-            return 1.0
-    return 0.0
-
-
-def compute_f1(prediction: str, references: List[str]) -> float:
-    pred_tokens = normalize_answer(prediction).split()
-    if not pred_tokens:
-        return 0.0
-    best = 0.0
-    for ref in references:
-        ref_tokens = normalize_answer(ref).split()
-        if not ref_tokens:
-            continue
-        overlap = set(pred_tokens) & set(ref_tokens)
-        if not overlap:
-            continue
-        overlap_count = sum(min(pred_tokens.count(tok), ref_tokens.count(tok)) for tok in overlap)
-        precision = overlap_count / len(pred_tokens)
-        recall = overlap_count / len(ref_tokens)
-        if precision + recall == 0:
-            continue
-        f1 = 2 * precision * recall / (precision + recall)
-        best = max(best, f1)
-    return best
+from .evaluation.basic import (
+    compute_contains,
+    compute_em,
+    compute_f1,
+    normalize_answer,
+)
+from .evaluation.generation import (
+    compute_bleu4,
+    compute_rouge1,
+    compute_rouge2,
+    compute_rouge_l,
+)
+from .evaluation.config import (
+    DATASET_METRICS,
+    evaluate_for_dataset,
+    get_dataset_metrics,
+    get_metric_names,
+)
+from .models import Question
 
 
 def evaluate_predictions(
     predictions: Dict[str, Tuple[str, bool]],
     lookup: Dict[str, Question],
+    include_generation_metrics: bool = False,
+    dataset: str = None,
 ) -> Dict[str, float]:
+    """
+    Evaluate predictions against references.
+
+    Args:
+        predictions: Dict of {qid: (prediction, strict_valid)}
+        lookup: Dict of {qid: Question} with references
+        include_generation_metrics: If True, include BLEU-4 and ROUGE metrics
+            (useful for long-form generation tasks like CMB)
+        dataset: If provided, use dataset-specific metrics
+
+    Returns:
+        Dict with metric scores (averaged over all predictions)
+    """
     total = len(predictions)
     if total == 0:
-        return {"strict_acc": 0.0, "lenient_acc": 0.0, "f1": 0.0}
+        result = {"strict_acc": 0.0, "lenient_acc": 0.0, "f1": 0.0}
+        if include_generation_metrics:
+            result.update({
+                "bleu4": 0.0,
+                "rouge1": 0.0,
+                "rouge2": 0.0,
+                "rougeL": 0.0,
+            })
+        return result
+
+    # If dataset is specified, use dataset-specific metrics
+    if dataset:
+        refs_dict = {qid: lookup[qid].references for qid in predictions}
+        return evaluate_for_dataset(dataset, predictions, refs_dict)
 
     strict = lenient = f1_sum = 0.0
+    bleu4_sum = rouge1_sum = rouge2_sum = rougeL_sum = 0.0
+
     for qid, (prediction, strict_valid) in predictions.items():
         refs = lookup[qid].references
         if strict_valid:
@@ -68,8 +74,45 @@ def evaluate_predictions(
         lenient += compute_contains(prediction, refs)
         f1_sum += compute_f1(prediction, refs)
 
-    return {
+        if include_generation_metrics:
+            bleu4_sum += compute_bleu4(prediction, refs)
+            rouge1_sum += compute_rouge1(prediction, refs)
+            rouge2_sum += compute_rouge2(prediction, refs)
+            rougeL_sum += compute_rouge_l(prediction, refs)
+
+    result = {
         "strict_acc": strict / total,
         "lenient_acc": lenient / total,
         "f1": f1_sum / total,
     }
+
+    if include_generation_metrics:
+        result.update({
+            "bleu4": bleu4_sum / total,
+            "rouge1": rouge1_sum / total,
+            "rouge2": rouge2_sum / total,
+            "rougeL": rougeL_sum / total,
+        })
+
+    return result
+
+
+__all__ = [
+    # Basic metrics
+    "normalize_answer",
+    "compute_em",
+    "compute_f1",
+    "compute_contains",
+    # Generation metrics
+    "compute_bleu4",
+    "compute_rouge1",
+    "compute_rouge2",
+    "compute_rouge_l",
+    # Evaluation functions
+    "evaluate_predictions",
+    "evaluate_for_dataset",
+    # Config
+    "DATASET_METRICS",
+    "get_dataset_metrics",
+    "get_metric_names",
+]
