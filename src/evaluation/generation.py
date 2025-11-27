@@ -8,9 +8,13 @@ Metrics:
 - ROUGE-1: Unigram overlap F1
 - ROUGE-2: Bigram overlap F1
 - ROUGE-L: Longest common subsequence F1
+
+Note: For Chinese text, character-level tokenization is used since
+Chinese does not use whitespace between words.
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from typing import List, Optional
 
@@ -26,6 +30,28 @@ try:
     ROUGE_AVAILABLE = True
 except ImportError:
     ROUGE_AVAILABLE = False
+
+
+def _is_chinese_text(text: str) -> bool:
+    """Check if text contains significant Chinese characters."""
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    return chinese_chars > len(text) * 0.3  # More than 30% Chinese
+
+
+def _tokenize(text: str) -> List[str]:
+    """Tokenize text, using character-level for Chinese.
+
+    For Chinese text: splits into individual characters (excluding whitespace/punctuation).
+    For other text: splits on whitespace.
+    """
+    text = text.lower().strip()
+    if _is_chinese_text(text):
+        # Character-level tokenization for Chinese
+        # Keep Chinese characters, digits, and letters
+        tokens = list(re.findall(r'[\u4e00-\u9fff\w]', text))
+        return tokens
+    else:
+        return text.split()
 
 
 # -----------------------------------------------------------------------------
@@ -66,13 +92,13 @@ def _compute_bleu4_fallback(prediction: str, references: List[str]) -> float:
     """Fallback BLEU-4 implementation without nltk."""
     import math
 
-    pred_tokens = prediction.lower().split()
+    pred_tokens = _tokenize(prediction)
     if len(pred_tokens) < 4:
         return 0.0
 
     best_score = 0.0
     for ref in references:
-        ref_tokens = ref.lower().split()
+        ref_tokens = _tokenize(ref)
         if len(ref_tokens) < 4:
             continue
 
@@ -127,14 +153,14 @@ def compute_bleu4(prediction: str, references: List[str]) -> float:
         return 0.0
 
     if NLTK_AVAILABLE:
-        pred_tokens = prediction.lower().split()
+        pred_tokens = _tokenize(prediction)
         if len(pred_tokens) < 4:
             return 0.0
 
         best_score = 0.0
         smoothing = SmoothingFunction().method1
         for ref in references:
-            ref_tokens = ref.lower().split()
+            ref_tokens = _tokenize(ref)
             if len(ref_tokens) < 4:
                 continue
             try:
@@ -162,13 +188,13 @@ def _compute_rouge_fallback(
     rouge_type: str
 ) -> float:
     """Fallback ROUGE implementation without rouge_score package."""
-    pred_tokens = prediction.lower().split()
+    pred_tokens = _tokenize(prediction)
     if not pred_tokens:
         return 0.0
 
     best_f1 = 0.0
     for ref in references:
-        ref_tokens = ref.lower().split()
+        ref_tokens = _tokenize(ref)
         if not ref_tokens:
             continue
 
@@ -229,6 +255,10 @@ def compute_rouge1(prediction: str, references: List[str]) -> float:
     if not prediction.strip() or not references:
         return 0.0
 
+    # Use fallback for Chinese text (char-level tokenization)
+    if _is_chinese_text(prediction) or any(_is_chinese_text(r) for r in references):
+        return _compute_rouge_fallback(prediction, references, "rouge1")
+
     if ROUGE_AVAILABLE:
         scorer = _get_rouge_scorer()
         best_score = 0.0
@@ -257,6 +287,10 @@ def compute_rouge2(prediction: str, references: List[str]) -> float:
     if not prediction.strip() or not references:
         return 0.0
 
+    # Use fallback for Chinese text (char-level tokenization)
+    if _is_chinese_text(prediction) or any(_is_chinese_text(r) for r in references):
+        return _compute_rouge_fallback(prediction, references, "rouge2")
+
     if ROUGE_AVAILABLE:
         scorer = _get_rouge_scorer()
         best_score = 0.0
@@ -284,6 +318,10 @@ def compute_rouge_l(prediction: str, references: List[str]) -> float:
     """
     if not prediction.strip() or not references:
         return 0.0
+
+    # Use fallback for Chinese text (char-level tokenization)
+    if _is_chinese_text(prediction) or any(_is_chinese_text(r) for r in references):
+        return _compute_rouge_fallback(prediction, references, "rougeL")
 
     if ROUGE_AVAILABLE:
         scorer = _get_rouge_scorer()
