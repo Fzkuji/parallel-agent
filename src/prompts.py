@@ -1,7 +1,10 @@
 import textwrap
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from src.models import Question
+
+# Only squad dataset has "unknown" labels
+EXTRACTIVE_DATASETS = {"squad"}
 
 
 def build_dependency_prompt(
@@ -10,19 +13,21 @@ def build_dependency_prompt(
     answers: Dict[str, str],
     dependencies: List[str],
     question_lookup: Dict[str, Question],
+    dataset: Optional[str] = None,
 ) -> Tuple[str, str]:
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
-    system_prompt = (
-        textwrap.dedent(
-            r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format <answer>text</answer>. If the answer is unknown, return <answer>unknown</answer>.
 
-Background:
-"""
-        ).strip()
-        + "\n"
-        + effective_background.strip()
+    # Only extractive QA datasets allow "unknown" responses
+    if dataset in EXTRACTIVE_DATASETS:
+        unknown_instruction = " If the answer is unknown, return <answer>unknown</answer>."
+    else:
+        unknown_instruction = ""
+
+    system_prompt = (
+        f"You are a helpful assistant that answers questions given background passages.\n"
+        f"Provide the answer with format <answer>text</answer>.{unknown_instruction}\n\n"
+        f"Background:\n{effective_background.strip()}"
     )
 
     user_lines: List[str] = []
@@ -41,19 +46,22 @@ Background:
     return system_prompt, user_prompt
 
 
-def build_single_prompt(background: str, question: Question) -> Tuple[str, str]:
+def build_single_prompt(
+    background: str, question: Question, dataset: Optional[str] = None
+) -> Tuple[str, str]:
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
-    system_prompt = (
-        textwrap.dedent(
-            r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format <answer>text</answer>. If the answer is unknown, return <answer>unknown</answer>.
 
-Background:
-"""
-        ).strip()
-        + "\n"
-        + effective_background.strip()
+    # Only extractive QA datasets allow "unknown" responses
+    if dataset in EXTRACTIVE_DATASETS:
+        unknown_instruction = " If the answer is unknown, return <answer>unknown</answer>."
+    else:
+        unknown_instruction = ""
+
+    system_prompt = (
+        f"You are a helpful assistant that answers questions given background passages.\n"
+        f"Provide the answer with format <answer>text</answer>.{unknown_instruction}\n\n"
+        f"Background:\n{effective_background.strip()}"
     )
     user_prompt = f"Question ({question.qid}): {question.text.strip()}"
     return system_prompt, user_prompt

@@ -22,6 +22,10 @@ from src.utils import (
 )
 
 
+# Only squad dataset has "unknown" labels
+EXTRACTIVE_DATASETS = {"squad"}
+
+
 def run_all_in_one_strategy(
     background: str,
     questions,
@@ -32,20 +36,25 @@ def run_all_in_one_strategy(
     dataset: str = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
-    instructions = textwrap.dedent(
-        r"""You are a helpful assistant that answers multiple questions from a single background.
-Answer each question using exactly this format: QID: <answer>text</answer>
 
-Example:
-Q1: <answer>Paris</answer>
-Q2: <answer>42</answer>
+    # Only extractive QA datasets allow "unknown" responses
+    if dataset in EXTRACTIVE_DATASETS:
+        unknown_rule = "- If unknown, use <answer>unknown</answer>\n"
+    else:
+        unknown_rule = ""
 
-Rules:
-- Use the exact question ID (e.g., Q1, Q2)
-- Put answer inside <answer></answer> tags
-- If unknown, use <answer>unknown</answer>
-- One answer per line, no extra text"""
-    ).strip()
+    instructions = (
+        f"You are a helpful assistant that answers multiple questions from a single background.\n"
+        f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
+        f"Example:\n"
+        f"Q1: <answer>Paris</answer>\n"
+        f"Q2: <answer>42</answer>\n\n"
+        f"Rules:\n"
+        f"- Use the exact question ID (e.g., Q1, Q2)\n"
+        f"- Put answer inside <answer></answer> tags\n"
+        f"{unknown_rule}"
+        f"- One answer per line, no extra text"
+    )
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
     user_message = textwrap.dedent(
         f"""Background:
@@ -171,20 +180,24 @@ def run_all_in_one_multi_strategy(
     answer_records: Dict[str, Tuple[str, bool]] = {}
     detail_records: List[Dict[str, Any]] = []
 
-    instructions = textwrap.dedent(
-        r"""You are a helpful assistant that answers multiple questions.
-Answer each question using exactly this format: QID: <answer>text</answer>
+    # Only extractive QA datasets allow "unknown" responses
+    if dataset in EXTRACTIVE_DATASETS:
+        unknown_rule = "- If unknown, use <answer>unknown</answer>\n"
+    else:
+        unknown_rule = ""
 
-Example:
-Q1: <answer>Paris</answer>
-Q2: <answer>42</answer>
-
-Rules:
-- Use the exact question ID (e.g., Q1, Q2)
-- Put answer inside <answer></answer> tags
-- If unknown, use <answer>unknown</answer>
-- One answer per line, no extra text"""
-    ).strip()
+    instructions = (
+        f"You are a helpful assistant that answers multiple questions.\n"
+        f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
+        f"Example:\n"
+        f"Q1: <answer>Paris</answer>\n"
+        f"Q2: <answer>42</answer>\n\n"
+        f"Rules:\n"
+        f"- Use the exact question ID (e.g., Q1, Q2)\n"
+        f"- Put answer inside <answer></answer> tags\n"
+        f"{unknown_rule}"
+        f"- One answer per line, no extra text"
+    )
 
     blocks = []
     for item in items:

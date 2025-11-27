@@ -93,6 +93,7 @@ def run_dependency_batch_strategy(
                 answers_text,
                 deps,
                 question_lookup,
+                dataset,
             )
             chat_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
             batch_text_prompts.append(chat_prompt)

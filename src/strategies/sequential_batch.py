@@ -38,10 +38,17 @@ def run_sequential_strategy(
     total_latency = 0.0
 
     # Align prompt with the single-question template used elsewhere
+    # Only squad dataset has "unknown" labels
+    extractive_datasets = {"squad"}
+    if dataset in extractive_datasets:
+        unknown_instruction = " If the answer is unknown, return <answer>unknown</answer>."
+    else:
+        unknown_instruction = ""
+
     system_message = (
         textwrap.dedent(
-            r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format <answer>text</answer>. If the answer is unknown, return <answer>unknown</answer>.
+            f"""You are a helpful assistant that answers questions given background passages.
+Provide the answer with format <answer>text</answer>.{unknown_instruction}
 
 Background:
 """
@@ -146,7 +153,7 @@ def run_full_batch_strategy(
 
     batch_chat_prompts: List[str] = []
     for question in questions:
-        system_prompt, user_prompt = build_single_prompt(background, question)
+        system_prompt, user_prompt = build_single_prompt(background, question, dataset)
         batch_chat_prompts.append(
             build_chat_prompt(
                 tokenizer,
@@ -261,7 +268,7 @@ def run_batch_multi_strategy(
     batch_chat_prompts: List[str] = []
     for item in items:
         q = question_lookup[item["qid"]]
-        system_prompt, user_prompt = build_single_prompt(item["context"], q)
+        system_prompt, user_prompt = build_single_prompt(item["context"], q, dataset)
         batch_chat_prompts.append(
             build_chat_prompt(
                 tokenizer,
@@ -376,10 +383,17 @@ def run_sequential_multi_strategy(
     total_latency = 0.0
     detail_records: List[Dict[str, Any]] = []
 
-    system_message = textwrap.dedent(
-        r"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format <answer>text</answer>. If the answer is unknown, return <answer>unknown</answer>."""
-    ).strip()
+    # Only squad dataset has "unknown" labels
+    extractive_datasets = {"squad"}
+    if dataset in extractive_datasets:
+        unknown_instruction = " If the answer is unknown, return <answer>unknown</answer>."
+    else:
+        unknown_instruction = ""
+
+    system_message = (
+        f"You are a helpful assistant that answers questions given background passages.\n"
+        f"Provide the answer with format <answer>text</answer>.{unknown_instruction}"
+    )
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
 
