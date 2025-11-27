@@ -96,13 +96,14 @@ def _compute_bleu4_fallback(prediction: str, references: List[str]) -> float:
     """Fallback BLEU-4 implementation without nltk."""
     import math
 
-    pred_tokens = _tokenize(prediction)
+    # Character-level tokenization (like LlamaFactory)
+    pred_tokens = list(prediction)
     if len(pred_tokens) < 4:
         return 0.0
 
     best_score = 0.0
     for ref in references:
-        ref_tokens = _tokenize(ref)
+        ref_tokens = list(ref)
         if len(ref_tokens) < 4:
             continue
 
@@ -157,14 +158,15 @@ def compute_bleu4(prediction: str, references: List[str]) -> float:
         return 0.0
 
     if NLTK_AVAILABLE:
-        pred_tokens = _tokenize(prediction)
+        # Character-level tokenization (like LlamaFactory)
+        pred_tokens = list(prediction)
         if len(pred_tokens) < 4:
             return 0.0
 
         best_score = 0.0
-        smoothing = SmoothingFunction().method1
+        smoothing = SmoothingFunction().method3  # NIST geometric sequence smoothing
         for ref in references:
-            ref_tokens = _tokenize(ref)
+            ref_tokens = list(ref)
             if len(ref_tokens) < 4:
                 continue
             try:
