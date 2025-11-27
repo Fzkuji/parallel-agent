@@ -29,6 +29,7 @@ from src import (
     LocalLLMDependencyGenerator,
     load_cmb_groups,
     load_hotpot_groups,
+    load_quac_groups,
     load_squad_random_questions,
     build_questions_from_group,
     load_squad_groups,
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         description="Compare sequential, batch, and dependency-aware QA strategies with optional BERT dependencies.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dataset", choices=["squad", "hotpot", "cmb"], default="squad", help="Dataset to evaluate.")
+    parser.add_argument("--dataset", choices=["squad", "hotpot", "quac", "cmb"], default="squad", help="Dataset to evaluate.")
     parser.add_argument("--model-name", default="Qwen/Qwen3-4B", help="Hugging Face model identifier or local path.")
     parser.add_argument("--split", default="train", help="Dataset split to sample.")
     parser.add_argument("--context-count", type=int, default=3, help="Number of contexts to process.")
@@ -561,11 +562,13 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
 def generate_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
     """Generate descriptive output folder name with timestamp and experiment parameters."""
     model_short = args.model_name.split("/")[-1]
-    # Build dataset identifier: squad_train, hotpot_distractor_train, or cmb_CMB-Clin_test
+    # Build dataset identifier: squad_train, hotpot_distractor_train, cmb_CMB-Clin_test, quac_train
     if args.dataset == "hotpot":
         dataset_id = f"hotpot_{args.hotpot_subset}_{args.split}"
     elif args.dataset == "cmb":
         dataset_id = f"cmb_{args.cmb_subset}_{args.split}"
+    elif args.dataset == "quac":
+        dataset_id = f"quac_{args.split}"
     else:
         dataset_id = f"squad_{args.split}"
     # Format: timestamp_dataset_model_n{samples}_q{questions}
@@ -732,6 +735,14 @@ def main() -> None:
         contexts = load_cmb_groups(
             args.split,
             subset=args.cmb_subset,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
+    elif args.dataset == "quac":
+        contexts = load_quac_groups(
+            args.split,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
             max_contexts=args.context_count,

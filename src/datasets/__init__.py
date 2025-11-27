@@ -6,6 +6,7 @@ from typing import List
 from .squad import load_squad_groups, load_squad_random_questions
 from .hotpot import load_hotpot_groups
 from .cmb import load_cmb_groups
+from .quac import load_quac_groups
 from ..models import Question
 from ..text_utils import detect_aggregate_question
 
@@ -14,6 +15,7 @@ __all__ = [
     "load_squad_random_questions",
     "load_hotpot_groups",
     "load_cmb_groups",
+    "load_quac_groups",
     "build_questions_from_group",
 ]
 

@@ -3,6 +3,7 @@
 This module defines which metrics are used for each dataset type:
 - squad: Short-form factual QA → EM, F1, Lenient
 - hotpot: Short-form factual QA → EM, F1, Lenient
+- quac: Conversational QA → EM, F1, Lenient
 - cmb: Long-form medical QA → BLEU-4, ROUGE-1, ROUGE-2, ROUGE-L
 """
 from __future__ import annotations
@@ -35,6 +36,12 @@ DATASET_METRICS: Dict[str, Dict[str, MetricFunc]] = {
     },
     # HotpotQA: Short-form factual QA (multi-hop)
     "hotpot": {
+        "strict_acc": compute_em,
+        "f1": compute_f1,
+        "lenient_acc": compute_contains,
+    },
+    # QuAC: Conversational QA
+    "quac": {
         "strict_acc": compute_em,
         "f1": compute_f1,
         "lenient_acc": compute_contains,
