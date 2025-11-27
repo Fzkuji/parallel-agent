@@ -105,6 +105,23 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --eval-model openai/gpt-4o  # Optional: requires OPENROUTER_API_KEY
 ```
 
+### QuAC (Conversational QA)
+
+QuAC is a conversational QA dataset where questions build on each other. Uses EM, F1, and Lenient metrics.
+
+```bash
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset quac \
+  --split train \
+  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --context-count 100 \
+  --min-questions 3 \
+  --max-questions 6 \
+  --max-new-tokens 256 \
+  --json-out outputs_json/results_quac.json \
+  --log-level INFO
+```
+
 ## scripts/run_parallel.py
 
 Single-context dependency pipeline with heuristic/LLM edges, cost-aware scheduling, and optional HTML output. Useful for debugging or exploring dependency-based scheduling on individual contexts.
