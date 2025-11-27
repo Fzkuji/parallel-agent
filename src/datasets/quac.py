@@ -43,7 +43,7 @@ def load_quac_groups(
     if load_dataset is None:
         raise RuntimeError("datasets package not available; install with `pip install datasets`.")
 
-    raw_dataset = list(load_dataset("quac", split=split))
+    raw_dataset = list(load_dataset("quac", split=split, trust_remote_code=True))
 
     # Filter by minimum questions
     filtered = [
