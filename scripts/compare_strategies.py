@@ -808,7 +808,7 @@ def main() -> None:
         overall_results[title] = strategy_list
 
         print(f"\n=== Context: {title} ===")
-        print(summarize_results(strategy_list))
+        print(summarize_results(strategy_list, dataset=args.dataset))
         print_answer_table(questions, strategy_list, dataset=args.dataset)
 
         # Build simplified serialization structure
