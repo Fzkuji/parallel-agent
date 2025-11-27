@@ -47,7 +47,7 @@ battlenet/
 | Strategy | Description | Batches | Use Case |
 |----------|-------------|---------|----------|
 | `all_in_one` | All questions in one prompt | 1 | Baseline, simple |
-| `sequential` | One question at a time | N | No parallelism |
+| `sequential` | One question at a time (KV cache enabled) | N | Multi-turn with context reuse |
 | `batch` | All questions in parallel, one batch | 1 | Max parallelism, no deps |
 | `parallel` | Dependency-scheduled batches (LLM deps) | Variable | Smart parallelism |
 | `parallel_bert` | Dependency-scheduled batches (BERT deps) | Variable | Fast dep detection |
@@ -217,10 +217,36 @@ f1 = compute_f1(prediction, references)  # 0.0 to 1.0
 
 ## Important Implementation Details
 
-1. **JSON Answer Extraction**: Answers are expected in `{"answer": "..."}` format for strict evaluation
+1. **JSON Answer Extraction**: Answers are expected in `<answer>...</answer>` format for strict evaluation
 2. **Batch Padding**: Left-padding for decoder-only models in batch generation
 3. **Distributed Saving**: Only rank 0 gathers and saves results in multi-GPU mode
 4. **Folder Naming**: `{timestamp}_{dataset}_{split}_{model}_n{samples}_q{questions}`
+5. **KV Cache Optimization**: Sequential strategies reuse `past_key_values` across turns to avoid redundant attention computation
+
+### KV Cache Optimization (Sequential Strategies)
+
+The `run_sequential_strategy` and `run_sequential_multi_strategy` functions support KV cache reuse:
+
+```python
+result = run_sequential_strategy(
+    background, questions, tokenizer, model,
+    max_new_tokens=96,
+    use_kv_cache=True,  # Default: enabled
+)
+```
+
+**How it works:**
+- Turn 1: Full encoding of `[system, user1, gen_prompt]` → generate response → cache `past_key_values`
+- Turn 2+: Only encode new tokens `[user2, gen_prompt]` → pass cached KV → generate
+- Automatic fallback: If token alignment diverges (>5 token mismatch), cache resets
+
+**Benefits:**
+- Reduces O(N²) attention computation to ~O(N) for N questions
+- Significant speedup for long conversations with shared context
+
+**Debugging:**
+- Each turn's `detail_records` includes `"used_kv_cache": true/false`
+- Cache misalignment triggers automatic reset (logged in detail records)
 
 ## Typical Workflow
 
