@@ -18,12 +18,7 @@ import re
 from collections import Counter
 from typing import List
 
-# Optional NLTK import for BLEU
-try:
-    from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-    NLTK_AVAILABLE = True
-except ImportError:
-    NLTK_AVAILABLE = False
+from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 
 # Optional rouge-chinese with jieba for Chinese text
 try:
@@ -92,65 +87,12 @@ def _lcs_length(x: List[str], y: List[str]) -> int:
 # BLEU-4 Metric
 # -----------------------------------------------------------------------------
 
-def _compute_bleu4_fallback(prediction: str, references: List[str]) -> float:
-    """Fallback BLEU-4 implementation with smoothing (like NLTK method3)."""
-    import math
-
-    # Character-level tokenization (like LlamaFactory)
-    pred_tokens = list(prediction)
-    if len(pred_tokens) < 4:
-        return 0.0
-
-    best_score = 0.0
-    for ref in references:
-        ref_tokens = list(ref)
-        if len(ref_tokens) < 4:
-            continue
-
-        # Compute n-gram precisions for n=1,2,3,4 with smoothing
-        precisions = []
-        for n in range(1, 5):
-            pred_ngrams = _get_ngrams(pred_tokens, n)
-            ref_ngrams = _get_ngrams(ref_tokens, n)
-
-            if not pred_ngrams:
-                # Add-1 smoothing for empty n-grams
-                precisions.append(1.0 / (len(pred_tokens) + 1))
-                continue
-
-            clipped_count = sum(
-                min(pred_ngrams[ng], ref_ngrams.get(ng, 0))
-                for ng in pred_ngrams
-            )
-            total_count = sum(pred_ngrams.values())
-
-            # Add-1 smoothing (Laplace smoothing) to avoid zero precision
-            smoothed_precision = (clipped_count + 1) / (total_count + 1)
-            precisions.append(smoothed_precision)
-
-        # Geometric mean of precisions (no zero check needed with smoothing)
-        log_sum = sum(math.log(p) for p in precisions)
-        score = math.exp(log_sum / 4)
-
-        # Brevity penalty
-        bp = 1.0 if len(pred_tokens) >= len(ref_tokens) else math.exp(
-            1 - len(ref_tokens) / len(pred_tokens)
-        )
-        score *= bp
-
-        best_score = max(best_score, score)
-
-    return best_score
-
-
 def compute_bleu4(prediction: str, references: List[str]) -> float:
     """Compute BLEU-4 score (best match against references).
 
     BLEU-4 measures n-gram precision (n=1,2,3,4) with a brevity penalty.
-    Useful for evaluating long-form text generation quality.
-
-    Uses NLTK sentence_bleu with method3 smoothing when available,
-    falls back to custom implementation with add-1 smoothing otherwise.
+    Uses NLTK sentence_bleu with method3 (NIST geometric sequence) smoothing.
+    Character-level tokenization for Chinese text (like LlamaFactory).
 
     Args:
         prediction: Model's predicted answer
@@ -162,38 +104,26 @@ def compute_bleu4(prediction: str, references: List[str]) -> float:
     if not prediction.strip() or not references:
         return 0.0
 
-    if NLTK_AVAILABLE:
-        # Character-level tokenization (like LlamaFactory)
-        pred_tokens = list(prediction)
-        if len(pred_tokens) < 4:
-            return 0.0
+    # Character-level tokenization (like LlamaFactory)
+    pred_tokens = list(prediction)
+    if len(pred_tokens) < 4:
+        return 0.0
 
-        best_score = 0.0
-        nltk_failed = False
-        smoothing = SmoothingFunction().method3  # NIST geometric sequence smoothing
-        for ref in references:
-            ref_tokens = list(ref)
-            if len(ref_tokens) < 4:
-                continue
-            try:
-                score = sentence_bleu(
-                    [ref_tokens],
-                    pred_tokens,
-                    weights=(0.25, 0.25, 0.25, 0.25),
-                    smoothing_function=smoothing
-                )
-                best_score = max(best_score, score)
-            except Exception:
-                # NLTK has compatibility issues with some Python versions
-                nltk_failed = True
-                break
+    best_score = 0.0
+    smoothing = SmoothingFunction().method3
+    for ref in references:
+        ref_tokens = list(ref)
+        if len(ref_tokens) < 4:
+            continue
+        score = sentence_bleu(
+            [ref_tokens],
+            pred_tokens,
+            weights=(0.25, 0.25, 0.25, 0.25),
+            smoothing_function=smoothing
+        )
+        best_score = max(best_score, score)
 
-        # Fall back to custom implementation if NLTK failed
-        if nltk_failed:
-            return _compute_bleu4_fallback(prediction, references)
-        return best_score
-    else:
-        return _compute_bleu4_fallback(prediction, references)
+    return best_score
 
 
 # -----------------------------------------------------------------------------
