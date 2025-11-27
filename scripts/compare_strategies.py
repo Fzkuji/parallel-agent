@@ -516,16 +516,9 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
 
         # If any question has errors, include this context (filtered)
         if error_questions:
-            # Build questions data for error cases
-            error_questions_data = {}
-            for qid in error_questions:
-                if questions and qid in questions:
-                    error_questions_data[qid] = questions[qid]
-                else:
-                    error_questions_data[qid] = {
-                        "text": ctx.get("questions_text", {}).get(qid, ""),
-                        "gold": error_questions[qid],
-                    }
+            # Build questions text for error cases
+            questions_text = ctx.get("questions_text", {})
+            error_questions_text = {qid: questions_text.get(qid, "") for qid in error_questions}
 
             # Build strategies data for error cases
             error_strategies = {}
@@ -537,7 +530,8 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
 
             filtered_ctx = {
                 "context": ctx.get("context"),
-                "questions": error_questions_data,
+                "questions_text": error_questions_text,
+                "gold_answers": error_questions,
                 "strategies": error_strategies,
             }
             error_contexts.append(filtered_ctx)
@@ -821,11 +815,9 @@ def main() -> None:
         print(summarize_results(strategy_list, dataset=args.dataset))
         print_answer_table(questions, strategy_list, dataset=args.dataset)
 
-        # Build simplified serialization structure
-        questions_data = {
-            q.qid: {"text": q.text.strip(), "gold": q.references}
-            for q in questions
-        }
+        # Build serialization structure (questions and answers separated for readability)
+        questions_text = {q.qid: q.text.strip() for q in questions}
+        gold_answers = {q.qid: q.references for q in questions}
 
         # Get dataset-specific metrics
         dataset_metrics = get_dataset_metrics(args.dataset)
@@ -869,6 +861,7 @@ def main() -> None:
                 "generated_tokens": res.generated_tokens,
                 "latency": round(res.latency, 2),
                 "batches": res.batches,
+                "details": res.details,  # Raw prompts, responses, per-turn/per-question data
             }
             # For parallel strategies, promote DAG info to top level
             if res.details and "dependency_stage" in res.details:
@@ -886,7 +879,8 @@ def main() -> None:
 
         serialized_contexts.append({
             "context": title,
-            "questions": questions_data,
+            "questions_text": questions_text,
+            "gold_answers": gold_answers,
             "strategies": strategies_data,
         })
 
