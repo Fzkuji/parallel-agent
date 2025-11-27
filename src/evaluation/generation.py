@@ -93,7 +93,7 @@ def _lcs_length(x: List[str], y: List[str]) -> int:
 # -----------------------------------------------------------------------------
 
 def _compute_bleu4_fallback(prediction: str, references: List[str]) -> float:
-    """Fallback BLEU-4 implementation without nltk."""
+    """Fallback BLEU-4 implementation with smoothing (like NLTK method3)."""
     import math
 
     # Character-level tokenization (like LlamaFactory)
@@ -107,28 +107,30 @@ def _compute_bleu4_fallback(prediction: str, references: List[str]) -> float:
         if len(ref_tokens) < 4:
             continue
 
-        # Compute n-gram precisions for n=1,2,3,4
+        # Compute n-gram precisions for n=1,2,3,4 with smoothing
         precisions = []
         for n in range(1, 5):
             pred_ngrams = _get_ngrams(pred_tokens, n)
             ref_ngrams = _get_ngrams(ref_tokens, n)
 
             if not pred_ngrams:
-                precisions.append(0.0)
+                # Add-1 smoothing for empty n-grams
+                precisions.append(1.0 / (len(pred_tokens) + 1))
                 continue
 
             clipped_count = sum(
                 min(pred_ngrams[ng], ref_ngrams.get(ng, 0))
                 for ng in pred_ngrams
             )
-            precisions.append(clipped_count / sum(pred_ngrams.values()))
+            total_count = sum(pred_ngrams.values())
 
-        # Geometric mean of precisions
-        if any(p == 0 for p in precisions):
-            score = 0.0
-        else:
-            log_sum = sum(math.log(p) for p in precisions)
-            score = math.exp(log_sum / 4)
+            # Add-1 smoothing (Laplace smoothing) to avoid zero precision
+            smoothed_precision = (clipped_count + 1) / (total_count + 1)
+            precisions.append(smoothed_precision)
+
+        # Geometric mean of precisions (no zero check needed with smoothing)
+        log_sum = sum(math.log(p) for p in precisions)
+        score = math.exp(log_sum / 4)
 
         # Brevity penalty
         bp = 1.0 if len(pred_tokens) >= len(ref_tokens) else math.exp(
@@ -147,6 +149,9 @@ def compute_bleu4(prediction: str, references: List[str]) -> float:
     BLEU-4 measures n-gram precision (n=1,2,3,4) with a brevity penalty.
     Useful for evaluating long-form text generation quality.
 
+    Uses NLTK sentence_bleu with method3 smoothing when available,
+    falls back to custom implementation with add-1 smoothing otherwise.
+
     Args:
         prediction: Model's predicted answer
         references: List of gold/reference answers
@@ -164,6 +169,7 @@ def compute_bleu4(prediction: str, references: List[str]) -> float:
             return 0.0
 
         best_score = 0.0
+        nltk_failed = False
         smoothing = SmoothingFunction().method3  # NIST geometric sequence smoothing
         for ref in references:
             ref_tokens = list(ref)
@@ -178,7 +184,13 @@ def compute_bleu4(prediction: str, references: List[str]) -> float:
                 )
                 best_score = max(best_score, score)
             except Exception:
-                continue
+                # NLTK has compatibility issues with some Python versions
+                nltk_failed = True
+                break
+
+        # Fall back to custom implementation if NLTK failed
+        if nltk_failed:
+            return _compute_bleu4_fallback(prediction, references)
         return best_score
     else:
         return _compute_bleu4_fallback(prediction, references)
