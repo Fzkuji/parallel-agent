@@ -482,16 +482,30 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
     return "\n".join(summary_lines)
 
 
+def _parse_qid_from_string(s: str) -> tuple:
+    """Parse 'Qx: content' format and return (qid, content)."""
+    if ": " in s:
+        qid, content = s.split(": ", 1)
+        return qid.strip(), content
+    return "", s
+
+
 def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
     """Extract contexts containing questions where at least one strategy answered incorrectly."""
     error_contexts = []
     for ctx in serialized_contexts:
-        # Handle both new format (questions dict) and legacy format (gold_answers)
-        questions = ctx.get("questions", {})
-        if questions:
-            gold_answers = {qid: q.get("gold", []) for qid, q in questions.items()}
+        # Handle list format (new) or dict format (legacy)
+        gold_answers_raw = ctx.get("gold_answers", [])
+        if isinstance(gold_answers_raw, list):
+            # New list format: ["Q1: answer1", "Q2: answer2"]
+            gold_answers = {}
+            for item in gold_answers_raw:
+                qid, content = _parse_qid_from_string(item)
+                if qid:
+                    gold_answers[qid] = [content] if content else []
         else:
-            gold_answers = ctx.get("gold_answers", {})
+            # Legacy dict format
+            gold_answers = gold_answers_raw
 
         strategies = ctx.get("strategies", {})
         # Handle both dict format (new) and list format (legacy)
@@ -501,7 +515,7 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
             strategy_items = list(strategies.items())
 
         # Check each question
-        error_questions = {}
+        error_qids = set()
         for qid, refs in gold_answers.items():
             # Check if all strategies got this question correct
             all_correct = True
@@ -512,26 +526,31 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
                     break
 
             if not all_correct:
-                error_questions[qid] = refs
+                error_qids.add(qid)
 
         # If any question has errors, include this context (filtered)
-        if error_questions:
-            # Build questions text for error cases
-            questions_text = ctx.get("questions_text", {})
-            error_questions_text = {qid: questions_text.get(qid, "") for qid in error_questions}
+        if error_qids:
+            # Filter questions_text and gold_answers to only error cases
+            questions_text_raw = ctx.get("questions_text", [])
+            if isinstance(questions_text_raw, list):
+                error_questions_text = [q for q in questions_text_raw if _parse_qid_from_string(q)[0] in error_qids]
+                error_gold_answers = [g for g in gold_answers_raw if _parse_qid_from_string(g)[0] in error_qids]
+            else:
+                error_questions_text = [f"{qid}: {questions_text_raw.get(qid, '')}" for qid in error_qids]
+                error_gold_answers = [f"{qid}: {gold_answers.get(qid, [''])[0]}" for qid in error_qids]
 
             # Build strategies data for error cases
             error_strategies = {}
             for name, s in strategy_items:
                 error_strategies[name] = {
-                    "answers": {qid: s.get("answers", {}).get(qid, "") for qid in error_questions},
+                    "answers": {qid: s.get("answers", {}).get(qid, "") for qid in error_qids},
                     "metrics": s.get("metrics"),
                 }
 
             filtered_ctx = {
                 "context": ctx.get("context"),
                 "questions_text": error_questions_text,
-                "gold_answers": error_questions,
+                "gold_answers": error_gold_answers,
                 "strategies": error_strategies,
             }
             error_contexts.append(filtered_ctx)
@@ -815,9 +834,9 @@ def main() -> None:
         print(summarize_results(strategy_list, dataset=args.dataset))
         print_answer_table(questions, strategy_list, dataset=args.dataset)
 
-        # Build serialization structure (questions and answers separated for readability)
-        questions_text = {q.qid: q.text.strip() for q in questions}
-        gold_answers = {q.qid: q.references for q in questions}
+        # Build serialization structure (simple list format)
+        questions_text = [f"{q.qid}: {q.text.strip()}" for q in questions]
+        gold_answers = [f"{q.qid}: {q.references[0] if q.references else ''}" for q in questions]
 
         # Get dataset-specific metrics
         dataset_metrics = get_dataset_metrics(args.dataset)
