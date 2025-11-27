@@ -101,8 +101,8 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --max-questions 4 \
   --max-new-tokens 1024 \
   --json-out outputs_json/results_cmb.json \
-  --log-level INFO
-  # --eval-model openai/gpt-4o  # Optional: requires OPENROUTER_API_KEY
+  --log-level INFO \
+  --eval-model openai/gpt-4o  # Optional: requires OPENROUTER_API_KEY
 ```
 
 ## scripts/run_parallel.py

@@ -1,8 +1,8 @@
-from typing import List
+from typing import List, Optional
 
 from src.models import Question
 
-from .eval import normalize_answer
+from .eval import normalize_answer, compute_rouge_l
 from .results import StrategyResult
 
 
@@ -40,11 +40,18 @@ def summarize_results(results: List[StrategyResult]) -> str:
 def print_answer_table(
     questions: List[Question],
     strategies: List[StrategyResult],
+    dataset: Optional[str] = None,
 ) -> None:
+    """Print answer comparison table.
+
+    For short-form QA (squad, hotpot): shows ✓/✗ based on exact match.
+    For long-form QA (cmb): shows ROUGE-L score for each answer.
+    """
     headers = ["QID", "Question", "Gold"] + [res.name for res in strategies]
     rows = []
     max_answer_len = 40
     max_question_len = 60
+    use_rouge = dataset == "cmb"
 
     for question in questions:
         gold = "; ".join(question.references) if question.references else ""
@@ -58,11 +65,18 @@ def print_answer_table(
         def mark_answer(ans: str) -> str:
             if not ans:
                 return "∅"
-            norm_ans = normalize_answer(ans)
-            for ref in question.references:
-                if normalize_answer(ref) == norm_ans:
-                    return f"✓ {ans[:max_answer_len]}"
-            return f"✗ {ans[:max_answer_len]}"
+            if use_rouge:
+                # For CMB: show ROUGE-L score
+                score = compute_rouge_l(ans, question.references)
+                truncated = ans[:max_answer_len] if len(ans) > max_answer_len else ans
+                return f"[{score:.2f}] {truncated}"
+            else:
+                # For SQuAD/HotpotQA: show ✓/✗ based on exact match
+                norm_ans = normalize_answer(ans)
+                for ref in question.references:
+                    if normalize_answer(ref) == norm_ans:
+                        return f"✓ {ans[:max_answer_len]}"
+                return f"✗ {ans[:max_answer_len]}"
 
         row = [question.qid, question_text, gold]
         for res in strategies:
@@ -73,5 +87,9 @@ def print_answer_table(
     header_line = " | ".join(h.ljust(widths[idx]) for idx, h in enumerate(headers))
     separator = "-+-".join("-" * width for width in widths)
     row_lines = [" | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row)) for row in rows]
-    print("\nAnswer comparison (✓ = correct, ✗ = incorrect, ∅ = empty):")
+
+    if use_rouge:
+        print("\nAnswer comparison ([score] = ROUGE-L, ∅ = empty):")
+    else:
+        print("\nAnswer comparison (✓ = correct, ✗ = incorrect, ∅ = empty):")
     print("\n".join([header_line, separator, *row_lines]))
