@@ -25,6 +25,9 @@ from src.utils import (
 # Only squad dataset has "unknown" labels
 EXTRACTIVE_DATASETS = {"squad"}
 
+# Datasets where answers should be extracted from context (not freely generated)
+EXTRACTIVE_QA_DATASETS = {"squad", "quac", "hotpot"}
+
 
 def run_all_in_one_strategy(
     background: str,
@@ -43,6 +46,12 @@ def run_all_in_one_strategy(
     else:
         unknown_rule = ""
 
+    # Extractive QA datasets should extract answers from context
+    if dataset in EXTRACTIVE_QA_DATASETS:
+        extract_rule = "- Extract answers directly from the background passage\n"
+    else:
+        extract_rule = ""
+
     instructions = (
         f"You are a helpful assistant that answers multiple questions from a single background.\n"
         f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
@@ -52,6 +61,7 @@ def run_all_in_one_strategy(
         f"Rules:\n"
         f"- Use the exact question ID (e.g., Q1, Q2)\n"
         f"- Put answer inside <answer></answer> tags\n"
+        f"{extract_rule}"
         f"{unknown_rule}"
         f"- One answer per line, no extra text"
     )
@@ -186,6 +196,12 @@ def run_all_in_one_multi_strategy(
     else:
         unknown_rule = ""
 
+    # Extractive QA datasets should extract answers from context
+    if dataset in EXTRACTIVE_QA_DATASETS:
+        extract_rule = "- Extract answers directly from the context\n"
+    else:
+        extract_rule = ""
+
     instructions = (
         f"You are a helpful assistant that answers multiple questions.\n"
         f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
@@ -195,6 +211,7 @@ def run_all_in_one_multi_strategy(
         f"Rules:\n"
         f"- Use the exact question ID (e.g., Q1, Q2)\n"
         f"- Put answer inside <answer></answer> tags\n"
+        f"{extract_rule}"
         f"{unknown_rule}"
         f"- One answer per line, no extra text"
     )

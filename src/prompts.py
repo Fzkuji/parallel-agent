@@ -6,6 +6,9 @@ from src.models import Question
 # Only squad dataset has "unknown" labels
 EXTRACTIVE_DATASETS = {"squad"}
 
+# Datasets where answers should be extracted from context (not freely generated)
+EXTRACTIVE_QA_DATASETS = {"squad", "quac", "hotpot"}
+
 
 def build_dependency_prompt(
     background: str,
@@ -24,9 +27,15 @@ def build_dependency_prompt(
     else:
         unknown_instruction = ""
 
+    # Extractive QA datasets should extract answers from context
+    if dataset in EXTRACTIVE_QA_DATASETS:
+        extract_instruction = " Extract the answer directly from the background passage."
+    else:
+        extract_instruction = ""
+
     system_prompt = (
         f"You are a helpful assistant that answers questions given background passages.\n"
-        f"Provide the answer with format <answer>text</answer>.{unknown_instruction}\n\n"
+        f"Provide the answer with format <answer>text</answer>.{extract_instruction}{unknown_instruction}\n\n"
         f"Background:\n{effective_background.strip()}"
     )
 
@@ -58,9 +67,15 @@ def build_single_prompt(
     else:
         unknown_instruction = ""
 
+    # Extractive QA datasets should extract answers from context
+    if dataset in EXTRACTIVE_QA_DATASETS:
+        extract_instruction = " Extract the answer directly from the background passage."
+    else:
+        extract_instruction = ""
+
     system_prompt = (
         f"You are a helpful assistant that answers questions given background passages.\n"
-        f"Provide the answer with format <answer>text</answer>.{unknown_instruction}\n\n"
+        f"Provide the answer with format <answer>text</answer>.{extract_instruction}{unknown_instruction}\n\n"
         f"Background:\n{effective_background.strip()}"
     )
     user_prompt = f"Question ({question.qid}): {question.text.strip()}"
