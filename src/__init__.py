@@ -43,6 +43,7 @@ from .selection import (
 # Data loaders
 from .loaders import (
     build_questions_from_group,
+    load_cmb_groups,
     load_hotpot_groups,
     load_squad_groups,
     load_squad_random_questions,
@@ -92,6 +93,7 @@ __all__ = [
     "load_squad_groups",
     "load_squad_random_questions",
     "load_hotpot_groups",
+    "load_cmb_groups",
     "build_questions_from_group",
     # Inference utilities
     "DEFAULT_SYSTEM_PROMPT",

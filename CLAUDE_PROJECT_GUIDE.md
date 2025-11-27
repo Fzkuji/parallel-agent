@@ -4,7 +4,7 @@ This document provides a quick reference for understanding the project structure
 
 ## Project Overview
 
-**Purpose**: Compare different question-answering strategies on QA datasets (SQuAD, HotpotQA) using local LLMs. The core research question is: **Can dependency-aware parallel processing improve multi-question answering efficiency without sacrificing accuracy?**
+**Purpose**: Compare different question-answering strategies on QA datasets (SQuAD, HotpotQA, CMB) using local LLMs. The core research question is: **Can dependency-aware parallel processing improve multi-question answering efficiency without sacrificing accuracy?**
 
 **Key Idea**: When answering multiple questions about the same context, some questions may depend on others (e.g., "Where was the treaty signed?" → "Who signed the treaty there?"). This project explores whether detecting these dependencies and scheduling questions accordingly can improve performance.
 
@@ -20,7 +20,12 @@ battlenet/
 ├── src/                        # Core library
 │   ├── __init__.py            # Public API exports
 │   ├── models.py              # Data classes: Question, EdgeCandidate, BatchAssignment
-│   ├── loaders.py             # Dataset loaders: load_squad_groups, load_hotpot_groups
+│   ├── loaders.py             # Re-exports from datasets/ for backward compatibility
+│   ├── datasets/              # Dataset loaders (modular)
+│   │   ├── __init__.py        # Exports all loaders
+│   │   ├── squad.py           # SQuAD loader: load_squad_groups, load_squad_random_questions
+│   │   ├── hotpot.py          # HotpotQA loader: load_hotpot_groups
+│   │   └── cmb.py             # CMB loader: load_cmb_groups (Chinese Medical Benchmark)
 │   ├── eval.py                # Evaluation metrics: compute_em, compute_f1, compute_contains
 │   ├── inference.py           # LLM inference utilities: build_chat_prompt, extract_json
 │   ├── generators.py          # Dependency generators: Heuristic, LLM, BERT-attention
@@ -112,13 +117,14 @@ class StrategyResult:
 
 ### Key Arguments
 ```bash
---dataset {squad,hotpot}     # Dataset choice
+--dataset {squad,hotpot,cmb} # Dataset choice
 --model-name <hf_model>      # HuggingFace model ID
 --context-count N            # Number of context groups
 --min-questions M            # Min questions per group
 --max-questions K            # Max questions per group
 --strategies "s1,s2,..."     # Comma-separated strategy list
 --json-out <path>            # Output directory for results
+--cmb-subset CMB-Clin        # CMB subset (default: CMB-Clin)
 ```
 
 ### Multi-GPU Support
@@ -149,14 +155,24 @@ outputs_json/
 - Questions are bundled into groups for testing
 - Subset options: `distractor`, `fullwiki`
 
+### CMB (FreedomIntelligence/CMB)
+- Chinese Medical Benchmark - clinical case analysis
+- Each case has: title, description (shared context), QA_pairs (3-4 questions per case)
+- Subset options: `CMB-Clin` (74 clinical cases, test split only)
+- Perfect fit: multiple questions share one medical case context
+
 ## Common Code Patterns
 
 ### Loading Data
 ```python
-from src import load_squad_groups, load_hotpot_groups
+from src import load_squad_groups, load_hotpot_groups, load_cmb_groups
 
 contexts = load_squad_groups("train", min_questions=3, max_questions=8, max_contexts=10)
 # Returns: List[dict] with keys: title, context, questions
+
+# CMB example (Chinese medical cases)
+cmb_contexts = load_cmb_groups("test", subset="CMB-Clin", max_contexts=10)
+# Returns same format: List[dict] with keys: title, context, questions
 ```
 
 ### Running Strategies
@@ -184,7 +200,7 @@ f1 = compute_f1(prediction, references)  # 0.0 to 1.0
 
 ## Typical Workflow
 
-1. Load dataset → `load_squad_groups()` / `load_hotpot_groups()`
+1. Load dataset → `load_squad_groups()` / `load_hotpot_groups()` / `load_cmb_groups()`
 2. For each context group:
    - Build Question objects
    - Run each strategy → get StrategyResult

@@ -1,6 +1,6 @@
 # Parallel Decoding Experiments
 
-This project explores dependency-aware question answering on SQuAD and HotpotQA using local LLM models. It contains core library code in `src/` and runnable scripts in `scripts/`.
+This project explores dependency-aware question answering on SQuAD, HotpotQA, and CMB using local LLM models. It contains core library code in `src/` and runnable scripts in `scripts/`.
 
 ## Project Structure
 
@@ -39,11 +39,12 @@ Use the `--bert-*` flags (model name, thresholds, token caps, and cost weight) t
 
 ### Key arguments
 
-- `--dataset {squad,hotpot}`: choose dataset. Hotpot enables multi-context mode (each question has its own context).
+- `--dataset {squad,hotpot,cmb}`: choose dataset. Hotpot enables multi-context mode (each question has its own context). CMB is Chinese Medical Benchmark with clinical case analysis.
 - `--model-name`: HF model id or local path.
 - `--context-count`: number of sampled groups/steps.
 - `--min-questions / --max-questions`: number of questions per group.
-- `--hotpot-subset`: HotpotQA split (e.g., `distractor`).
+- `--hotpot-subset`: HotpotQA subset (e.g., `distractor`).
+- `--cmb-subset`: CMB subset (default: `CMB-Clin`).
 - `--max-new-tokens`: generation cap.
 - `--json-out`: write summary JSON; on multi-GPU a single merged file is produced.
 - `--log-level`: logging verbosity.
@@ -79,6 +80,22 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --max-questions 4 \
   --max-new-tokens 1024 \
   --json-out outputs_json/results_hotpot.json \
+  --log-level INFO
+```
+
+### CMB (Chinese Medical Benchmark)
+
+```bash
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset cmb \
+  --cmb-subset CMB-Clin \
+  --split test \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --context-count 74 \
+  --min-questions 3 \
+  --max-questions 4 \
+  --max-new-tokens 1024 \
+  --json-out outputs_json/results_cmb.json \
   --log-level INFO
 ```
 

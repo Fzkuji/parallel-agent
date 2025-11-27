@@ -23,6 +23,7 @@ from src import (
     BertAttentionDependencyGenerator,
     HeuristicDependencyGenerator,
     LocalLLMDependencyGenerator,
+    load_cmb_groups,
     load_hotpot_groups,
     load_squad_random_questions,
     build_questions_from_group,
@@ -49,9 +50,9 @@ def parse_args() -> argparse.Namespace:
         description="Compare sequential, batch, and dependency-aware QA strategies with optional BERT dependencies.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dataset", choices=["squad", "hotpot"], default="squad", help="Dataset to evaluate.")
+    parser.add_argument("--dataset", choices=["squad", "hotpot", "cmb"], default="squad", help="Dataset to evaluate.")
     parser.add_argument("--model-name", default="Qwen/Qwen3-4B", help="Hugging Face model identifier or local path.")
-    parser.add_argument("--split", default="train", help="SQuAD split to sample.")
+    parser.add_argument("--split", default="train", help="Dataset split to sample.")
     parser.add_argument("--context-count", type=int, default=3, help="Number of contexts to process.")
     parser.add_argument("--min-questions", type=int, default=3, help="Minimum questions per context.")
     parser.add_argument("--max-questions", type=int, default=5, help="Maximum questions per context.")
@@ -62,6 +63,7 @@ def parse_args() -> argparse.Namespace:
         help="For SQuAD, sample individual questions randomly instead of grouping by shared context.",
     )
     parser.add_argument("--hotpot-subset", default="distractor", help="HotpotQA subset (e.g., distractor).")
+    parser.add_argument("--cmb-subset", default="CMB-Clin", help="CMB subset (e.g., CMB-Clin).")
 
     parser.add_argument("--cost-weight", type=float, default=0.01, help="Cost penalty weight for dependency selection.")
     parser.add_argument("--min-confidence", type=float, default=0.45, help="Minimum edge confidence.")
@@ -318,8 +320,14 @@ def compute_aggregate_metrics(serialized_contexts: List[dict]) -> str:
     strategy_totals: Dict[str, Dict[str, float]] = {}
 
     for ctx in serialized_contexts:
-        for strategy in ctx.get("strategies", []):
-            name = strategy.get("name", "unknown")
+        strategies = ctx.get("strategies", {})
+        # Handle both dict format (new) and list format (legacy)
+        if isinstance(strategies, list):
+            strategy_items = [(s.get("name", "unknown"), s) for s in strategies]
+        else:
+            strategy_items = list(strategies.items())
+
+        for name, strategy in strategy_items:
             metrics = strategy.get("metrics", {})
             stats = strategy_totals.setdefault(
                 name,
@@ -377,15 +385,26 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
     """Extract contexts containing questions where at least one strategy answered incorrectly."""
     error_contexts = []
     for ctx in serialized_contexts:
-        gold_answers = ctx.get("gold_answers", {})
-        strategies = ctx.get("strategies", [])
+        # Handle both new format (questions dict) and legacy format (gold_answers)
+        questions = ctx.get("questions", {})
+        if questions:
+            gold_answers = {qid: q.get("gold", []) for qid, q in questions.items()}
+        else:
+            gold_answers = ctx.get("gold_answers", {})
+
+        strategies = ctx.get("strategies", {})
+        # Handle both dict format (new) and list format (legacy)
+        if isinstance(strategies, list):
+            strategy_items = [(s.get("name", "unknown"), s) for s in strategies]
+        else:
+            strategy_items = list(strategies.items())
 
         # Check each question
         error_questions = {}
         for qid, refs in gold_answers.items():
             # Check if all strategies got this question correct
             all_correct = True
-            for strategy in strategies:
+            for name, strategy in strategy_items:
                 answer = strategy.get("answers", {}).get(qid, "")
                 if compute_em(answer, refs) < 1.0:
                     all_correct = False
@@ -396,18 +415,29 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
 
         # If any question has errors, include this context (filtered)
         if error_questions:
+            # Build questions data for error cases
+            error_questions_data = {}
+            for qid in error_questions:
+                if questions and qid in questions:
+                    error_questions_data[qid] = questions[qid]
+                else:
+                    error_questions_data[qid] = {
+                        "text": ctx.get("questions_text", {}).get(qid, ""),
+                        "gold": error_questions[qid],
+                    }
+
+            # Build strategies data for error cases
+            error_strategies = {}
+            for name, s in strategy_items:
+                error_strategies[name] = {
+                    "answers": {qid: s.get("answers", {}).get(qid, "") for qid in error_questions},
+                    "metrics": s.get("metrics"),
+                }
+
             filtered_ctx = {
                 "context": ctx.get("context"),
-                "questions_text": {qid: ctx.get("questions_text", {}).get(qid, "") for qid in error_questions},
-                "gold_answers": error_questions,
-                "strategies": [
-                    {
-                        "name": s.get("name"),
-                        "answers": {qid: s.get("answers", {}).get(qid, "") for qid in error_questions},
-                        "metrics": s.get("metrics"),
-                    }
-                    for s in strategies
-                ],
+                "questions": error_questions_data,
+                "strategies": error_strategies,
             }
             error_contexts.append(filtered_ctx)
 
@@ -417,9 +447,11 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
 def generate_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
     """Generate descriptive output folder name with timestamp and experiment parameters."""
     model_short = args.model_name.split("/")[-1]
-    # Build dataset identifier: squad_train or hotpot_distractor_train
+    # Build dataset identifier: squad_train, hotpot_distractor_train, or cmb_CMB-Clin_test
     if args.dataset == "hotpot":
         dataset_id = f"hotpot_{args.hotpot_subset}_{args.split}"
+    elif args.dataset == "cmb":
+        dataset_id = f"cmb_{args.cmb_subset}_{args.split}"
     else:
         dataset_id = f"squad_{args.split}"
     # Format: timestamp_dataset_model_n{samples}_q{questions}
@@ -456,6 +488,8 @@ def save_experiment_results(
     }
     if args.dataset == "hotpot":
         config["hotpot_subset"] = args.hotpot_subset
+    elif args.dataset == "cmb":
+        config["cmb_subset"] = args.cmb_subset
 
     # Save config to readable txt file
     config_txt_path = output_dir / "config.txt"
@@ -467,6 +501,8 @@ def save_experiment_results(
         f.write(f"Dataset: {args.dataset}\n")
         if args.dataset == "hotpot":
             f.write(f"  - HuggingFace: hotpotqa/hotpot_qa ({args.hotpot_subset})\n")
+        elif args.dataset == "cmb":
+            f.write(f"  - HuggingFace: FreedomIntelligence/CMB ({args.cmb_subset})\n")
         else:
             f.write(f"  - HuggingFace: rajpurkar/squad\n")
         f.write(f"  - Split: {args.split}\n")
@@ -578,6 +614,15 @@ def main() -> None:
             max_questions=args.max_questions,
             seed=args.seed,
         )
+    elif args.dataset == "cmb":
+        contexts = load_cmb_groups(
+            args.split,
+            subset=args.cmb_subset,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
     else:
         if args.squad_random_questions:
             contexts = load_squad_random_questions(
@@ -665,26 +710,41 @@ def main() -> None:
         print(summarize_results(strategy_list))
         print_answer_table(questions, strategy_list)
 
-        serialized_contexts.append(
-            {
-                "context": title,
-                "questions_text": {q.qid: q.text.strip() for q in questions},
-                "gold_answers": {q.qid: q.references for q in questions},
-                "strategies": [
-                    {
-                        "name": res.name,
-                        "metrics": {k: round(v, 2) for k, v in res.metrics.items()},
-                        "prompt_tokens": res.prompt_tokens,
-                        "generated_tokens": res.generated_tokens,
-                        "latency": round(res.latency, 2),
-                        "batches": res.batches,
-                        "answers": res.answers,
-                        "details": res.details,
-                    }
-                    for res in strategy_list
-                ],
+        # Build simplified serialization structure
+        questions_data = {
+            q.qid: {"text": q.text.strip(), "gold": q.references}
+            for q in questions
+        }
+
+        strategies_data = {}
+        for res in strategy_list:
+            strategy_entry = {
+                "answers": res.answers,
+                "metrics": {k: round(v, 2) for k, v in res.metrics.items()},
+                "prompt_tokens": res.prompt_tokens,
+                "generated_tokens": res.generated_tokens,
+                "latency": round(res.latency, 2),
+                "batches": res.batches,
             }
-        )
+            # For parallel strategies, promote DAG info to top level
+            if res.details and "dependency_stage" in res.details:
+                dep_stage = res.details["dependency_stage"]
+                strategy_entry["dag_edges"] = dep_stage.get("edges", [])
+                strategy_entry["dag_generation"] = {
+                    "prompt_tokens": dep_stage.get("prompt_tokens", 0),
+                    "generated_tokens": dep_stage.get("generated_tokens", 0),
+                    "latency": dep_stage.get("latency", 0),
+                }
+            # Keep batch execution details if present
+            if res.details and "batches" in res.details:
+                strategy_entry["batch_details"] = res.details["batches"]
+            strategies_data[res.name] = strategy_entry
+
+        serialized_contexts.append({
+            "context": title,
+            "questions": questions_data,
+            "strategies": strategies_data,
+        })
 
     # Distributed output handling: gather to rank0 and write a single file
     if world_size > 1 and dist.is_initialized():
