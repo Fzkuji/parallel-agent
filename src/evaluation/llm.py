@@ -122,9 +122,10 @@ class OpenRouterEvaluator:
         model: str = "openai/gpt-4o",
         api_key: Optional[str] = None,
         base_url: str = "https://openrouter.ai/api/v1",
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
+        max_retries: int = 5,
+        retry_delay: float = 2.0,
         timeout: float = 60.0,
+        request_delay: float = 1.0,
     ):
         """
         Initialize OpenRouter evaluator.
@@ -134,8 +135,9 @@ class OpenRouterEvaluator:
             api_key: OpenRouter API key (or set OPENROUTER_API_KEY env var)
             base_url: OpenRouter API base URL
             max_retries: Maximum retry attempts for failed requests
-            retry_delay: Delay between retries (seconds)
+            retry_delay: Base delay between retries (seconds), uses exponential backoff
             timeout: Request timeout (seconds)
+            request_delay: Delay between batch requests to avoid rate limiting (seconds)
         """
         self.model = model
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
@@ -148,6 +150,7 @@ class OpenRouterEvaluator:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.timeout = timeout
+        self.request_delay = request_delay
 
         if not HTTPX_AVAILABLE and not REQUESTS_AVAILABLE:
             raise RuntimeError(
@@ -190,9 +193,19 @@ class OpenRouterEvaluator:
 
             except Exception as e:
                 last_error = e
-                logger.warning(f"API request failed (attempt {attempt + 1}): {e}")
+                # Check for rate limiting (429)
+                is_rate_limit = "429" in str(e) or "Too Many Requests" in str(e)
+                if is_rate_limit:
+                    # Exponential backoff for rate limiting: 5s, 10s, 20s, 40s, 80s
+                    wait_time = self.retry_delay * (2 ** (attempt + 1))
+                    logger.warning(f"Rate limited (attempt {attempt + 1}), waiting {wait_time:.1f}s...")
+                else:
+                    # Linear backoff for other errors
+                    wait_time = self.retry_delay * (attempt + 1)
+                    logger.warning(f"API request failed (attempt {attempt + 1}): {e}")
+
                 if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
+                    time.sleep(wait_time)
 
         raise RuntimeError(f"API request failed after {self.max_retries} attempts: {last_error}")
 
@@ -320,6 +333,10 @@ class OpenRouterEvaluator:
                     average=0.0,
                     raw_response=f"Error: {e}",
                 ))
+
+            # Rate limiting: delay between requests
+            if i < total - 1 and self.request_delay > 0:
+                time.sleep(self.request_delay)
 
         return results
 
