@@ -246,6 +246,8 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             "prompt_tokens": float(prompt_tokens),
             "generated_tokens": float(gen_tokens),
             "latency": float(elapsed),
+            "dag_prompt": chat_prompt,
+            "dag_raw_response": raw_text,
         }
         try:
             payload = extract_json_from_text(text)

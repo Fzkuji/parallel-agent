@@ -39,6 +39,9 @@ def run_dependency_batch_strategy(
     dep_prompt_tokens = dep_metrics.get("prompt_tokens", 0.0) if isinstance(dep_metrics, dict) else 0.0
     dep_generated_tokens = dep_metrics.get("generated_tokens", 0.0) if isinstance(dep_metrics, dict) else 0.0
     dep_latency = dep_metrics.get("latency", 0.0) if isinstance(dep_metrics, dict) else 0.0
+    # DAG inference details (prompt and raw response from LLM)
+    dag_prompt = dep_metrics.get("dag_prompt", "") if isinstance(dep_metrics, dict) else ""
+    dag_raw_response = dep_metrics.get("dag_raw_response", "") if isinstance(dep_metrics, dict) else ""
     selected = select_dependency_edges(
         question_lookup,
         edges,
@@ -204,6 +207,8 @@ def run_dependency_batch_strategy(
                 "prompt_tokens": dep_prompt_tokens,
                 "generated_tokens": dep_generated_tokens,
                 "latency": dep_latency,
+                "dag_prompt": dag_prompt,
+                "dag_raw_response": dag_raw_response,
             },
             "batches": batch_details,
         },
