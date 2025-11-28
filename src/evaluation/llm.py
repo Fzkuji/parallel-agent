@@ -211,8 +211,16 @@ class OpenRouterEvaluator:
 
     def _parse_scores(self, response: str) -> Dict[str, Any]:
         """Parse scores from LLM response."""
-        # Try to extract JSON from response
-        json_match = re.search(r"\{[^{}]*\}", response, re.DOTALL)
+        # Try to extract JSON from markdown code blocks first
+        code_block_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", response)
+        if code_block_match:
+            try:
+                return json.loads(code_block_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Try to extract JSON object (allowing nested content)
+        json_match = re.search(r"\{[\s\S]*?\}", response)
         if json_match:
             try:
                 return json.loads(json_match.group())
@@ -225,12 +233,21 @@ class OpenRouterEvaluator:
         except json.JSONDecodeError:
             pass
 
-        # Last resort: extract numbers manually
+        # Last resort: extract numbers manually with flexible patterns
         scores = {}
         for key in ["fluency", "relevance", "completeness", "proficiency"]:
-            match = re.search(rf'"{key}":\s*(\d)', response, re.IGNORECASE)
-            if match:
-                scores[key] = int(match.group(1))
+            # Try various patterns: "key": 5, key: 5, key=5, key：5 (Chinese colon)
+            patterns = [
+                rf'"{key}"[\s:：]+(\d+)',  # "key": 5
+                rf"'{key}'[\s:：]+(\d+)",  # 'key': 5
+                rf'\b{key}[\s:：]+(\d+)',  # key: 5 or key：5
+                rf'{key}\s*[=]\s*(\d+)',   # key=5
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, response, re.IGNORECASE)
+                if match:
+                    scores[key] = int(match.group(1))
+                    break
 
         if len(scores) < 4:
             logger.warning(f"Failed to parse scores from response: {response[:200]}")
