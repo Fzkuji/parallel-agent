@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hotpot-subset", default="distractor", help="HotpotQA subset (e.g., distractor).")
     parser.add_argument("--cmb-subset", default="CMB-Clin", help="CMB subset (e.g., CMB-Clin).")
 
-    parser.add_argument("--cost-weight", type=float, default=0.01, help="Cost penalty weight for dependency selection.")
+    parser.add_argument("--cost-weight", type=float, default=0.0, help="Cost penalty weight for dependency selection (set to 0 to let model decide).")
     parser.add_argument("--min-confidence", type=float, default=0.45, help="Minimum edge confidence.")
     parser.add_argument("--max-dependencies", type=int, default=3, help="Max dependencies per question.")
     parser.add_argument("--total-cost-budget", type=int, default=None, help="Optional global dependency cost budget.")

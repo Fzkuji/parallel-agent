@@ -1,0 +1,18 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.14.0
+
+# Evaluation metrics
+nltk>=3.8.1
+
+# Optional: Chinese text processing (for CMB dataset)
+rouge-chinese>=1.0.3
+jieba>=0.42.1
+
+# Optional: HTTP clients for LLM evaluation via OpenRouter API
+httpx>=0.24.0
+requests>=2.31.0
+
+# Scientific computing
+numpy>=1.24.0
