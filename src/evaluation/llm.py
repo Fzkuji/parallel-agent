@@ -211,6 +211,17 @@ class OpenRouterEvaluator:
 
     def _parse_scores(self, response: str) -> Dict[str, Any]:
         """Parse scores from LLM response."""
+        # Handle empty or whitespace-only responses
+        if not response or not response.strip():
+            logger.warning("Received empty response from LLM")
+            return {
+                "fluency": 3,
+                "relevance": 3,
+                "completeness": 3,
+                "proficiency": 3,
+                "reasoning": "Empty response from LLM",
+            }
+
         # Try to extract JSON from markdown code blocks first
         code_block_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", response)
         if code_block_match:
@@ -235,22 +246,36 @@ class OpenRouterEvaluator:
 
         # Last resort: extract numbers manually with flexible patterns
         scores = {}
-        for key in ["fluency", "relevance", "completeness", "proficiency"]:
-            # Try various patterns: "key": 5, key: 5, key=5, key：5 (Chinese colon)
-            patterns = [
-                rf'"{key}"[\s:：]+(\d+)',  # "key": 5
-                rf"'{key}'[\s:：]+(\d+)",  # 'key': 5
-                rf'\b{key}[\s:：]+(\d+)',  # key: 5 or key：5
-                rf'{key}\s*[=]\s*(\d+)',   # key=5
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, response, re.IGNORECASE)
-                if match:
-                    scores[key] = int(match.group(1))
+        # Chinese key mappings
+        key_aliases = {
+            "fluency": ["fluency", "流畅性", "流畅"],
+            "relevance": ["relevance", "相关性", "相关"],
+            "completeness": ["completeness", "完整性", "完整"],
+            "proficiency": ["proficiency", "专业性", "医学专业性", "专业"],
+        }
+
+        for key, aliases in key_aliases.items():
+            for alias in aliases:
+                # Try various patterns: "key": 5, key: 5, key=5, key：5 (Chinese colon)
+                patterns = [
+                    rf'"{alias}"[\s:：]+(\d+)',  # "key": 5
+                    rf"'{alias}'[\s:：]+(\d+)",  # 'key': 5
+                    rf'{alias}[\s:：]+(\d+)',    # key: 5 or key：5
+                    rf'{alias}\s*[=]\s*(\d+)',   # key=5
+                ]
+                found = False
+                for pattern in patterns:
+                    match = re.search(pattern, response, re.IGNORECASE)
+                    if match:
+                        scores[key] = int(match.group(1))
+                        found = True
+                        break
+                if found:
                     break
 
         if len(scores) < 4:
-            logger.warning(f"Failed to parse scores from response: {response[:200]}")
+            # Log more context for debugging
+            logger.warning(f"Failed to parse scores (found {len(scores)}/4) from response: {response[:300]}...")
             # Return default scores
             return {
                 "fluency": 3,
