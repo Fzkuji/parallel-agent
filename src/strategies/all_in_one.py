@@ -173,8 +173,8 @@ Questions:
             ans_text = found[qid]
             strict_valid = True
         else:
-            # If not found, mark as unknown instead of using fallback
-            ans_text = "unknown"
+            # If not found, use empty string (only extractive datasets like squad use "unknown")
+            ans_text = ""
             strict_valid = False
         answers_text[qid] = ans_text
         answer_records[qid] = (ans_text, strict_valid)
@@ -350,8 +350,8 @@ def run_all_in_one_multi_strategy(
                 strict_valid = True
                 break
         if not strict_valid:
-            # If not found, mark as unknown instead of using fallback
-            ans = "unknown"
+            # If not found, use empty string (only extractive datasets like squad use "unknown")
+            ans = ""
         answers_text[qid] = ans
         answer_records[qid] = (ans, strict_valid)
         detail_records.append(
