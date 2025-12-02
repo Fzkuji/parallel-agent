@@ -73,11 +73,25 @@ from .inference import (
     PLANNER_SYSTEM_PROMPT,
     USE_THINK_TOKENS,
     LocalLLMDependencyGenerator,
+    APILLMDependencyGenerator,
+    GenerationResult,
     build_chat_prompt,
     build_dependency_prompt,
     extract_box_answer,
     extract_json_from_text,
     set_think_tokens,
+    generate_completion,
+    generate_with_api,
+    generate_with_local_model,
+)
+
+# API client
+from .api_client import (
+    APIClient,
+    APIModelWrapper,
+    APITokenizerWrapper,
+    APIResponse,
+    create_api_inference,
 )
 
 __all__ = [
@@ -137,4 +151,15 @@ __all__ = [
     "extract_json_from_text",
     "build_dependency_prompt",
     "LocalLLMDependencyGenerator",
+    "APILLMDependencyGenerator",
+    "GenerationResult",
+    "generate_completion",
+    "generate_with_api",
+    "generate_with_local_model",
+    # API client
+    "APIClient",
+    "APIModelWrapper",
+    "APITokenizerWrapper",
+    "APIResponse",
+    "create_api_inference",
 ]

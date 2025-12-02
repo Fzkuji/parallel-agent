@@ -8,7 +8,8 @@ import os
 import re
 import textwrap
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from .generators import DependencyGraphGenerator, HeuristicDependencyGenerator
 from .models import EdgeCandidate, Question
@@ -16,6 +17,7 @@ from .models import EdgeCandidate, Question
 if TYPE_CHECKING:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from .api_client import APIClient
 
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that answers questions given background passages."
@@ -276,4 +278,274 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             except (TypeError, ValueError):
                 confidence = 0.7
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
+        return edges
+
+
+# =============================================================================
+# Unified Generation Interface (supports both local models and API)
+# =============================================================================
+
+@dataclass
+class GenerationResult:
+    """Result from a generation call."""
+    text: str
+    prompt_tokens: int
+    generated_tokens: int
+    latency: float
+
+
+def generate_with_local_model(
+    prompt: str,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
+    *,
+    max_new_tokens: int = 1024,
+    do_sample: bool = False,
+    temperature: float = 0.0,
+) -> GenerationResult:
+    """Generate text using a local HuggingFace model.
+
+    Args:
+        prompt: The full prompt string (already formatted)
+        tokenizer: HuggingFace tokenizer
+        model: HuggingFace model
+        max_new_tokens: Maximum tokens to generate
+        do_sample: Whether to use sampling
+        temperature: Sampling temperature
+
+    Returns:
+        GenerationResult with generated text and metrics
+    """
+    import torch
+    from .utils import reset_generation_seed, DEFAULT_GENERATION_SEED, clean_model_text
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_tokens = inputs["input_ids"].shape[-1]
+
+    start = time.perf_counter()
+    reset_generation_seed(DEFAULT_GENERATION_SEED)
+
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+            num_beams=1,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+
+    elapsed = time.perf_counter() - start
+    sequences = generated.sequences
+
+    # Extract generated tokens (excluding prompt)
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+    tail_tokens: List[int] = []
+    for token in sequences[0].tolist()[prompt_tokens:]:
+        if token in (eos_id, pad_id):
+            break
+        tail_tokens.append(token)
+
+    raw_text = tokenizer.decode(tail_tokens, skip_special_tokens=True).strip()
+    raw_text = clean_model_text(raw_text)
+
+    return GenerationResult(
+        text=raw_text,
+        prompt_tokens=prompt_tokens,
+        generated_tokens=len(tail_tokens),
+        latency=elapsed,
+    )
+
+
+def generate_with_api(
+    messages: List[Dict[str, str]],
+    api_client: "APIClient",
+    *,
+    max_new_tokens: int = 1024,
+    temperature: float = 0.0,
+) -> GenerationResult:
+    """Generate text using an API client.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+        api_client: APIClient instance
+        max_new_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+
+    Returns:
+        GenerationResult with generated text and metrics
+    """
+    response = api_client.generate(
+        messages,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+
+    return GenerationResult(
+        text=response.text,
+        prompt_tokens=response.prompt_tokens,
+        generated_tokens=response.completion_tokens,
+        latency=response.latency,
+    )
+
+
+def generate_completion(
+    messages: List[Dict[str, str]],
+    tokenizer: Any,
+    model: Any,
+    *,
+    max_new_tokens: int = 1024,
+    do_sample: bool = False,
+    temperature: float = 0.0,
+    api_client: Optional["APIClient"] = None,
+) -> GenerationResult:
+    """Unified generation interface supporting both local models and API.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+        tokenizer: HuggingFace tokenizer (ignored if api_client is provided)
+        model: HuggingFace model (ignored if api_client is provided)
+        max_new_tokens: Maximum tokens to generate
+        do_sample: Whether to use sampling (local model only)
+        temperature: Sampling temperature
+        api_client: Optional APIClient for API-based inference
+
+    Returns:
+        GenerationResult with generated text and metrics
+    """
+    if api_client is not None:
+        return generate_with_api(
+            messages,
+            api_client,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+        )
+    else:
+        # Build prompt from messages using tokenizer's chat template
+        prompt = build_chat_prompt_from_messages(tokenizer, messages)
+        return generate_with_local_model(
+            prompt,
+            tokenizer,
+            model,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )
+
+
+def build_chat_prompt_from_messages(
+    tokenizer: "AutoTokenizer",
+    messages: List[Dict[str, str]],
+) -> str:
+    """Build a chat prompt string from messages using tokenizer's template.
+
+    Args:
+        tokenizer: HuggingFace tokenizer with chat template
+        messages: List of message dicts
+
+    Returns:
+        Formatted prompt string
+    """
+    if hasattr(tokenizer, "apply_chat_template"):
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=(not USE_THINK_TOKENS),
+        )
+    else:
+        # Fallback for tokenizers without chat template
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                parts.append(f"System: {content}")
+            elif role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                parts.append(f"Assistant: {content}")
+        parts.append("Assistant:")
+        return "\n\n".join(parts)
+
+
+class APILLMDependencyGenerator(DependencyGraphGenerator):
+    """Generate dependencies using an API-based LLM."""
+
+    def __init__(
+        self,
+        api_client: "APIClient",
+        *,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> None:
+        self.api_client = api_client
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.last_metrics: Dict[str, float] = {
+            "prompt_tokens": 0,
+            "generated_tokens": 0,
+            "latency": 0.0,
+        }
+
+    def generate_edges(
+        self,
+        background: str,
+        questions: List[Question],
+        metadata: Optional[dict] = None,
+    ) -> List[EdgeCandidate]:
+        prompt = build_dependency_prompt(background, questions)
+
+        messages = [
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+
+        result = generate_with_api(
+            messages,
+            self.api_client,
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+        )
+
+        self.last_metrics = {
+            "prompt_tokens": float(result.prompt_tokens),
+            "generated_tokens": float(result.generated_tokens),
+            "latency": float(result.latency),
+            "dag_prompt": prompt,
+            "dag_raw_response": result.text,
+        }
+
+        try:
+            payload = extract_json_from_text(result.text)
+        except ValueError as exc:
+            snippet = str(exc)
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            logging.warning(
+                "API dependency generation failed to parse JSON (%s); falling back to heuristics.",
+                snippet,
+            )
+            heuristic = HeuristicDependencyGenerator()
+            return heuristic.generate_edges(background, questions, metadata)
+
+        edges_data = payload.get("edges", [])
+        edges: List[EdgeCandidate] = []
+        for item in edges_data:
+            try:
+                source = item["source"]
+                target = item["target"]
+            except KeyError:
+                continue
+            val = item.get("confidence", 0.7)
+            try:
+                confidence = float(0.7 if val is None else val)
+            except (TypeError, ValueError):
+                confidence = 0.7
+            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
+
         return edges

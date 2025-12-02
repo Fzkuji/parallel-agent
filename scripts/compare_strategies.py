@@ -27,6 +27,7 @@ from src import (
     BertAttentionDependencyGenerator,
     HeuristicDependencyGenerator,
     LocalLLMDependencyGenerator,
+    APILLMDependencyGenerator,
     load_cmb_groups,
     load_hotpot_groups,
     load_quac_groups,
@@ -35,6 +36,7 @@ from src import (
     load_squad_groups,
     Question,
     set_think_tokens,
+    APIClient,
 )
 from src.strategies import (
     StrategyResult,
@@ -143,6 +145,33 @@ def parse_args() -> argparse.Namespace:
         help="OpenRouter model ID for LLM-based evaluation (e.g., 'openai/gpt-4o'). "
              "Requires OPENROUTER_API_KEY env var.",
     )
+    # API-based inference (instead of local model)
+    parser.add_argument(
+        "--use-api",
+        action="store_true",
+        help="Use API-based inference instead of local model. "
+             "Requires setting appropriate API key environment variable.",
+    )
+    parser.add_argument(
+        "--api-model",
+        type=str,
+        default=None,
+        help="Model identifier for API inference (e.g., 'deepseek-chat', 'qwen/qwen3-30b-a3b'). "
+             "If not specified, uses --model-name.",
+    )
+    parser.add_argument(
+        "--api-provider",
+        type=str,
+        choices=["openai", "openrouter", "together", "deepseek"],
+        default=None,
+        help="API provider (auto-detected from model name if not specified).",
+    )
+    parser.add_argument(
+        "--api-base-url",
+        type=str,
+        default=None,
+        help="Custom API base URL (overrides provider default).",
+    )
     return parser.parse_args()
 
 
@@ -150,10 +179,15 @@ def resolve_dependency_generators(
     args: argparse.Namespace,
     tokenizer: AutoTokenizer,
     model: AutoModelForCausalLM,
+    api_client: Optional[APIClient] = None,
 ) -> tuple:
     if args.no_llm_deps:
         dep_generator = HeuristicDependencyGenerator()
         logging.info("Using heuristic dependency generator.")
+    elif api_client is not None:
+        # Use API for LLM-based dependency generation
+        dep_generator = APILLMDependencyGenerator(api_client)
+        logging.info("Using API-based LLM dependency generator.")
     else:
         dep_generator = LocalLLMDependencyGenerator(tokenizer, model)
         logging.info("Using local LLM dependency generator.")
@@ -187,6 +221,7 @@ def run_all_strategies(
     args: argparse.Namespace,
     bert_conf_threshold: float,
     selected_strategies: Optional[List[str]] = None,
+    api_client: Optional[APIClient] = None,
 ) -> List[StrategyResult]:
     # Default to all strategies if none specified
     if selected_strategies is None:
@@ -205,6 +240,7 @@ def run_all_strategies(
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="all_in_one",
                 dataset=args.dataset,
+                api_client=api_client,
             ))
         if "sequential" in selected_strategies:
             results.append(run_sequential_multi_strategy(
@@ -214,6 +250,7 @@ def run_all_strategies(
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="sequential",
                 dataset=args.dataset,
+                api_client=api_client,
             ))
         if "batch" in selected_strategies:
             results.append(run_batch_multi_strategy(
@@ -223,6 +260,7 @@ def run_all_strategies(
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="batch",
                 dataset=args.dataset,
+                api_client=api_client,
             ))
         # For dependency strategies in multi-context mode, store context per question
         # This ensures consistent prompt format with batch strategy (context in system message)
@@ -253,6 +291,7 @@ def run_all_strategies(
                     max_new_tokens=args.max_new_tokens,
                     strategy_name="parallel",
                     dataset=args.dataset,
+                    api_client=api_client,
                 ))
             if "parallel_bert" in selected_strategies:
                 results.append(run_dependency_batch_strategy(
@@ -268,6 +307,7 @@ def run_all_strategies(
                     max_new_tokens=args.max_new_tokens,
                     strategy_name="parallel_bert",
                     dataset=args.dataset,
+                    api_client=api_client,
                 ))
         return results
 
@@ -279,6 +319,7 @@ def run_all_strategies(
             model,
             max_new_tokens=args.max_new_tokens,
             dataset=args.dataset,
+            api_client=api_client,
         ))
     if "sequential" in selected_strategies:
         results.append(run_sequential_strategy(
@@ -288,6 +329,7 @@ def run_all_strategies(
             model,
             max_new_tokens=args.max_new_tokens,
             dataset=args.dataset,
+            api_client=api_client,
         ))
     if "batch" in selected_strategies:
         results.append(run_full_batch_strategy(
@@ -297,6 +339,7 @@ def run_all_strategies(
             model,
             max_new_tokens=args.max_new_tokens,
             dataset=args.dataset,
+            api_client=api_client,
         ))
     if "parallel" in selected_strategies:
         results.append(run_dependency_batch_strategy(
@@ -312,6 +355,7 @@ def run_all_strategies(
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel",
             dataset=args.dataset,
+            api_client=api_client,
         ))
     if "parallel_bert" in selected_strategies:
         results.append(run_dependency_batch_strategy(
@@ -327,6 +371,7 @@ def run_all_strategies(
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel_bert",
             dataset=args.dataset,
+            api_client=api_client,
         ))
     return results
 
@@ -673,54 +718,78 @@ def main() -> None:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_folder_name = generate_output_folder_name(args, run_timestamp) if args.json_out else ""
 
-    logging.info("Loading tokenizer and model: %s", args.model_name)
-    if args.deterministic:
-        # Strong determinism: disable TF32, set deterministic algorithms
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = False  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        try:
-            torch.backends.cudnn.allow_tf32 = False  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        torch.use_deterministic_algorithms(True)
+    # API mode: use API for inference instead of local model
+    api_client = None
+    tokenizer = None
+    model = None
 
-    # Bind each rank to a single GPU to avoid piling all processes on cuda:0
-    if torch.cuda.is_available():
-        num_devices = torch.cuda.device_count()
-        if num_devices == 0:
-            raise RuntimeError("CUDA_VISIBLE_DEVICES is set but no GPUs detected")
-        device_id = rank % num_devices
-        torch.cuda.set_device(device_id)
-        logging.info("Rank %d using cuda:%d (visible devices: %d)", rank, device_id, num_devices)
-
-    # Initialize distributed backend for multi-GPU (required for gathering results)
-    if world_size > 1 and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-        logging.info("Initialized distributed backend: %s (rank %d/%d)", backend, rank, world_size)
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    # Prefer float32 under deterministic mode to minimize divergence
-    load_dtype = torch.float32 if args.deterministic or not torch.cuda.is_available() else torch.float16
-    device_map = "auto"
-    if world_size > 1 and torch.cuda.is_available():
-        device_map = {"": f"cuda:{torch.cuda.current_device()}"}
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        device_map=device_map,
-        torch_dtype=load_dtype,
-    )
-    # Force eager attention if configurable (post-load best effort)
-    if args.deterministic and hasattr(model, "config") and hasattr(model.config, "attn_implementation"):
+    if args.use_api:
+        api_model = args.api_model or args.model_name
+        logging.info("Using API mode with model: %s (provider: %s)", api_model, args.api_provider or "auto")
+        api_client = APIClient(
+            model=api_model,
+            provider=args.api_provider,
+            base_url=args.api_base_url,
+        )
+        # For API mode, we still need a tokenizer for prompt formatting (use a small one)
+        # Try to load a lightweight tokenizer for chat template
         try:
-            model.config.attn_implementation = "eager"  # type: ignore[attr-defined]
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            logging.info("Loaded lightweight tokenizer for prompt formatting")
         except Exception:
-            pass
-    model.eval()
+            tokenizer = None
+            logging.info("No tokenizer loaded - will use API directly")
+    else:
+        logging.info("Loading tokenizer and model: %s", args.model_name)
+        if args.deterministic:
+            # Strong determinism: disable TF32, set deterministic algorithms
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = False  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            torch.use_deterministic_algorithms(True)
+
+        # Bind each rank to a single GPU to avoid piling all processes on cuda:0
+        if torch.cuda.is_available():
+            num_devices = torch.cuda.device_count()
+            if num_devices == 0:
+                raise RuntimeError("CUDA_VISIBLE_DEVICES is set but no GPUs detected")
+            device_id = rank % num_devices
+            torch.cuda.set_device(device_id)
+            logging.info("Rank %d using cuda:%d (visible devices: %d)", rank, device_id, num_devices)
+
+        # Initialize distributed backend for multi-GPU (required for gathering results)
+        if world_size > 1 and not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+            logging.info("Initialized distributed backend: %s (rank %d/%d)", backend, rank, world_size)
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        # Prefer float32 under deterministic mode to minimize divergence
+        load_dtype = torch.float32 if args.deterministic or not torch.cuda.is_available() else torch.float16
+        device_map = "auto"
+        if world_size > 1 and torch.cuda.is_available():
+            device_map = {"": f"cuda:{torch.cuda.current_device()}"}
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            device_map=device_map,
+            torch_dtype=load_dtype,
+        )
+        # Force eager attention if configurable (post-load best effort)
+        if args.deterministic and hasattr(model, "config") and hasattr(model.config, "attn_implementation"):
+            try:
+                model.config.attn_implementation = "eager"  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        model.eval()
 
     if args.dataset == "hotpot":
         contexts = load_hotpot_groups(
@@ -768,7 +837,7 @@ def main() -> None:
         logging.info("Sharding contexts: rank %d/%d -> %d contexts", rank, world_size, len(contexts))
     logging.info("Loaded %d contexts (requested: %d)", len(contexts), args.context_count)
 
-    dep_generator, bert_dep_generator, bert_conf_threshold = resolve_dependency_generators(args, tokenizer, model)
+    dep_generator, bert_dep_generator, bert_conf_threshold = resolve_dependency_generators(args, tokenizer, model, api_client)
 
     # Initialize LLM evaluator if requested
     llm_evaluator = None
@@ -809,6 +878,7 @@ def main() -> None:
                 args=args,
                 bert_conf_threshold=bert_conf_threshold,
                 selected_strategies=selected_strategies,
+                api_client=api_client,
             )
             questions = [
                 Question(
@@ -838,6 +908,7 @@ def main() -> None:
                 args=args,
                 bert_conf_threshold=bert_conf_threshold,
                 selected_strategies=selected_strategies,
+                api_client=api_client,
             )
         overall_results[title] = strategy_list
 

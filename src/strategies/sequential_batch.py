@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import time
 import textwrap
-from typing import Any, Dict, List, Tuple
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.models import Question
 from src.inference import USE_THINK_TOKENS, build_chat_prompt, extract_box_answer
@@ -20,15 +17,24 @@ from src.utils import (
     strip_think_prefix,
 )
 
+if TYPE_CHECKING:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from src.api_client import APIClient
+
+# Datasets that use direct answer format (no <answer> tags required)
+DIRECT_ANSWER_DATASETS = {"cmb"}
+
 
 def run_sequential_strategy(
     background: str,
     questions: List[Question],
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
     dataset: str = None,
+    api_client: Optional["APIClient"] = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
@@ -36,6 +42,9 @@ def run_sequential_strategy(
     prompt_token_lengths: List[int] = []
     total_generated_tokens = 0
     total_latency = 0.0
+
+    # CMB uses direct answer format without <answer> tags
+    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
 
     # Align prompt with the single-question template used elsewhere
     # Only squad dataset has "unknown" labels
@@ -45,17 +54,30 @@ def run_sequential_strategy(
     else:
         unknown_instruction = ""
 
-    system_message = (
-        textwrap.dedent(
-            f"""You are a helpful assistant that answers questions given background passages.
+    if use_direct_format:
+        system_message = (
+            textwrap.dedent(
+                f"""You are a helpful medical assistant that answers questions given background passages.
+Provide the answer directly without any special formatting.
+
+Background:
+"""
+            ).strip()
+            + "\n"
+            + background.strip()
+        )
+    else:
+        system_message = (
+            textwrap.dedent(
+                f"""You are a helpful assistant that answers questions given background passages.
 Provide the answer with format <answer>text</answer>.{unknown_instruction}
 
 Background:
 """
-        ).strip()
-        + "\n"
-        + background.strip()
-    )
+            ).strip()
+            + "\n"
+            + background.strip()
+        )
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
     detail_records: List[Dict[str, Any]] = []
@@ -64,48 +86,60 @@ Background:
         user_message = f"Question ({question.qid}): {question.text.strip()}"
         messages.append({"role": "user", "content": user_message})
 
-        chat_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=(not USE_THINK_TOKENS),
-        )
-
-        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
-        prompt_tokens = inputs["input_ids"].shape[-1]
-        start = time.perf_counter()
-        reset_generation_seed(DEFAULT_GENERATION_SEED)
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_scores=False,
+        # Use API or local model for generation
+        if api_client is not None:
+            start = time.perf_counter()
+            response = api_client.generate(messages, max_tokens=max_new_tokens)
+            elapsed = time.perf_counter() - start
+            raw_response = clean_model_text(response.text)
+            prompt_tokens = response.prompt_tokens
+            gen_tokens = response.completion_tokens
+            chat_prompt = str(messages)  # For logging
+        else:
+            import torch
+            chat_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=(not USE_THINK_TOKENS),
             )
-        elapsed = time.perf_counter() - start
-        sequences = generated.sequences
-        generated_part = sequences[:, prompt_tokens:]
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id or eos_id
-        trimmed_tokens: List[int] = []
-        for token in generated_part[0].tolist():
-            if token in (eos_id, pad_id):
-                break
-            trimmed_tokens.append(token)
-        raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
-        raw_response = clean_model_text(raw_response)
-        final_answer, strict_valid = extract_box_answer(raw_response)
 
+            inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+            prompt_tokens = inputs["input_ids"].shape[-1]
+            start = time.perf_counter()
+            reset_generation_seed(DEFAULT_GENERATION_SEED)
+            with torch.no_grad():
+                generated = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                )
+            elapsed = time.perf_counter() - start
+            sequences = generated.sequences
+            generated_part = sequences[:, prompt_tokens:]
+            eos_id = tokenizer.eos_token_id
+            pad_id = tokenizer.pad_token_id or eos_id
+            trimmed_tokens: List[int] = []
+            for token in generated_part[0].tolist():
+                if token in (eos_id, pad_id):
+                    break
+                trimmed_tokens.append(token)
+            raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+            raw_response = clean_model_text(raw_response)
+            gen_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
+
+        final_answer, strict_valid = extract_box_answer(raw_response)
         messages.append({"role": "assistant", "content": raw_response})
 
         answer_records[question.qid] = (final_answer, strict_valid)
         answers_text[question.qid] = final_answer
         prompt_token_lengths.append(prompt_tokens)
-        total_generated_tokens += int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
+        total_generated_tokens += gen_tokens
         total_latency += elapsed
 
         detail_records.append(
@@ -119,7 +153,7 @@ Background:
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
-                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+                "generated_tokens": gen_tokens,
             }
         )
 
@@ -140,74 +174,108 @@ Background:
 def run_full_batch_strategy(
     background: str,
     questions: List[Question],
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
     dataset: str = None,
+    api_client: Optional["APIClient"] = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
     answers_text: Dict[str, str] = {}
     per_question: List[Dict[str, Any]] = []
 
+    # Build prompts for all questions
+    batch_messages: List[List[Dict[str, str]]] = []
     batch_chat_prompts: List[str] = []
     for question in questions:
         system_prompt, user_prompt = build_single_prompt(background, question, dataset)
-        batch_chat_prompts.append(
-            build_chat_prompt(
-                tokenizer,
-                user_prompt,
-                system_prompt=system_prompt,
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        batch_messages.append(messages)
+        if tokenizer is not None:
+            batch_chat_prompts.append(
+                build_chat_prompt(
+                    tokenizer,
+                    user_prompt,
+                    system_prompt=system_prompt,
+                )
             )
-        )
+        else:
+            batch_chat_prompts.append(str(messages))
 
-    original_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
-    inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
-    attention = inputs["attention_mask"]
-    input_lengths = attention.sum(dim=1).tolist()
-    prompt_window = inputs["input_ids"].shape[-1]
+    # Use API or local model for generation
+    if api_client is not None:
+        # API mode: process each question sequentially
+        raw_texts = []
+        boxes = []
+        generated_token_counts = []
+        input_lengths = []
+        total_latency = 0.0
 
-    start = time.perf_counter()
-    reset_generation_seed(DEFAULT_GENERATION_SEED)
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_scores=False,
-        )
-    tokenizer.padding_side = original_padding_side
-    elapsed = time.perf_counter() - start
-    sequences = generated.sequences
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id or eos_id
+        for messages in batch_messages:
+            start = time.perf_counter()
+            response = api_client.generate(messages, max_tokens=max_new_tokens)
+            elapsed = time.perf_counter() - start
+            total_latency += elapsed
 
-    raw_texts = []
-    boxes = []
-    generated_token_counts = []
-    for seq in sequences:
-        tokens = []
-        for token in seq[int(prompt_window) :].tolist():
-            if token in (eos_id, pad_id):
-                break
-            tokens.append(token)
-        raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-        raw_text = strip_assistant_prefix(strip_think_prefix(raw_text))
-        raw_texts.append(raw_text)
-        box = extract_box_answer(raw_text)
-        boxes.append(box)
-        generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
+            raw_text = clean_model_text(response.text)
+            raw_texts.append(raw_text)
+            boxes.append(extract_box_answer(raw_text))
+            generated_token_counts.append(response.completion_tokens)
+            input_lengths.append(response.prompt_tokens)
 
-    # Sum prompt lengths for all samples in the batch
-    total_prompt_tokens = sum(int(length) for length in input_lengths) if input_lengths else 0
-    total_generated_tokens = sum(generated_token_counts)
-    total_latency = elapsed
+        total_prompt_tokens = sum(input_lengths)
+        total_generated_tokens = sum(generated_token_counts)
+    else:
+        import torch
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
+        attention = inputs["attention_mask"]
+        input_lengths = attention.sum(dim=1).tolist()
+        prompt_window = inputs["input_ids"].shape[-1]
+
+        start = time.perf_counter()
+        reset_generation_seed(DEFAULT_GENERATION_SEED)
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        tokenizer.padding_side = original_padding_side
+        total_latency = time.perf_counter() - start
+        sequences = generated.sequences
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+
+        raw_texts = []
+        boxes = []
+        generated_token_counts = []
+        for seq in sequences:
+            tokens = []
+            for token in seq[int(prompt_window) :].tolist():
+                if token in (eos_id, pad_id):
+                    break
+                tokens.append(token)
+            raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            raw_text = strip_assistant_prefix(strip_think_prefix(raw_text))
+            raw_texts.append(raw_text)
+            box = extract_box_answer(raw_text)
+            boxes.append(box)
+            generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
+
+        total_prompt_tokens = sum(int(length) for length in input_lengths) if input_lengths else 0
+        total_generated_tokens = sum(generated_token_counts)
 
     for idx, question in enumerate(questions):
         final_answer, strict_valid = boxes[idx]
@@ -222,7 +290,7 @@ def run_full_batch_strategy(
                 "raw_response": raw_texts[idx],
                 "final_answer": final_answer,
                 "strict_valid": strict_valid,
-                "latency": elapsed,
+                "latency": total_latency / len(questions),
                 "prompt_tokens": int(input_lengths[idx]),
                 "generated_tokens": generated_token_counts[idx],
             }
@@ -243,12 +311,13 @@ def run_full_batch_strategy(
 
 def run_batch_multi_strategy(
     items: List[Dict[str, Any]],
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
     strategy_name: str = "batch",
     dataset: str = None,
+    api_client: Optional["APIClient"] = None,
 ) -> StrategyResult:
     question_lookup = {
         item["qid"]: Question(
@@ -265,63 +334,97 @@ def run_batch_multi_strategy(
     answers_text: Dict[str, str] = {}
     per_question: List[Dict[str, Any]] = []
 
+    # Build prompts for all items
+    batch_messages: List[List[Dict[str, str]]] = []
     batch_chat_prompts: List[str] = []
     for item in items:
         q = question_lookup[item["qid"]]
         system_prompt, user_prompt = build_single_prompt(item["context"], q, dataset)
-        batch_chat_prompts.append(
-            build_chat_prompt(
-                tokenizer,
-                user_prompt,
-                system_prompt=system_prompt,
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        batch_messages.append(messages)
+        if tokenizer is not None:
+            batch_chat_prompts.append(
+                build_chat_prompt(
+                    tokenizer,
+                    user_prompt,
+                    system_prompt=system_prompt,
+                )
             )
-        )
+        else:
+            batch_chat_prompts.append(str(messages))
 
-    original_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
-    inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
-    attention = inputs["attention_mask"]
-    input_lengths = attention.sum(dim=1).tolist()
-    prompt_window = inputs["input_ids"].shape[-1]
+    # Use API or local model for generation
+    if api_client is not None:
+        # API mode: process each item sequentially
+        raw_texts = []
+        boxes = []
+        generated_token_counts = []
+        input_lengths = []
+        total_latency = 0.0
 
-    start = time.perf_counter()
-    reset_generation_seed(DEFAULT_GENERATION_SEED)
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_scores=False,
-        )
-    tokenizer.padding_side = original_padding_side
-    elapsed = time.perf_counter() - start
-    sequences = generated.sequences
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id or eos_id
+        for messages in batch_messages:
+            start = time.perf_counter()
+            response = api_client.generate(messages, max_tokens=max_new_tokens)
+            elapsed = time.perf_counter() - start
+            total_latency += elapsed
 
-    raw_texts = []
-    boxes = []
-    generated_token_counts = []
-    for seq in sequences:
-        tokens = []
-        for token in seq[int(prompt_window) :].tolist():
-            if token in (eos_id, pad_id):
-                break
-            tokens.append(token)
-        raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-        raw_text = clean_model_text(raw_text)
-        raw_texts.append(raw_text)
-        box = extract_box_answer(raw_text)
-        boxes.append(box)
-        generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
+            raw_text = clean_model_text(response.text)
+            raw_texts.append(raw_text)
+            boxes.append(extract_box_answer(raw_text))
+            generated_token_counts.append(response.completion_tokens)
+            input_lengths.append(response.prompt_tokens)
 
-    total_prompt_tokens = sum(int(length) for length in input_lengths) if input_lengths else 0
-    total_generated_tokens = sum(generated_token_counts)
-    total_latency = elapsed
+        total_prompt_tokens = sum(input_lengths)
+        total_generated_tokens = sum(generated_token_counts)
+    else:
+        import torch
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(batch_chat_prompts, return_tensors="pt", padding=True).to(model.device)
+        attention = inputs["attention_mask"]
+        input_lengths = attention.sum(dim=1).tolist()
+        prompt_window = inputs["input_ids"].shape[-1]
+
+        start = time.perf_counter()
+        reset_generation_seed(DEFAULT_GENERATION_SEED)
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        tokenizer.padding_side = original_padding_side
+        total_latency = time.perf_counter() - start
+        sequences = generated.sequences
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+
+        raw_texts = []
+        boxes = []
+        generated_token_counts = []
+        for seq in sequences:
+            tokens = []
+            for token in seq[int(prompt_window) :].tolist():
+                if token in (eos_id, pad_id):
+                    break
+                tokens.append(token)
+            raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            raw_text = clean_model_text(raw_text)
+            raw_texts.append(raw_text)
+            box = extract_box_answer(raw_text)
+            boxes.append(box)
+            generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
+
+        total_prompt_tokens = sum(int(length) for length in input_lengths) if input_lengths else 0
+        total_generated_tokens = sum(generated_token_counts)
 
     for idx, item in enumerate(items):
         qid = item["qid"]
@@ -358,12 +461,13 @@ def run_batch_multi_strategy(
 
 def run_sequential_multi_strategy(
     items: List[Dict[str, Any]],
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
     strategy_name: str = "sequential",
     dataset: str = None,
+    api_client: Optional["APIClient"] = None,
 ) -> StrategyResult:
     question_lookup = {
         item["qid"]: Question(
@@ -383,6 +487,9 @@ def run_sequential_multi_strategy(
     total_latency = 0.0
     detail_records: List[Dict[str, Any]] = []
 
+    # CMB uses direct answer format without <answer> tags
+    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
+
     # Only squad dataset has "unknown" labels
     extractive_datasets = {"squad"}
     if dataset in extractive_datasets:
@@ -390,10 +497,16 @@ def run_sequential_multi_strategy(
     else:
         unknown_instruction = ""
 
-    system_message = (
-        f"You are a helpful assistant that answers questions given background passages.\n"
-        f"Provide the answer with format <answer>text</answer>.{unknown_instruction}"
-    )
+    if use_direct_format:
+        system_message = (
+            f"You are a helpful medical assistant that answers questions given background passages.\n"
+            f"Provide the answer directly without any special formatting."
+        )
+    else:
+        system_message = (
+            f"You are a helpful assistant that answers questions given background passages.\n"
+            f"Provide the answer with format <answer>text</answer>.{unknown_instruction}"
+        )
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
 
@@ -401,49 +514,60 @@ def run_sequential_multi_strategy(
         user_message = f"Context ({item['qid']}):\n{item['context']}\nQuestion ({item['qid']}): {item['question']}"
         messages.append({"role": "user", "content": user_message})
 
-        chat_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=(not USE_THINK_TOKENS),
-        )
-
-        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
-        prompt_tokens = inputs["input_ids"].shape[-1]
-        start = time.perf_counter()
-        reset_generation_seed(DEFAULT_GENERATION_SEED)
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_scores=False,
+        # Use API or local model for generation
+        if api_client is not None:
+            start = time.perf_counter()
+            response = api_client.generate(messages, max_tokens=max_new_tokens)
+            elapsed = time.perf_counter() - start
+            raw_response = clean_model_text(response.text)
+            prompt_tokens = response.prompt_tokens
+            gen_tokens = response.completion_tokens
+            chat_prompt = str(messages)  # For logging
+        else:
+            import torch
+            chat_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=(not USE_THINK_TOKENS),
             )
-        elapsed = time.perf_counter() - start
-        sequences = generated.sequences
-        generated_part = sequences[:, prompt_tokens:]
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id or eos_id
-        trimmed_tokens: List[int] = []
-        for token in generated_part[0].tolist():
-            if token in (eos_id, pad_id):
-                break
-            trimmed_tokens.append(token)
-        raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
-        raw_response = clean_model_text(raw_response)
-        final_answer, strict_valid = extract_box_answer(raw_response)
 
+            inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+            prompt_tokens = inputs["input_ids"].shape[-1]
+            start = time.perf_counter()
+            reset_generation_seed(DEFAULT_GENERATION_SEED)
+            with torch.no_grad():
+                generated = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                )
+            elapsed = time.perf_counter() - start
+            sequences = generated.sequences
+            generated_part = sequences[:, prompt_tokens:]
+            eos_id = tokenizer.eos_token_id
+            pad_id = tokenizer.pad_token_id or eos_id
+            trimmed_tokens: List[int] = []
+            for token in generated_part[0].tolist():
+                if token in (eos_id, pad_id):
+                    break
+                trimmed_tokens.append(token)
+            raw_response = tokenizer.decode(trimmed_tokens, skip_special_tokens=True).strip()
+            raw_response = clean_model_text(raw_response)
+            gen_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
+
+        final_answer, strict_valid = extract_box_answer(raw_response)
         messages.append({"role": "assistant", "content": raw_response})
 
         qid = item["qid"]
         answer_records[qid] = (final_answer, strict_valid)
         answers_text[qid] = final_answer
         prompt_token_lengths.append(prompt_tokens)
-        gen_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
         total_generated_tokens += gen_tokens
         total_latency += elapsed
 

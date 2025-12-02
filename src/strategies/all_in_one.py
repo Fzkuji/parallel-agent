@@ -4,10 +4,7 @@ import os
 import re
 import time
 import textwrap
-from typing import Any, Dict, List, Tuple
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.models import Question
 from src.inference import USE_THINK_TOKENS
@@ -21,6 +18,11 @@ from src.utils import (
     clean_model_text,
 )
 
+if TYPE_CHECKING:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from src.api_client import APIClient
+
 
 # Only squad dataset has "unknown" labels
 EXTRACTIVE_DATASETS = {"squad"}
@@ -28,17 +30,24 @@ EXTRACTIVE_DATASETS = {"squad"}
 # Datasets where answers should be extracted from context (not freely generated)
 EXTRACTIVE_QA_DATASETS = {"squad", "quac", "hotpot"}
 
+# Datasets that use direct answer format (no <answer> tags required)
+DIRECT_ANSWER_DATASETS = {"cmb"}
+
 
 def run_all_in_one_strategy(
     background: str,
     questions,
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
     dataset: str = None,
+    api_client: Optional["APIClient"] = None,
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
+
+    # CMB uses direct answer format without <answer> tags
+    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
 
     # Only extractive QA datasets allow "unknown" responses
     if dataset in EXTRACTIVE_DATASETS:
@@ -52,19 +61,32 @@ def run_all_in_one_strategy(
     else:
         extract_rule = ""
 
-    instructions = (
-        f"You are a helpful assistant that answers multiple questions from a single background.\n"
-        f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
-        f"Example:\n"
-        f"Q1: <answer>Paris</answer>\n"
-        f"Q2: <answer>42</answer>\n\n"
-        f"Rules:\n"
-        f"- Use the exact question ID (e.g., Q1, Q2)\n"
-        f"- Put answer inside <answer></answer> tags\n"
-        f"{extract_rule}"
-        f"{unknown_rule}"
-        f"- One answer per line, no extra text"
-    )
+    if use_direct_format:
+        instructions = (
+            f"You are a helpful medical assistant that answers multiple questions from a single background.\n"
+            f"Answer each question using exactly this format: QID: answer_text\n\n"
+            f"Example:\n"
+            f"Q1: Paris\n"
+            f"Q2: 42\n\n"
+            f"Rules:\n"
+            f"- Use the exact question ID (e.g., Q1, Q2)\n"
+            f"- Put answer directly after the colon\n"
+            f"- One answer per line, no extra text"
+        )
+    else:
+        instructions = (
+            f"You are a helpful assistant that answers multiple questions from a single background.\n"
+            f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
+            f"Example:\n"
+            f"Q1: <answer>Paris</answer>\n"
+            f"Q2: <answer>42</answer>\n\n"
+            f"Rules:\n"
+            f"- Use the exact question ID (e.g., Q1, Q2)\n"
+            f"- Put answer inside <answer></answer> tags\n"
+            f"{extract_rule}"
+            f"{unknown_rule}"
+            f"- One answer per line, no extra text"
+        )
     question_lines = [f"Question ({q.qid}): {q.text.strip()}" for q in questions]
     user_message = textwrap.dedent(
         f"""Background:
@@ -79,44 +101,62 @@ Questions:
         {"role": "system", "content": instructions},
         {"role": "user", "content": user_message},
     ]
-    chat_prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=(not USE_THINK_TOKENS),
-    )
 
-    inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
-    prompt_tokens = inputs["input_ids"].shape[-1]
-    start = time.perf_counter()
-    reset_generation_seed(DEFAULT_GENERATION_SEED)
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_scores=False,
+    # Use API or local model for generation
+    if api_client is not None:
+        start = time.perf_counter()
+        response = api_client.generate(messages, max_tokens=max_new_tokens)
+        elapsed = time.perf_counter() - start
+        raw_response = clean_model_text(response.text)
+        prompt_tokens = response.prompt_tokens
+        generated_tokens = response.completion_tokens
+        chat_prompt = str(messages)  # For logging
+    else:
+        import torch
+        chat_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=(not USE_THINK_TOKENS),
         )
-    elapsed = time.perf_counter() - start
 
-    sequences = generated.sequences
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id or eos_id
-    gen_tokens = sequences[:, prompt_tokens:]
-    trimmed: List[int] = []
-    for token in gen_tokens[0].tolist():
-        if token in (eos_id, pad_id):
-            break
-        trimmed.append(token)
-    raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
-    raw_response = clean_model_text(raw_response)
+        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+        prompt_tokens = inputs["input_ids"].shape[-1]
+        start = time.perf_counter()
+        reset_generation_seed(DEFAULT_GENERATION_SEED)
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        elapsed = time.perf_counter() - start
 
-    # Match format: Q1: <answer>text</answer>
-    pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+        sequences = generated.sequences
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+        gen_tokens = sequences[:, prompt_tokens:]
+        trimmed: List[int] = []
+        for token in gen_tokens[0].tolist():
+            if token in (eos_id, pad_id):
+                break
+            trimmed.append(token)
+        raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
+        raw_response = clean_model_text(raw_response)
+        generated_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
+
+    # Match format based on dataset type
+    if use_direct_format:
+        # Match format: Q1: answer_text (one line per answer)
+        pattern = re.compile(r"(Q\d+)\s*:\s*(.+?)(?=\n|$)", re.IGNORECASE)
+    else:
+        # Match format: Q1: <answer>text</answer>
+        pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
     matches = pattern.findall(raw_response)
     found = {}
     for qid, ans in matches:
@@ -149,7 +189,7 @@ Questions:
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
-                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+                "generated_tokens": generated_tokens,
             }
         )
 
@@ -158,7 +198,7 @@ Questions:
         name="all_in_one",
         answers=answers_text,
         prompt_tokens=prompt_tokens,
-        generated_tokens=int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+        generated_tokens=generated_tokens,
         latency=elapsed,
         batches=1,
         metrics=metrics,
@@ -168,12 +208,13 @@ Questions:
 
 def run_all_in_one_multi_strategy(
     items,
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    tokenizer: "AutoTokenizer",
+    model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
     strategy_name: str = "all_in_one",
     dataset: str = None,
+    api_client: Optional["APIClient"] = None,
 ) -> StrategyResult:
     question_lookup = {
         item["qid"]: Question(
@@ -190,6 +231,9 @@ def run_all_in_one_multi_strategy(
     answer_records: Dict[str, Tuple[str, bool]] = {}
     detail_records: List[Dict[str, Any]] = []
 
+    # CMB uses direct answer format without <answer> tags
+    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
+
     # Only extractive QA datasets allow "unknown" responses
     if dataset in EXTRACTIVE_DATASETS:
         unknown_rule = "- If unknown, use <answer>unknown</answer>\n"
@@ -202,19 +246,32 @@ def run_all_in_one_multi_strategy(
     else:
         extract_rule = ""
 
-    instructions = (
-        f"You are a helpful assistant that answers multiple questions.\n"
-        f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
-        f"Example:\n"
-        f"Q1: <answer>Paris</answer>\n"
-        f"Q2: <answer>42</answer>\n\n"
-        f"Rules:\n"
-        f"- Use the exact question ID (e.g., Q1, Q2)\n"
-        f"- Put answer inside <answer></answer> tags\n"
-        f"{extract_rule}"
-        f"{unknown_rule}"
-        f"- One answer per line, no extra text"
-    )
+    if use_direct_format:
+        instructions = (
+            f"You are a helpful medical assistant that answers multiple questions.\n"
+            f"Answer each question using exactly this format: QID: answer_text\n\n"
+            f"Example:\n"
+            f"Q1: Paris\n"
+            f"Q2: 42\n\n"
+            f"Rules:\n"
+            f"- Use the exact question ID (e.g., Q1, Q2)\n"
+            f"- Put answer directly after the colon\n"
+            f"- One answer per line, no extra text"
+        )
+    else:
+        instructions = (
+            f"You are a helpful assistant that answers multiple questions.\n"
+            f"Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
+            f"Example:\n"
+            f"Q1: <answer>Paris</answer>\n"
+            f"Q2: <answer>42</answer>\n\n"
+            f"Rules:\n"
+            f"- Use the exact question ID (e.g., Q1, Q2)\n"
+            f"- Put answer inside <answer></answer> tags\n"
+            f"{extract_rule}"
+            f"{unknown_rule}"
+            f"- One answer per line, no extra text"
+        )
 
     blocks = []
     for item in items:
@@ -225,44 +282,62 @@ def run_all_in_one_multi_strategy(
         {"role": "system", "content": instructions},
         {"role": "user", "content": user_message},
     ]
-    chat_prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=(not USE_THINK_TOKENS),
-    )
 
-    inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
-    prompt_tokens = inputs["input_ids"].shape[-1]
-    start = time.perf_counter()
-    reset_generation_seed(DEFAULT_GENERATION_SEED)
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_scores=False,
+    # Use API or local model for generation
+    if api_client is not None:
+        start = time.perf_counter()
+        response = api_client.generate(messages, max_tokens=max_new_tokens)
+        elapsed = time.perf_counter() - start
+        raw_response = clean_model_text(response.text)
+        prompt_tokens = response.prompt_tokens
+        generated_tokens = response.completion_tokens
+        chat_prompt = str(messages)  # For logging
+    else:
+        import torch
+        chat_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=(not USE_THINK_TOKENS),
         )
-    elapsed = time.perf_counter() - start
 
-    sequences = generated.sequences
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id or eos_id
-    gen_tokens = sequences[:, prompt_tokens:]
-    trimmed: List[int] = []
-    for token in gen_tokens[0].tolist():
-        if token in (eos_id, pad_id):
-            break
-        trimmed.append(token)
-    raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
-    raw_response = clean_model_text(raw_response)
+        inputs = tokenizer(chat_prompt, return_tensors="pt").to(model.device)
+        prompt_tokens = inputs["input_ids"].shape[-1]
+        start = time.perf_counter()
+        reset_generation_seed(DEFAULT_GENERATION_SEED)
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
+        elapsed = time.perf_counter() - start
 
-    # Match format: Q1: <answer>text</answer>
-    pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+        sequences = generated.sequences
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id or eos_id
+        gen_tokens = sequences[:, prompt_tokens:]
+        trimmed: List[int] = []
+        for token in gen_tokens[0].tolist():
+            if token in (eos_id, pad_id):
+                break
+            trimmed.append(token)
+        raw_response = tokenizer.decode(trimmed, skip_special_tokens=True).strip()
+        raw_response = clean_model_text(raw_response)
+        generated_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
+
+    # Match format based on dataset type
+    if use_direct_format:
+        # Match format: Q1: answer_text (one line per answer)
+        pattern = re.compile(r"(Q\d+)\s*:\s*(.+?)(?=\n|$)", re.IGNORECASE)
+    else:
+        # Match format: Q1: <answer>text</answer>
+        pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
     matches = pattern.findall(raw_response)
 
     for item in items:
@@ -290,7 +365,7 @@ def run_all_in_one_multi_strategy(
                 "strict_valid": strict_valid,
                 "latency": elapsed,
                 "prompt_tokens": prompt_tokens,
-                "generated_tokens": int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+                "generated_tokens": generated_tokens,
             }
         )
 
@@ -299,7 +374,7 @@ def run_all_in_one_multi_strategy(
         name=strategy_name,
         answers=answers_text,
         prompt_tokens=prompt_tokens,
-        generated_tokens=int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1]),
+        generated_tokens=generated_tokens,
         latency=elapsed,
         batches=1,
         metrics=metrics,
