@@ -154,7 +154,11 @@ def extract_json_from_text(text: str) -> dict:
 
 
 def build_dependency_prompt(background: str, questions: List[Question]) -> str:
-    """Build prompt for LLM-based dependency inference."""
+    """Build prompt for LLM-based dependency inference.
+
+    The prompt asks the model to output edges ordered by importance (most important first).
+    The position in the list will be used to assign confidence scores.
+    """
     question_lines = [f"{q.qid}: {q.text.strip()}" for q in questions]
     prompt = textwrap.dedent(
         f"""
@@ -166,15 +170,15 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
         ```json
         {{
           "edges": [
-            {{"source": "Q1", "target": "Q3", "confidence": 0.72}},
-            {{"source": "Q2", "target": "Q4", "confidence": 0.85}}
+            {{"source": "Q1", "target": "Q3"}},
+            {{"source": "Q2", "target": "Q4"}}
           ]
         }}
         ```
 
         规则：
         - 只能使用给定问题的 ID 作为 source/target。
-        - confidence 取值 0~1 的数字。
+        - **按依赖关系的重要性从高到低排序输出**（最重要的依赖放在最前面）。
         - 无需依赖的题目可省略（返回空edges数组）。
         - 禁止引用不存在的 ID，禁止循环依赖。
         - 不需要额外解释或分析，只输出```json代码块。
@@ -266,17 +270,23 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             return heuristic.generate_edges(background, questions, metadata)
         edges_data = payload.get("edges", [])
         edges: List[EdgeCandidate] = []
-        for item in edges_data:
+        total_edges = len(edges_data)
+        for idx, item in enumerate(edges_data):
             try:
                 source = item["source"]
                 target = item["target"]
             except KeyError:
                 continue
-            val = item.get("confidence", 0.7)
-            try:
-                confidence = float(0.7 if val is None else val)
-            except (TypeError, ValueError):
-                confidence = 0.7
+            # Assign confidence based on position: first edge gets highest confidence
+            # If model provides explicit confidence, use it; otherwise use position-based
+            if "confidence" in item and item["confidence"] is not None:
+                try:
+                    confidence = float(item["confidence"])
+                except (TypeError, ValueError):
+                    confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            else:
+                # Position-based: first edge = 1.0, last edge = 0.5
+                confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
         return edges
 
@@ -535,17 +545,23 @@ class APILLMDependencyGenerator(DependencyGraphGenerator):
 
         edges_data = payload.get("edges", [])
         edges: List[EdgeCandidate] = []
-        for item in edges_data:
+        total_edges = len(edges_data)
+        for idx, item in enumerate(edges_data):
             try:
                 source = item["source"]
                 target = item["target"]
             except KeyError:
                 continue
-            val = item.get("confidence", 0.7)
-            try:
-                confidence = float(0.7 if val is None else val)
-            except (TypeError, ValueError):
-                confidence = 0.7
+            # Assign confidence based on position: first edge gets highest confidence
+            # If model provides explicit confidence, use it; otherwise use position-based
+            if "confidence" in item and item["confidence"] is not None:
+                try:
+                    confidence = float(item["confidence"])
+                except (TypeError, ValueError):
+                    confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            else:
+                # Position-based: first edge = 1.0, last edge = 0.5
+                confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
 
         return edges

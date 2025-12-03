@@ -112,14 +112,15 @@ class LLMDependencyGenerator(DependencyGraphGenerator):
             输出要求：
             - 仅使用提供的问题 ID（例如 "Q1"）。
             - 如果某问题可独立回答，可以不给它添加依赖。
+            - **按依赖关系的重要性从高到低排序输出**（最重要的依赖放在最前面）。
             - 返回必须是 JSON，格式如下：
               {{
                 "edges": [
-                  {{"source": "Q1", "target": "Q3", "confidence": 0.72, "rationale": "Q3 需要 Q1 的事实"}},
+                  {{"source": "Q1", "target": "Q3", "rationale": "Q3 需要 Q1 的事实"}},
                   ...
                 ]
               }}
-            - confidence 范围 0~1，表示依赖可信度；rationale 可简要说明原因。
+            - rationale 可简要说明原因（可选）。
             - 不能出现循环依赖；若不确定可保持稀疏。
 
             背景：
@@ -186,14 +187,24 @@ class LLMDependencyGenerator(DependencyGraphGenerator):
             payload = self._extract_json_payload(text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Failed to parse LLM JSON output: {text}") from exc
+        edges_data = payload.get("edges", [])
         edges: List[EdgeCandidate] = []
-        for item in payload.get("edges", []):
+        total_edges = len(edges_data)
+        for idx, item in enumerate(edges_data):
             try:
                 source = item["source"]
                 target = item["target"]
             except KeyError:
                 continue
-            confidence = float(item.get("confidence", 0.7))
+            # Assign confidence based on position: first edge gets highest confidence
+            if "confidence" in item and item["confidence"] is not None:
+                try:
+                    confidence = float(item["confidence"])
+                except (TypeError, ValueError):
+                    confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            else:
+                # Position-based: first edge = 1.0, last edge = 0.5
+                confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
             rationale = item.get("rationale")
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence, rationale=rationale))
         return edges
