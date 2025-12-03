@@ -158,6 +158,7 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
 
     The prompt asks the model to output edges ordered by importance (most important first).
     The position in the list will be used to assign confidence scores.
+    Uses compact format: {"source": "target"} instead of {"source": "Q1", "target": "Q2"}.
     """
     question_lines = [f"{q.qid}: {q.text.strip()}" for q in questions]
     prompt = textwrap.dedent(
@@ -166,22 +167,16 @@ def build_dependency_prompt(background: str, questions: List[Question]) -> str:
 
         **重要：你的回答必须是markdown代码块格式，以```json开头，以```结尾。**
 
-        输出格式示例：
+        输出格式示例（source依赖于target，即回答source时需要先知道target的答案）：
         ```json
-        {{
-          "edges": [
-            {{"source": "Q1", "target": "Q3"}},
-            {{"source": "Q2", "target": "Q4"}}
-          ]
-        }}
+        {{"edges": [{{"Q3": "Q1"}}, {{"Q4": "Q2"}}]}}
         ```
 
         规则：
-        - 只能使用给定问题的 ID 作为 source/target。
-        - **按依赖关系的重要性从高到低排序输出**（最重要的依赖放在最前面）。
-        - 无需依赖的题目可省略（返回空edges数组）。
-        - 禁止引用不存在的 ID，禁止循环依赖。
-        - 不需要额外解释或分析，只输出```json代码块。
+        - 格式为 {{"被依赖问题ID": "依赖问题ID"}}，表示回答前者需要后者的答案。
+        - **按依赖关系的重要性从高到低排序输出**。
+        - 无依赖返回空数组：{{"edges": []}}
+        - 禁止循环依赖。
 
         背景：
         {background.strip()}
@@ -272,21 +267,18 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
         edges: List[EdgeCandidate] = []
         total_edges = len(edges_data)
         for idx, item in enumerate(edges_data):
-            try:
-                source = item["source"]
-                target = item["target"]
-            except KeyError:
-                continue
-            # Assign confidence based on position: first edge gets highest confidence
-            # If model provides explicit confidence, use it; otherwise use position-based
-            if "confidence" in item and item["confidence"] is not None:
-                try:
-                    confidence = float(item["confidence"])
-                except (TypeError, ValueError):
-                    confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
+            if len(item) == 1:
+                target, source = next(iter(item.items()))
             else:
-                # Position-based: first edge = 1.0, last edge = 0.5
-                confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+                # Fallback to old format for compatibility
+                try:
+                    source = item["source"]
+                    target = item["target"]
+                except KeyError:
+                    continue
+            # Position-based confidence: first edge = 1.0, last edge = 0.5
+            confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
         return edges
 
@@ -547,21 +539,18 @@ class APILLMDependencyGenerator(DependencyGraphGenerator):
         edges: List[EdgeCandidate] = []
         total_edges = len(edges_data)
         for idx, item in enumerate(edges_data):
-            try:
-                source = item["source"]
-                target = item["target"]
-            except KeyError:
-                continue
-            # Assign confidence based on position: first edge gets highest confidence
-            # If model provides explicit confidence, use it; otherwise use position-based
-            if "confidence" in item and item["confidence"] is not None:
-                try:
-                    confidence = float(item["confidence"])
-                except (TypeError, ValueError):
-                    confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
+            if len(item) == 1:
+                target, source = next(iter(item.items()))
             else:
-                # Position-based: first edge = 1.0, last edge = 0.5
-                confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+                # Fallback to old format for compatibility
+                try:
+                    source = item["source"]
+                    target = item["target"]
+                except KeyError:
+                    continue
+            # Position-based confidence: first edge = 1.0, last edge = 0.5
+            confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
             edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
 
         return edges

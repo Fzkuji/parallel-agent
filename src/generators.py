@@ -107,29 +107,24 @@ class LLMDependencyGenerator(DependencyGraphGenerator):
         question_lines = [f"{q.qid}: {q.text.strip()}" for q in questions]
         prompt = textwrap.dedent(
             f"""
-            你将看到一段背景文本以及针对该背景的若干个问题。目标是推断回答这些问题时是否需要引用其他问题的答案。
+            你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
 
-            输出要求：
-            - 仅使用提供的问题 ID（例如 "Q1"）。
-            - 如果某问题可独立回答，可以不给它添加依赖。
-            - **按依赖关系的重要性从高到低排序输出**（最重要的依赖放在最前面）。
-            - 返回必须是 JSON，格式如下：
-              {{
-                "edges": [
-                  {{"source": "Q1", "target": "Q3", "rationale": "Q3 需要 Q1 的事实"}},
-                  ...
-                ]
-              }}
-            - rationale 可简要说明原因（可选）。
-            - 不能出现循环依赖；若不确定可保持稀疏。
+            输出格式示例（source依赖于target，即回答source时需要先知道target的答案）：
+            {{"edges": [{{"Q3": "Q1"}}, {{"Q4": "Q2"}}]}}
+
+            规则：
+            - 格式为 {{"被依赖问题ID": "依赖问题ID"}}，表示回答前者需要后者的答案。
+            - **按依赖关系的重要性从高到低排序输出**。
+            - 无依赖返回空数组：{{"edges": []}}
+            - 禁止循环依赖。
 
             背景：
             {background.strip()}
 
-            问题列表：
+            问题：
             {os.linesep.join(question_lines)}
 
-            请直接输出 JSON，不要添加多余解释。
+            请直接输出JSON：
             """
         ).strip()
         return prompt
@@ -191,22 +186,19 @@ class LLMDependencyGenerator(DependencyGraphGenerator):
         edges: List[EdgeCandidate] = []
         total_edges = len(edges_data)
         for idx, item in enumerate(edges_data):
-            try:
-                source = item["source"]
-                target = item["target"]
-            except KeyError:
-                continue
-            # Assign confidence based on position: first edge gets highest confidence
-            if "confidence" in item and item["confidence"] is not None:
-                try:
-                    confidence = float(item["confidence"])
-                except (TypeError, ValueError):
-                    confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
+            if len(item) == 1:
+                target, source = next(iter(item.items()))
             else:
-                # Position-based: first edge = 1.0, last edge = 0.5
-                confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
-            rationale = item.get("rationale")
-            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence, rationale=rationale))
+                # Fallback to old format for compatibility
+                try:
+                    source = item["source"]
+                    target = item["target"]
+                except KeyError:
+                    continue
+            # Position-based confidence: first edge = 1.0, last edge = 0.5
+            confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
         return edges
 
 
