@@ -39,7 +39,7 @@ Use the `--bert-*` flags (model name, thresholds, token caps, and cost weight) t
 
 ### Key arguments
 
-- `--dataset {squad,hotpot,cmb}`: choose dataset. Hotpot enables multi-context mode (each question has its own context). CMB is Chinese Medical Benchmark with clinical case analysis.
+- `--dataset {squad,hotpot,quac,cmb,quality,drop}`: choose dataset. Hotpot enables multi-context mode (each question has its own context). CMB is Chinese Medical Benchmark with clinical case analysis. QuALITY is long-context reading comprehension (~5000 words per article). DROP requires discrete reasoning (arithmetic, counting, sorting).
 - `--model-name`: HF model id or local path.
 - `--context-count`: number of sampled groups/steps.
 - `--min-questions / --max-questions`: number of questions per group.
@@ -122,6 +122,56 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --log-level INFO
 ```
 
+### QuALITY (Long-Context Reading Comprehension)
+
+QuALITY is a challenging long-context multiple-choice reading comprehension dataset. Each article is ~5000 words with ~18 questions per article. Use `--quality-hard-only` to focus on difficult questions that require full document understanding.
+
+```bash
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset quality \
+  --split validation \
+  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --context-count 20 \
+  --min-questions 5 \
+  --max-questions 10 \
+  --max-new-tokens 256 \
+  --json-out outputs_json/results_quality.json \
+  --log-level INFO
+```
+
+For hard questions only (recommended for testing complex reasoning):
+
+```bash
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset quality \
+  --split validation \
+  --quality-hard-only \
+  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --context-count 20 \
+  --min-questions 5 \
+  --max-questions 10 \
+  --max-new-tokens 256 \
+  --json-out outputs_json/results_quality_hard.json \
+  --log-level INFO
+```
+
+### DROP (Discrete Reasoning Over Paragraphs)
+
+DROP is a reading comprehension benchmark requiring discrete reasoning (arithmetic, counting, sorting). Each passage has ~16 questions on average.
+
+```bash
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset drop \
+  --split validation \
+  --model-name Qwen/Qwen2.5-14B-Instruct \
+  --context-count 50 \
+  --min-questions 5 \
+  --max-questions 10 \
+  --max-new-tokens 128 \
+  --json-out outputs_json/results_drop.json \
+  --log-level INFO
+```
+
 ## scripts/run_parallel.py
 
 Single-context dependency pipeline with heuristic/LLM edges, cost-aware scheduling, and optional HTML output. Useful for debugging or exploring dependency-based scheduling on individual contexts.
@@ -165,7 +215,7 @@ python scripts/test_bert_dependencies.py \
 
 Metrics are automatically selected based on dataset:
 
-### SQuAD / HotpotQA (Short-form QA)
+### SQuAD / HotpotQA / QuAC / QuALITY / DROP (Short-form QA)
 | Metric | Description |
 |--------|-------------|
 | **EM (Strict)** | Exact match after normalization |

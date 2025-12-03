@@ -29,8 +29,10 @@ from src import (
     LocalLLMDependencyGenerator,
     APILLMDependencyGenerator,
     load_cmb_groups,
+    load_drop_groups,
     load_hotpot_groups,
     load_quac_groups,
+    load_quality_groups,
     load_squad_random_questions,
     build_questions_from_group,
     load_squad_groups,
@@ -57,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         description="Compare sequential, batch, and dependency-aware QA strategies with optional BERT dependencies.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dataset", choices=["squad", "hotpot", "quac", "cmb"], default="squad", help="Dataset to evaluate.")
+    parser.add_argument("--dataset", choices=["squad", "hotpot", "quac", "cmb", "quality", "drop"], default="squad", help="Dataset to evaluate.")
     parser.add_argument("--model-name", default="Qwen/Qwen3-4B", help="Hugging Face model identifier or local path.")
     parser.add_argument("--split", default="train", help="Dataset split to sample.")
     parser.add_argument("--context-count", type=int, default=3, help="Number of contexts to process.")
@@ -71,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hotpot-subset", default="distractor", help="HotpotQA subset (e.g., distractor).")
     parser.add_argument("--cmb-subset", default="CMB-Clin", help="CMB subset (e.g., CMB-Clin).")
+    parser.add_argument("--quality-hard-only", action="store_true", help="For QuALITY, only use hard questions.")
 
     parser.add_argument("--cost-weight", type=float, default=0.0, help="Cost penalty weight for dependency selection (set to 0 to let model decide).")
     parser.add_argument("--min-confidence", type=float, default=0.45, help="Minimum edge confidence.")
@@ -614,6 +617,11 @@ def generate_output_folder_name(args: argparse.Namespace, timestamp: str) -> str
         dataset_id = f"cmb_{args.cmb_subset}_{args.split}"
     elif args.dataset == "quac":
         dataset_id = f"quac_{args.split}"
+    elif args.dataset == "quality":
+        hard_suffix = "_hard" if args.quality_hard_only else ""
+        dataset_id = f"quality{hard_suffix}_{args.split}"
+    elif args.dataset == "drop":
+        dataset_id = f"drop_{args.split}"
     else:
         dataset_id = f"squad_{args.split}"
     # Format: timestamp_dataset_model_n{samples}_q{questions}
@@ -652,6 +660,8 @@ def save_experiment_results(
         config["hotpot_subset"] = args.hotpot_subset
     elif args.dataset == "cmb":
         config["cmb_subset"] = args.cmb_subset
+    elif args.dataset == "quality":
+        config["quality_hard_only"] = args.quality_hard_only
 
     # Save config to readable txt file
     config_txt_path = output_dir / "config.txt"
@@ -665,6 +675,13 @@ def save_experiment_results(
             f.write(f"  - HuggingFace: hotpotqa/hotpot_qa ({args.hotpot_subset})\n")
         elif args.dataset == "cmb":
             f.write(f"  - HuggingFace: FreedomIntelligence/CMB ({args.cmb_subset})\n")
+        elif args.dataset == "quality":
+            hard_str = " (hard only)" if args.quality_hard_only else ""
+            f.write(f"  - HuggingFace: emozilla/quality{hard_str}\n")
+        elif args.dataset == "drop":
+            f.write(f"  - HuggingFace: ucinlp/drop\n")
+        elif args.dataset == "quac":
+            f.write(f"  - HuggingFace: quac\n")
         else:
             f.write(f"  - HuggingFace: rajpurkar/squad\n")
         f.write(f"  - Split: {args.split}\n")
@@ -811,6 +828,23 @@ def main() -> None:
         )
     elif args.dataset == "quac":
         contexts = load_quac_groups(
+            args.split,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
+    elif args.dataset == "quality":
+        contexts = load_quality_groups(
+            args.split,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+            hard_only=args.quality_hard_only,
+        )
+    elif args.dataset == "drop":
+        contexts = load_drop_groups(
             args.split,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
