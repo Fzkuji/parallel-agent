@@ -318,11 +318,11 @@ class LMHeadOnlyTrainer:
 
         return {"loss": avg_loss, "num_tokens": num_tokens}
 
-    def train_epoch(self, dataloader: DataLoader, epoch: int) -> Dict[str, float]:
+    def train_epoch(self, dataloader: DataLoader, epoch: int, rank: int = 0) -> Dict[str, float]:
         total_loss = 0.0
         num_batches = 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
         for batch in pbar:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
@@ -352,14 +352,26 @@ class LMHeadOnlyTrainer:
         batch_size: int = 8,
         max_length: int = 512,
         save_dir: Optional[str] = "checkpoints_lmhead_only",
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> Dict[str, Any]:
-        if save_dir:
+        if save_dir and rank == 0:
             os.makedirs(save_dir, exist_ok=True)
+
+        # DDP sampler if distributed
+        sampler = None
+        shuffle = True
+        if distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            shuffle = False
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             collate_fn=lambda b: collate_fn(b, self.tokenizer, max_length),
             drop_last=True,
         )
@@ -371,25 +383,30 @@ class LMHeadOnlyTrainer:
         best_loss = float('inf')
 
         for epoch in range(1, num_epochs + 1):
-            logger.info(f"\n{'='*50}")
-            logger.info(f"Epoch {epoch}/{num_epochs} (LM Head Only)")
-            logger.info(f"{'='*50}")
+            if sampler is not None:
+                sampler.set_epoch(epoch)
 
-            metrics = self.train_epoch(train_loader, epoch)
+            if rank == 0:
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Epoch {epoch}/{num_epochs} (LM Head Only)")
+                logger.info(f"{'='*50}")
+
+            metrics = self.train_epoch(train_loader, epoch, rank=rank)
             history["train_loss"].append(metrics["loss"])
-            logger.info(f"Epoch {epoch} - Loss: {metrics['loss']:.4f}")
+            if rank == 0:
+                logger.info(f"Epoch {epoch} - Loss: {metrics['loss']:.4f}")
 
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
                 self.best_lm_head_state = _clone_state_dict(self.model.lm_head)
-                if save_dir:
+                if save_dir and rank == 0:
                     self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
 
         # Restore best state for in-memory evaluation
         if self.best_lm_head_state is not None:
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
 
-        if save_dir:
+        if save_dir and rank == 0:
             self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
             with open(os.path.join(save_dir, "training_history.json"), "w") as f:
                 json.dump(history, f, indent=2)
@@ -632,6 +649,7 @@ class CrossBatchTrainer:
         self,
         dataloader: DataLoader,
         epoch: int,
+        rank: int = 0,
     ) -> Dict[str, float]:
         """Train for one epoch."""
         self.cross_batch_module.train()
@@ -641,7 +659,7 @@ class CrossBatchTrainer:
         total_improvement = 0.0
         num_batches = 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
         for batch in pbar:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
@@ -697,6 +715,9 @@ class CrossBatchTrainer:
         max_length: int = 512,
         save_dir: Optional[str] = "checkpoints",
         eval_dataset: Optional[Dataset] = None,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> Dict[str, Any]:
         """
         Full training loop.
@@ -708,18 +729,30 @@ class CrossBatchTrainer:
             max_length: Maximum sequence length
             save_dir: Directory to save checkpoints
             eval_dataset: Optional evaluation dataset
+            distributed: Whether to use DDP
+            rank: Process rank
+            world_size: Total number of processes
 
         Returns:
             Training history
         """
-        if save_dir:
+        if save_dir and rank == 0:
             os.makedirs(save_dir, exist_ok=True)
+
+        # DDP sampler if distributed
+        sampler = None
+        shuffle = True
+        if distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            shuffle = False
 
         # Create dataloader
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             collate_fn=lambda b: collate_fn(b, self.tokenizer, max_length),
             drop_last=True,  # Ensure we always have full batches for cross-batch
         )
@@ -741,19 +774,24 @@ class CrossBatchTrainer:
         best_improvement = float('-inf')
 
         for epoch in range(1, num_epochs + 1):
-            logger.info(f"\n{'='*50}")
-            logger.info(f"Epoch {epoch}/{num_epochs}")
-            logger.info(f"{'='*50}")
+            if sampler is not None:
+                sampler.set_epoch(epoch)
 
-            metrics = self.train_epoch(train_loader, epoch)
+            if rank == 0:
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Epoch {epoch}/{num_epochs}")
+                logger.info(f"{'='*50}")
+
+            metrics = self.train_epoch(train_loader, epoch, rank=rank)
 
             history["train_loss"].append(metrics["loss"])
             history["baseline_loss"].append(metrics["baseline_loss"])
             history["improvement"].append(metrics["improvement"])
 
-            logger.info(f"Epoch {epoch} - Loss: {metrics['loss']:.4f}, "
-                       f"Baseline: {metrics['baseline_loss']:.4f}, "
-                       f"Improvement: {metrics['improvement']:.4f}")
+            if rank == 0:
+                logger.info(f"Epoch {epoch} - Loss: {metrics['loss']:.4f}, "
+                           f"Baseline: {metrics['baseline_loss']:.4f}, "
+                           f"Improvement: {metrics['improvement']:.4f}")
 
             # Save best model
             if metrics["improvement"] > best_improvement:
@@ -761,14 +799,14 @@ class CrossBatchTrainer:
                 self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module)
                 if self.train_lm_head and hasattr(self.model, 'lm_head'):
                     self.best_lm_head_state = _clone_state_dict(self.model.lm_head)
-                if save_dir:
+                if save_dir and rank == 0:
                     self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
                     logger.info(f"Saved best model with improvement: {best_improvement:.4f}")
-                else:
+                elif rank == 0:
                     logger.info(f"New best improvement: {best_improvement:.4f}")
 
             # Save periodic checkpoint
-            if save_dir and epoch % 5 == 0:
+            if save_dir and rank == 0 and epoch % 5 == 0:
                 self.save_checkpoint(os.path.join(save_dir, f"checkpoint_epoch{epoch}.pt"))
 
         # Restore best states for subsequent evaluation
@@ -777,7 +815,7 @@ class CrossBatchTrainer:
         if self.best_lm_head_state is not None and hasattr(self.model, 'lm_head'):
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
 
-        if save_dir:
+        if save_dir and rank == 0:
             # Save final model
             self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
 
