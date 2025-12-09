@@ -9,8 +9,9 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
   --batch-size    每卡 batch size (default: 8)
   --eval-samples  评估样本数 (default: 100)
   --lr            学习率 (default: 1e-4)
+  --save-dir      保存 checkpoint 的目录 (default: outputs/checkpoints)
 
-用法:
+训练用法:
   # 0.5B 模型 (单卡)
   python scripts/train_cross_batch.py
 
@@ -18,12 +19,20 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
   torchrun --nproc_per_node=8 scripts/train_cross_batch.py
 
   # 7B 模型 (8卡并行)
-  torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
-      --model Qwen/Qwen2.5-7B-Instruct \
-      --batch-size 2 \
-      --max-samples 10000 \
-      --epochs 1 \
-      --eval-samples 100
+  torchrun --nproc_per_node=8 scripts/train_cross_batch.py \\
+      --model Qwen/Qwen2.5-7B-Instruct \\
+      --batch-size 4 \\
+      --max-samples 50000 \\
+      --epochs 1 \\
+      --eval-samples 1000
+
+推理用法 (加载训练好的 checkpoint):
+  python scripts/compare_strategies.py \\
+      --model Qwen/Qwen2.5-7B-Instruct \\
+      --strategies collab_hidden \\
+      --collab-hidden-checkpoint outputs/checkpoints/Qwen_Qwen2.5-7B-Instruct_crossbatch.pt \\
+      --dataset squad \\
+      --max-contexts 100
 """
 import sys
 from pathlib import Path
@@ -61,6 +70,8 @@ def parse_args():
                         help='评估样本数 (default: 100)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='学习率 (default: 1e-4)')
+    parser.add_argument('--save-dir', type=str, default='outputs/checkpoints',
+                        help='保存 checkpoint 的目录 (default: outputs/checkpoints)')
     return parser.parse_args()
 
 
@@ -268,7 +279,7 @@ def main():
     )
     print_rank0(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}', rank)
 
-    # 只在 rank 0 上评估
+    # 只在 rank 0 上评估和保存
     if is_main_process(rank):
         metrics_crossbatch = evaluate_with_strategy(
             model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device,
@@ -277,6 +288,23 @@ def main():
         )
         all_results['crossbatch'] = metrics_crossbatch
         print(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}')
+
+        # 保存 checkpoint
+        os.makedirs(args.save_dir, exist_ok=True)
+        model_name = args.model.replace('/', '_')
+        checkpoint_path = os.path.join(args.save_dir, f'{model_name}_crossbatch.pt')
+        checkpoint = {
+            'cross_batch_module': trainer_crossbatch.cross_batch_module.state_dict(),
+            'lm_head': model_crossbatch.lm_head.state_dict(),
+            'config': {
+                'model': args.model,
+                'hidden_size': model_crossbatch.config.hidden_size,
+                'train_samples': args.max_samples,
+                'epochs': args.epochs,
+            },
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f'\nCheckpoint 已保存到: {checkpoint_path}')
 
     del trainer_crossbatch, model_crossbatch, cross_batch_module
     gc.collect()
