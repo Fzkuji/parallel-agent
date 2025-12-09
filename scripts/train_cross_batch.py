@@ -95,22 +95,24 @@ def print_rank0(msg, rank):
 def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_samples,
                            enable_cross_batch=True, strategy_name="eval"):
     """使用和 compare_strategies.py 相同的评估逻辑"""
-    # 加载 SQuAD 验证集
-    questions = load_squad_random_questions(
+    # 加载 SQuAD 验证集 (随机采样问题，每个问题有自己的 context)
+    groups = load_squad_random_questions(
         split="validation",
-        num_questions=eval_samples,
+        max_contexts=eval_samples,
         seed=42,
     )
 
-    # 转换为 items 格式
+    # 转换为 items 格式 (和 run_cross_batch_multi_strategy 兼容)
     items = []
-    for q in questions:
-        items.append({
-            "qid": q.qid,
-            "question": q.text,
-            "context": q.context if hasattr(q, 'context') else "",
-            "references": q.references,
-        })
+    for group in groups:
+        context = group["context"]
+        for q in group["questions"]:
+            items.append({
+                "qid": q["qid"],
+                "question": q["text"],
+                "context": context,
+                "references": q["references"],
+            })
 
     # 创建 generator
     generator = CrossBatchGenerator(
