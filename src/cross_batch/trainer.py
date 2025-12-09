@@ -222,7 +222,6 @@ class LMHeadOnlyTrainer:
 
         # Unfreeze and train only lm_head
         if hasattr(self.model, 'lm_head'):
-            self.model.lm_head = self.model.lm_head.float()
             for param in self.model.lm_head.parameters():
                 param.requires_grad = True
             trainable_params = list(self.model.lm_head.parameters())
@@ -237,10 +236,6 @@ class LMHeadOnlyTrainer:
         )
         self.scheduler = None
         self.best_lm_head_state = None
-
-    def _cast_lm_head_to_model_dtype(self):
-        if hasattr(self.model, 'lm_head'):
-            self.model.lm_head = self.model.lm_head.to(dtype=self.model_dtype)
 
     def compute_loss(
         self,
@@ -262,25 +257,27 @@ class LMHeadOnlyTrainer:
         current_mask = attention_mask.clone()
         max_gen_steps = min(max_answer_len, 32)
 
-        for step in range(max_gen_steps):
-            with torch.no_grad():
-                hidden_states = _forward_hidden_states(
-                    self.base_model,
-                    current_ids,
-                    current_mask,
-                )[-1]
-
+        # First step: process the full prompt and get KV cache
+        past_key_values = None
+        with torch.no_grad():
+            hidden_states, past_key_values = _forward_hidden_states(
+                self.base_model,
+                current_ids,
+                current_mask,
+                past_key_values=None,
+                use_cache=True,
+            )
             seq_lengths = current_mask.sum(dim=1) - 1
-            last_hidden = hidden_states[torch.arange(batch_size, device=self.device), seq_lengths]
-            last_hidden = last_hidden.float()
+            last_hidden = hidden_states[-1][torch.arange(batch_size, device=self.device), seq_lengths]
 
+        for step in range(max_gen_steps):
             # NO cross-batch mixing - just use lm_head directly
             logits = self.model.lm_head(last_hidden)
 
             target_positions = prompt_lengths + step
             valid_mask = target_positions < labels.size(1)
-            target_positions = target_positions.clamp(max=labels.size(1) - 1)
-            target_tokens = labels[torch.arange(batch_size, device=self.device), target_positions]
+            target_positions_clamped = target_positions.clamp(max=labels.size(1) - 1)
+            target_tokens = labels[torch.arange(batch_size, device=self.device), target_positions_clamped]
 
             if valid_mask.any():
                 valid_logits = logits[valid_mask]
@@ -294,15 +291,28 @@ class LMHeadOnlyTrainer:
                     total_loss = total_loss + step_loss
                     num_tokens += non_pad_mask.sum().item()
 
+            # Early stopping
+            all_finished = (~valid_mask).all() or (valid_mask.any() and non_pad_mask.sum() == 0)
+            if all_finished:
+                break
+
+            # Prepare next step with KV cache
             next_tokens = target_tokens.unsqueeze(1)
-            current_ids = torch.cat([current_ids, next_tokens], dim=1)
-            current_mask = torch.cat([
-                current_mask,
-                valid_mask.long().unsqueeze(1)
-            ], dim=1)
+            next_mask = valid_mask.long().unsqueeze(1)
+            current_mask = torch.cat([current_mask, next_mask], dim=1)
+
+            with torch.no_grad():
+                hidden_states, past_key_values = _forward_hidden_states(
+                    self.base_model,
+                    next_tokens,
+                    current_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                last_hidden = hidden_states[-1][:, -1, :]
 
         if num_tokens > 0:
-            avg_loss = total_loss / max_gen_steps
+            avg_loss = total_loss / num_tokens
         else:
             avg_loss = torch.tensor(0.0, device=self.device)
 
@@ -378,8 +388,6 @@ class LMHeadOnlyTrainer:
         # Restore best state for in-memory evaluation
         if self.best_lm_head_state is not None:
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
-        # Always cast back to original dtype for inference
-        self._cast_lm_head_to_model_dtype()
 
         if save_dir:
             self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
@@ -436,8 +444,8 @@ class CrossBatchTrainer:
         # Get model dtype
         self.model_dtype = next(model.parameters()).dtype
 
-        # Setup cross-batch module - use float32 for stable training
-        self.cross_batch_module = cross_batch_module.to(device=device, dtype=torch.float32)
+        # Setup cross-batch module - use same dtype as model
+        self.cross_batch_module = cross_batch_module.to(device=device, dtype=self.model_dtype)
         self.cross_batch_module.train()
 
         # Collect trainable parameters
@@ -445,8 +453,7 @@ class CrossBatchTrainer:
 
         # Optionally train lm_head together
         if train_lm_head and hasattr(self.model, 'lm_head'):
-            # Unfreeze lm_head and convert to float32
-            self.model.lm_head = self.model.lm_head.float()
+            # Unfreeze lm_head (keep same dtype as model)
             for param in self.model.lm_head.parameters():
                 param.requires_grad = True
             trainable_params.extend(self.model.lm_head.parameters())
@@ -464,10 +471,6 @@ class CrossBatchTrainer:
         self.scheduler = None
         self.best_cross_batch_state = None
         self.best_lm_head_state = None
-
-    def _cast_lm_head_to_model_dtype(self):
-        if hasattr(self.model, 'lm_head'):
-            self.model.lm_head = self.model.lm_head.to(dtype=self.model_dtype)
 
     def _hidden_to_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Convert hidden states to logits."""
@@ -511,10 +514,10 @@ class CrossBatchTrainer:
             use_lm_head_module = False
             with torch.no_grad():
                 if hasattr(self.model, 'lm_head'):
-                    lm_weight = self.model.lm_head.weight.float()
-                    lm_bias = self.model.lm_head.bias.float() if self.model.lm_head.bias is not None else None
+                    lm_weight = self.model.lm_head.weight
+                    lm_bias = self.model.lm_head.bias if self.model.lm_head.bias is not None else None
                 elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'wte'):
-                    lm_weight = self.model.transformer.wte.weight.float()
+                    lm_weight = self.model.transformer.wte.weight
                     lm_bias = None
                 else:
                     raise ValueError("Could not find output projection layer")
@@ -538,7 +541,6 @@ class CrossBatchTrainer:
             # Get last token's hidden state from prompt
             seq_lengths = current_mask.sum(dim=1) - 1
             last_hidden = hidden_states[-1][torch.arange(batch_size, device=self.device), seq_lengths]
-            last_hidden = last_hidden.float()
 
         # Generate answer tokens one by one using KV cache
         for step in range(max_answer_len):
@@ -610,7 +612,6 @@ class CrossBatchTrainer:
                 )
                 # Hidden state for the new token is at position 0 (since we only passed 1 token)
                 last_hidden = hidden_states[-1][:, -1, :]  # [batch, hidden]
-                last_hidden = last_hidden.float()
 
         # Average loss over all tokens
         if num_tokens > 0:
@@ -775,8 +776,6 @@ class CrossBatchTrainer:
             self.cross_batch_module.load_state_dict(self.best_cross_batch_state)
         if self.best_lm_head_state is not None and hasattr(self.model, 'lm_head'):
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
-        # Cast lm_head back to original dtype for inference
-        self._cast_lm_head_to_model_dtype()
 
         if save_dir:
             # Save final model
