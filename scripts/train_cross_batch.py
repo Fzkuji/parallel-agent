@@ -3,8 +3,16 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
 包含训练和三方对比评估
 
 用法:
-  单卡: python scripts/train_cross_batch.py
-  多卡: torchrun --nproc_per_node=8 scripts/train_cross_batch.py
+  # 0.5B 模型 (单卡)
+  python scripts/train_cross_batch.py
+
+  # 0.5B 模型 (8卡并行)
+  torchrun --nproc_per_node=8 scripts/train_cross_batch.py
+
+  # 7B 模型 (8卡并行，需要修改下面的配置)
+  # MODEL_NAME = 'Qwen/Qwen2.5-7B-Instruct'
+  # BATCH_SIZE = 2
+  torchrun --nproc_per_node=8 scripts/train_cross_batch.py
 """
 import sys
 from pathlib import Path
