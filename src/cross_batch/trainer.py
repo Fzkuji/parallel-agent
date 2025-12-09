@@ -150,18 +150,27 @@ def _forward_hidden_states(
     base_model: nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-) -> List[torch.Tensor]:
-    """Run the frozen base model and return its hidden states."""
+    past_key_values: Optional[tuple] = None,
+    use_cache: bool = False,
+) -> tuple:
+    """Run the frozen base model and return its hidden states and optionally KV cache.
+
+    Returns:
+        Tuple of (hidden_states, past_key_values) where:
+        - hidden_states: List of hidden states from each layer
+        - past_key_values: KV cache for next step (None if use_cache=False)
+    """
     try:
         outputs = base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
             output_hidden_states=True,
-            use_cache=False,
+            use_cache=use_cache,
             return_dict=True,
         )
     except TypeError:
-        # Some base models might not accept use_cache
+        # Some base models might not accept use_cache or past_key_values
         outputs = base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -174,7 +183,9 @@ def _forward_hidden_states(
         hidden_states = outputs[2]
     if hidden_states is None:
         raise ValueError("Base model did not return hidden states")
-    return hidden_states
+
+    new_past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
+    return hidden_states, new_past_key_values
 
 
 def _clone_state_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
@@ -477,25 +488,24 @@ class CrossBatchTrainer:
         labels_attention_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute training loss over the FULL answer sequence.
+        Compute training loss over the FULL answer sequence with KV cache optimization.
 
         For each token position in the answer, we:
-        1. Get hidden states from the model
+        1. Get hidden states from the model (using KV cache for efficiency)
         2. Apply cross-batch mixing
         3. Predict next token
         4. Accumulate loss
 
-        This trains the cross-batch module to help at every generation step.
+        Uses dynamic answer length based on actual labels, with early stopping
+        when all samples have finished.
         """
         batch_size = input_ids.size(0)
         prompt_lengths = attention_mask.sum(dim=1)  # [batch]
-        answer_lengths = labels_attention_mask.sum(dim=1) - prompt_lengths  # [batch]
-        max_answer_len = answer_lengths.max().item()
+        total_label_lengths = labels_attention_mask.sum(dim=1)  # [batch]
+        max_answer_len = (total_label_lengths - prompt_lengths).max().item()
 
         # Get lm_head for computing logits
-        # If training lm_head, we need gradients; otherwise, use detached weights
         if self.train_lm_head and hasattr(self.model, 'lm_head'):
-            # Use lm_head directly (already float32)
             use_lm_head_module = True
         else:
             use_lm_head_module = False
@@ -513,27 +523,25 @@ class CrossBatchTrainer:
         total_baseline_loss = 0.0
         num_tokens = 0
 
-        # Start with prompt, generate answer token by token
-        current_ids = input_ids.clone()
+        # First step: process the full prompt and get KV cache
+        past_key_values = None
         current_mask = attention_mask.clone()
 
-        # Limit answer length to avoid too long sequences
-        max_gen_steps = min(max_answer_len, 32)
-
-        for step in range(max_gen_steps):
-            # Forward pass through frozen model
-            with torch.no_grad():
-                hidden_states = _forward_hidden_states(
-                    self.base_model,
-                    current_ids,
-                    current_mask,
-                )[-1]  # [batch, seq, hidden]
-
-            # Get the last token's hidden state
+        with torch.no_grad():
+            hidden_states, past_key_values = _forward_hidden_states(
+                self.base_model,
+                input_ids,
+                current_mask,
+                past_key_values=None,
+                use_cache=True,
+            )
+            # Get last token's hidden state from prompt
             seq_lengths = current_mask.sum(dim=1) - 1
-            last_hidden = hidden_states[torch.arange(batch_size, device=self.device), seq_lengths]
+            last_hidden = hidden_states[-1][torch.arange(batch_size, device=self.device), seq_lengths]
             last_hidden = last_hidden.float()
 
+        # Generate answer tokens one by one using KV cache
+        for step in range(max_answer_len):
             # Apply cross-batch interaction
             mixed_hidden = self.cross_batch_module(last_hidden)
 
@@ -545,10 +553,9 @@ class CrossBatchTrainer:
 
             # Get target tokens from labels
             target_positions = prompt_lengths + step
-            # Mask out positions that exceed label length
             valid_mask = target_positions < labels.size(1)
-            target_positions = target_positions.clamp(max=labels.size(1) - 1)
-            target_tokens = labels[torch.arange(batch_size, device=self.device), target_positions]
+            target_positions_clamped = target_positions.clamp(max=labels.size(1) - 1)
+            target_tokens = labels[torch.arange(batch_size, device=self.device), target_positions_clamped]
 
             # Only compute loss for valid positions
             if valid_mask.any():
@@ -564,7 +571,7 @@ class CrossBatchTrainer:
                     )
                     total_loss = total_loss + step_loss
 
-                    # Baseline loss (always no_grad, just for monitoring)
+                    # Baseline loss (without cross-batch mixing)
                     with torch.no_grad():
                         if use_lm_head_module:
                             baseline_logits = self.model.lm_head(last_hidden)
@@ -579,18 +586,36 @@ class CrossBatchTrainer:
 
                     num_tokens += non_pad_mask.sum().item()
 
-            # Append next token (use ground truth for teacher forcing)
-            next_tokens = target_tokens.unsqueeze(1)
-            current_ids = torch.cat([current_ids, next_tokens], dim=1)
-            current_mask = torch.cat([
-                current_mask,
-                valid_mask.long().unsqueeze(1)
-            ], dim=1)
+            # Early stopping: all samples have finished
+            all_finished = (~valid_mask).all() or (valid_mask.any() and non_pad_mask.sum() == 0)
+            if all_finished:
+                break
+
+            # Prepare next step: use teacher forcing (ground truth token)
+            next_token_ids = target_tokens.unsqueeze(1)  # [batch, 1]
+
+            # Update attention mask for next step
+            next_mask = valid_mask.long().unsqueeze(1)  # [batch, 1]
+            # Full attention mask for KV cache (need to include all previous positions)
+            current_mask = torch.cat([current_mask, next_mask], dim=1)
+
+            # Forward pass with KV cache: only process the new token
+            with torch.no_grad():
+                hidden_states, past_key_values = _forward_hidden_states(
+                    self.base_model,
+                    next_token_ids,
+                    current_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                # Hidden state for the new token is at position 0 (since we only passed 1 token)
+                last_hidden = hidden_states[-1][:, -1, :]  # [batch, hidden]
+                last_hidden = last_hidden.float()
 
         # Average loss over all tokens
         if num_tokens > 0:
-            avg_loss = total_loss / (max_gen_steps)
-            avg_baseline_loss = total_baseline_loss / max_gen_steps
+            avg_loss = total_loss / num_tokens
+            avg_baseline_loss = total_baseline_loss / num_tokens
         else:
             avg_loss = torch.tensor(0.0, device=self.device)
             avg_baseline_loss = 0.0
