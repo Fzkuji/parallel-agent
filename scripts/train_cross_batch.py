@@ -104,11 +104,13 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
 
     # 转换为 items 格式 (和 run_cross_batch_multi_strategy 兼容)
     items = []
-    for group in groups:
+    for group_idx, group in enumerate(groups):
         context = group["context"]
-        for q in group["questions"]:
+        for q_idx, q in enumerate(group["questions"]):
+            # 生成唯一 qid，避免所有问题都叫 Q1
+            unique_qid = f"G{group_idx}_Q{q_idx}"
             items.append({
-                "qid": q["qid"],
+                "qid": unique_qid,
                 "question": q["text"],
                 "context": context,
                 "references": q["references"],
@@ -135,7 +137,7 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
     )
 
     return {
-        "exact_match": result.metrics.get("em", 0.0) * 100,
+        "exact_match": result.metrics.get("strict_acc", 0.0) * 100,
         "f1": result.metrics.get("f1", 0.0) * 100,
     }
 
