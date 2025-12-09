@@ -93,8 +93,8 @@ def print_rank0(msg, rank):
 
 
 def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_samples,
-                           enable_cross_batch=True, strategy_name="eval"):
-    """使用和 compare_strategies.py 相同的评估逻辑"""
+                           enable_cross_batch=True, strategy_name="eval", eval_batch_size=8):
+    """使用和 compare_strategies.py 相同的评估逻辑，分 batch 处理避免 OOM"""
     # 加载 SQuAD 验证集 (随机采样问题，每个问题有自己的 context)
     groups = load_squad_random_questions(
         split="validation",
@@ -124,21 +124,29 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
         device=device,
     )
 
-    # 运行评估
-    result = run_cross_batch_multi_strategy(
-        items=items,
-        tokenizer=tokenizer,
-        model=model,
-        max_new_tokens=32,
-        strategy_name=strategy_name,
-        dataset="squad",
-        cross_batch_generator=generator,
-        enable_cross_batch=enable_cross_batch,
-    )
+    # 分 batch 评估，避免 OOM
+    all_strict_acc = []
+    all_f1 = []
 
+    for i in range(0, len(items), eval_batch_size):
+        batch_items = items[i:i + eval_batch_size]
+        result = run_cross_batch_multi_strategy(
+            items=batch_items,
+            tokenizer=tokenizer,
+            model=model,
+            max_new_tokens=32,
+            strategy_name=strategy_name,
+            dataset="squad",
+            cross_batch_generator=generator,
+            enable_cross_batch=enable_cross_batch,
+        )
+        all_strict_acc.append(result.metrics.get("strict_acc", 0.0) * len(batch_items))
+        all_f1.append(result.metrics.get("f1", 0.0) * len(batch_items))
+
+    total = len(items)
     return {
-        "exact_match": result.metrics.get("strict_acc", 0.0) * 100,
-        "f1": result.metrics.get("f1", 0.0) * 100,
+        "exact_match": sum(all_strict_acc) / total * 100 if total > 0 else 0.0,
+        "f1": sum(all_f1) / total * 100 if total > 0 else 0.0,
     }
 
 
@@ -178,7 +186,8 @@ def main():
 
         metrics_original = evaluate_with_strategy(
             model_original, tokenizer, cross_batch_original, device,
-            args.eval_samples, enable_cross_batch=False, strategy_name="original"
+            args.eval_samples, enable_cross_batch=False, strategy_name="original",
+            eval_batch_size=args.batch_size
         )
         all_results['original'] = metrics_original
         print(f'原始模型 - EM: {metrics_original["exact_match"]:.2f}, F1: {metrics_original["f1"]:.2f}')
@@ -219,7 +228,8 @@ def main():
         cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size)
         metrics_baseline = evaluate_with_strategy(
             model_baseline, tokenizer, cross_batch_baseline, device,
-            args.eval_samples, enable_cross_batch=False, strategy_name="baseline"
+            args.eval_samples, enable_cross_batch=False, strategy_name="baseline",
+            eval_batch_size=args.batch_size
         )
         all_results['baseline'] = metrics_baseline
         print(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}')
@@ -262,7 +272,8 @@ def main():
     if is_main_process(rank):
         metrics_crossbatch = evaluate_with_strategy(
             model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device,
-            args.eval_samples, enable_cross_batch=True, strategy_name="crossbatch"
+            args.eval_samples, enable_cross_batch=True, strategy_name="crossbatch",
+            eval_batch_size=args.batch_size
         )
         all_results['crossbatch'] = metrics_crossbatch
         print(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}')
