@@ -2,6 +2,14 @@
 Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
 包含训练和三方对比评估
 
+参数:
+  --model         模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)
+  --max-samples   训练样本数 (default: 2000)
+  --epochs        训练轮数 (default: 1)
+  --batch-size    每卡 batch size (default: 8)
+  --eval-samples  评估样本数 (default: 100)
+  --lr            学习率 (default: 1e-4)
+
 用法:
   # 0.5B 模型 (单卡)
   python scripts/train_cross_batch.py
@@ -9,15 +17,19 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
   # 0.5B 模型 (8卡并行)
   torchrun --nproc_per_node=8 scripts/train_cross_batch.py
 
-  # 7B 模型 (8卡并行，需要修改下面的配置)
-  # MODEL_NAME = 'Qwen/Qwen2.5-7B-Instruct'
-  # BATCH_SIZE = 2
-  torchrun --nproc_per_node=8 scripts/train_cross_batch.py
+  # 7B 模型 (8卡并行)
+  torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+      --model Qwen/Qwen2.5-7B-Instruct \
+      --batch-size 2 \
+      --max-samples 10000 \
+      --epochs 1 \
+      --eval-samples 100
 """
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import argparse
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -33,12 +45,22 @@ from src.cross_batch.attention import CrossBatchAttention
 from src.cross_batch.generator import CrossBatchGenerator
 from src.cross_batch.eval import SquadEvaluator
 
-# 配置
-MODEL_NAME = 'Qwen/Qwen2.5-0.5B-Instruct'
-MAX_SAMPLES = 2000
-NUM_EPOCHS = 1
-BATCH_SIZE = 8  # 每卡 batch size
-EVAL_SAMPLES = 100
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Cross-batch 模块训练脚本')
+    parser.add_argument('--model', type=str, default='Qwen/Qwen2.5-0.5B-Instruct',
+                        help='模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)')
+    parser.add_argument('--max-samples', type=int, default=2000,
+                        help='训练样本数 (default: 2000)')
+    parser.add_argument('--epochs', type=int, default=1,
+                        help='训练轮数 (default: 1)')
+    parser.add_argument('--batch-size', type=int, default=8,
+                        help='每卡 batch size (default: 8)')
+    parser.add_argument('--eval-samples', type=int, default=100,
+                        help='评估样本数 (default: 100)')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='学习率 (default: 1e-4)')
+    return parser.parse_args()
 
 
 def setup_ddp():
@@ -70,6 +92,7 @@ def print_rank0(msg, rank):
 
 
 def main():
+    args = parse_args()
     rank, local_rank, world_size = setup_ddp()
     device = f'cuda:{local_rank}'
 
@@ -77,18 +100,18 @@ def main():
     torch.cuda.empty_cache()
 
     print_rank0('=' * 60, rank)
-    print_rank0(f'训练配置: {MODEL_NAME}', rank)
-    print_rank0(f'样本数: {MAX_SAMPLES}, Epochs: {NUM_EPOCHS}, Batch: {BATCH_SIZE}', rank)
-    print_rank0(f'World size: {world_size}, 总 batch size: {BATCH_SIZE * world_size}', rank)
+    print_rank0(f'训练配置: {args.model}', rank)
+    print_rank0(f'样本数: {args.max_samples}, Epochs: {args.epochs}, Batch: {args.batch_size}', rank)
+    print_rank0(f'World size: {world_size}, 总 batch size: {args.batch_size * world_size}', rank)
     print_rank0('=' * 60, rank)
 
     # 加载 tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # 加载数据集
-    train_dataset = SQuADDataset(tokenizer=tokenizer, split='train', max_samples=MAX_SAMPLES)
+    train_dataset = SQuADDataset(tokenizer=tokenizer, split='train', max_samples=args.max_samples)
     print_rank0(f'训练数据集大小: {len(train_dataset)}', rank)
 
     if is_main_process(rank):
@@ -99,15 +122,15 @@ def main():
     if is_main_process(rank):
         print('\n[1/3] 评估原始模型 (未微调)')
         print('-' * 40)
-        model_original = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
+        model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
         generator_original = CrossBatchGenerator(
             model=model_original,
             tokenizer=tokenizer,
             cross_batch_module=CrossBatchAttention(hidden_size=model_original.config.hidden_size),
             device=device,
         )
-        evaluator_original = SquadEvaluator(generator_original, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
-        results_original = evaluator_original.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
+        evaluator_original = SquadEvaluator(generator_original, tokenizer, split='validation', max_samples=args.eval_samples)
+        results_original = evaluator_original.evaluate(batch_size=args.batch_size, max_new_tokens=32, enable_cross_batch=False)
         all_results['original'] = results_original['metrics']
         print(f'原始模型 - EM: {results_original["metrics"]["exact_match"]:.2f}, F1: {results_original["metrics"]["f1"]:.2f}')
 
@@ -122,19 +145,19 @@ def main():
     print_rank0('\n[2/3] Baseline：训练后立刻评估 (只训练 lm_head)', rank)
     print_rank0('-' * 40, rank)
 
-    model_baseline = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(device)
+    model_baseline = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
     trainer_baseline = LMHeadOnlyTrainer(
         model=model_baseline,
         tokenizer=tokenizer,
         device=device,
-        learning_rate=1e-4,
+        learning_rate=args.lr,
     )
 
     # DDP 训练
     history_baseline = trainer_baseline.train(
         train_dataset=train_dataset,
-        num_epochs=NUM_EPOCHS,
-        batch_size=BATCH_SIZE,
+        num_epochs=args.epochs,
+        batch_size=args.batch_size,
         save_dir=None,
         distributed=(world_size > 1),
         rank=rank,
@@ -149,8 +172,8 @@ def main():
             tokenizer=tokenizer,
             device=device,
         )
-        evaluator_baseline = SquadEvaluator(generator_baseline, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
-        results_baseline = evaluator_baseline.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=False)
+        evaluator_baseline = SquadEvaluator(generator_baseline, tokenizer, split='validation', max_samples=args.eval_samples)
+        results_baseline = evaluator_baseline.evaluate(batch_size=args.batch_size, max_new_tokens=32, enable_cross_batch=False)
         all_results['baseline'] = results_baseline['metrics']
         print(f'Baseline - EM: {results_baseline["metrics"]["exact_match"]:.2f}, F1: {results_baseline["metrics"]["f1"]:.2f}')
         del generator_baseline, evaluator_baseline
@@ -166,21 +189,21 @@ def main():
     print_rank0('\n[3/3] Cross-Batch：训练后立刻评估 (lm_head + cross-batch)', rank)
     print_rank0('-' * 40, rank)
 
-    model_crossbatch = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(device)
+    model_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
     cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size)
     trainer_crossbatch = CrossBatchTrainer(
         model=model_crossbatch,
         tokenizer=tokenizer,
         cross_batch_module=cross_batch_module,
         device=device,
-        learning_rate=1e-4,
+        learning_rate=args.lr,
         train_lm_head=True,
     )
 
     history_crossbatch = trainer_crossbatch.train(
         train_dataset=train_dataset,
-        num_epochs=NUM_EPOCHS,
-        batch_size=BATCH_SIZE,
+        num_epochs=args.epochs,
+        batch_size=args.batch_size,
         save_dir=None,
         distributed=(world_size > 1),
         rank=rank,
@@ -196,8 +219,8 @@ def main():
             cross_batch_module=trainer_crossbatch.cross_batch_module,
             device=device,
         )
-        evaluator_crossbatch = SquadEvaluator(generator_crossbatch, tokenizer, split='validation', max_samples=EVAL_SAMPLES)
-        results_crossbatch = evaluator_crossbatch.evaluate(batch_size=BATCH_SIZE, max_new_tokens=32, enable_cross_batch=True)
+        evaluator_crossbatch = SquadEvaluator(generator_crossbatch, tokenizer, split='validation', max_samples=args.eval_samples)
+        results_crossbatch = evaluator_crossbatch.evaluate(batch_size=args.batch_size, max_new_tokens=32, enable_cross_batch=True)
         all_results['crossbatch'] = results_crossbatch['metrics']
         print(f'Cross-Batch - EM: {results_crossbatch["metrics"]["exact_match"]:.2f}, F1: {results_crossbatch["metrics"]["f1"]:.2f}')
         del generator_crossbatch, evaluator_crossbatch
@@ -210,11 +233,11 @@ def main():
     if is_main_process(rank):
         summary = {
             'config': {
-                'model': MODEL_NAME,
-                'train_samples': MAX_SAMPLES,
-                'eval_samples': EVAL_SAMPLES,
-                'epochs': NUM_EPOCHS,
-                'batch_size': BATCH_SIZE,
+                'model': args.model,
+                'train_samples': args.max_samples,
+                'eval_samples': args.eval_samples,
+                'epochs': args.epochs,
+                'batch_size': args.batch_size,
                 'world_size': world_size,
             },
             'training_history': {
