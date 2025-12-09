@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Comma-separated list of strategies to test (e.g., 'all_in_one,sequential,batch'). "
-             "Available: all_in_one, sequential, batch, parallel, parallel_bert, cross_batch. "
+             "Available: all_in_one, sequential, batch, collab_llm, collab_bert, collab_hidden. "
              "If not specified, all strategies will be tested.",
     )
     parser.add_argument("--no-llm-deps", action="store_true", help="Force heuristic dependency generator.")
@@ -194,22 +194,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Custom API base URL (overrides provider default).",
     )
-    # Cross-batch strategy arguments
+    # Collaborative hidden (collab_hidden) strategy arguments
     parser.add_argument(
-        "--checkpoint-path",
+        "--collab-hidden-checkpoint",
         type=str,
         default=None,
-        help="Path to trained cross-batch module checkpoint for cross_batch strategy.",
+        help="Path to trained collab_hidden module checkpoint.",
     )
     parser.add_argument(
-        "--cross-batch-mix-method",
+        "--collab-hidden-mix-method",
         type=str,
         default="attention",
         choices=["attention", "mixer"],
-        help="Cross-batch mixing method (attention or mixer).",
+        help="Collab hidden mixing method (attention or mixer).",
     )
     parser.add_argument(
-        "--cross-batch-mix-layer",
+        "--collab-hidden-mix-layer",
         type=int,
         default=-1,
         help="Which layer's hidden state to mix (-1 for last layer).",
@@ -249,7 +249,7 @@ def resolve_dependency_generators(
     return dep_generator, bert_dep_generator, bert_conf_threshold
 
 
-ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "parallel", "parallel_bert", "cross_batch"]
+ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "collab_llm", "collab_bert", "collab_hidden"]
 
 
 def run_all_strategies(
@@ -309,7 +309,7 @@ def run_all_strategies(
             ))
         # For dependency strategies in multi-context mode, store context per question
         # This ensures consistent prompt format with batch strategy (context in system message)
-        if "parallel" in selected_strategies or "parallel_bert" in selected_strategies:
+        if "collab_llm" in selected_strategies or "collab_bert" in selected_strategies:
             dep_questions = [
                 Question(
                     qid=item["qid"],
@@ -322,7 +322,7 @@ def run_all_strategies(
                 )
                 for item in items
             ]
-            if "parallel" in selected_strategies:
+            if "collab_llm" in selected_strategies:
                 results.append(run_dependency_batch_strategy(
                     "",  # Empty shared background; each question has its own context
                     dep_questions,
@@ -334,11 +334,11 @@ def run_all_strategies(
                     max_dependencies=args.max_dependencies,
                     total_cost_budget=args.total_cost_budget,
                     max_new_tokens=args.max_new_tokens,
-                    strategy_name="parallel",
+                    strategy_name="collab_llm",
                     dataset=effective_dataset,
                     api_client=api_client,
                 ))
-            if "parallel_bert" in selected_strategies:
+            if "collab_bert" in selected_strategies:
                 results.append(run_dependency_batch_strategy(
                     "",  # Empty shared background; each question has its own context
                     dep_questions,
@@ -350,21 +350,21 @@ def run_all_strategies(
                     max_dependencies=args.max_dependencies,
                     total_cost_budget=args.total_cost_budget,
                     max_new_tokens=args.max_new_tokens,
-                    strategy_name="parallel_bert",
+                    strategy_name="collab_bert",
                     dataset=effective_dataset,
                     api_client=api_client,
                 ))
-        if "cross_batch" in selected_strategies:
+        if "collab_hidden" in selected_strategies:
             results.append(run_cross_batch_multi_strategy(
                 items,
                 tokenizer,
                 model,
                 max_new_tokens=args.max_new_tokens,
-                strategy_name="cross_batch",
+                strategy_name="collab_hidden",
                 dataset=effective_dataset,
-                mix_method=args.cross_batch_mix_method,
-                mix_layer=args.cross_batch_mix_layer,
-                checkpoint_path=args.checkpoint_path,
+                mix_method=args.collab_hidden_mix_method,
+                mix_layer=args.collab_hidden_mix_layer,
+                checkpoint_path=args.collab_hidden_checkpoint,
                 enable_cross_batch=True,
             ))
         return results
@@ -399,7 +399,7 @@ def run_all_strategies(
             dataset=effective_dataset,
             api_client=api_client,
         ))
-    if "parallel" in selected_strategies:
+    if "collab_llm" in selected_strategies:
         results.append(run_dependency_batch_strategy(
             background,
             questions,
@@ -411,11 +411,11 @@ def run_all_strategies(
             max_dependencies=args.max_dependencies,
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
-            strategy_name="parallel",
+            strategy_name="collab_llm",
             dataset=effective_dataset,
             api_client=api_client,
         ))
-    if "parallel_bert" in selected_strategies:
+    if "collab_bert" in selected_strategies:
         results.append(run_dependency_batch_strategy(
             background,
             questions,
@@ -427,11 +427,11 @@ def run_all_strategies(
             max_dependencies=args.max_dependencies,
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
-            strategy_name="parallel_bert",
+            strategy_name="collab_bert",
             dataset=effective_dataset,
             api_client=api_client,
         ))
-    if "cross_batch" in selected_strategies:
+    if "collab_hidden" in selected_strategies:
         results.append(run_cross_batch_strategy(
             background,
             questions,
@@ -439,9 +439,9 @@ def run_all_strategies(
             model,
             max_new_tokens=args.max_new_tokens,
             dataset=effective_dataset,
-            mix_method=args.cross_batch_mix_method,
-            mix_layer=args.cross_batch_mix_layer,
-            checkpoint_path=args.checkpoint_path,
+            mix_method=args.collab_hidden_mix_method,
+            mix_layer=args.collab_hidden_mix_layer,
+            checkpoint_path=args.collab_hidden_checkpoint,
             enable_cross_batch=True,
         ))
     return results
@@ -464,8 +464,9 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
         "all_in_one",
         "sequential",
         "batch",
-        "parallel",
-        "parallel_bert",
+        "collab_llm",
+        "collab_bert",
+        "collab_hidden",
     ]
 
     # Get the metric names for this dataset
@@ -1130,7 +1131,7 @@ def main() -> None:
                 "batches": res.batches,
                 "details": res.details,  # Raw prompts, responses, per-turn/per-question data
             }
-            # For parallel strategies, promote DAG info to top level
+            # For collaborative strategies (collab_llm, collab_bert), promote DAG info to top level
             if res.details and "dependency_stage" in res.details:
                 dep_stage = res.details["dependency_stage"]
                 strategy_entry["dag_edges"] = dep_stage.get("edges", [])
