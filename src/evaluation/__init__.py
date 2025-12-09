@@ -7,6 +7,7 @@ This module provides different evaluation methods for different QA datasets:
 """
 
 from .basic import (
+    compute_choice_accuracy,
     compute_contains,
     compute_em,
     compute_f1,
@@ -40,6 +41,7 @@ __all__ = [
     "compute_em",
     "compute_f1",
     "compute_contains",
+    "compute_choice_accuracy",
     # Generation metrics (long-form)
     "compute_bleu4",
     "compute_rouge1",

@@ -91,6 +91,41 @@ def compute_f1(prediction: str, references: List[str]) -> float:
     return best
 
 
+def compute_choice_accuracy(prediction: str, references: List[str]) -> float:
+    """Compute accuracy for multiple-choice questions.
+
+    Simply extracts the first option letter (A-F) found in the prediction
+    and compares with the reference answer.
+
+    Args:
+        prediction: Model's predicted answer
+        references: List of gold/reference answers (option letters like "A", "B", etc.)
+
+    Returns:
+        1.0 if prediction matches any reference, 0.0 otherwise
+    """
+    import re
+
+    # Find the first option letter (A-F) in the prediction
+    pred_upper = prediction.upper()
+    match = re.search(r'[A-F]', pred_upper)
+    if not match:
+        return 0.0
+    pred_letter = match.group(0)
+
+    # Compare with references
+    for ref in references:
+        ref_upper = ref.upper().strip()
+        # Extract first letter from reference too
+        ref_match = re.search(r'[A-F]', ref_upper)
+        ref_letter = ref_match.group(0) if ref_match else ref_upper
+
+        if pred_letter == ref_letter:
+            return 1.0
+
+    return 0.0
+
+
 def compute_contains(prediction: str, references: List[str]) -> float:
     """Compute lenient containment score.
 

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 import time
 import textwrap
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from src.models import Question
-from src.inference import USE_THINK_TOKENS, build_chat_prompt, extract_box_answer
+from src.models import Question, StrategyResult
+from src.inference import USE_THINK_TOKENS, build_chat_prompt, extract_answer
 from src.evaluation import evaluate_predictions
-from src.prompts import build_single_prompt
-from src.results import StrategyResult
+from src.prompts import (
+    build_single_prompt,
+    DIRECT_ANSWER_DATASETS,
+    MULTIPLE_CHOICE_DATASETS,
+)
 from src.utils import (
     DEFAULT_GENERATION_SEED,
     reset_generation_seed,
@@ -21,9 +25,6 @@ if TYPE_CHECKING:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from src.api_client import APIClient
-
-# Datasets that use direct answer format (no <answer> tags required)
-DIRECT_ANSWER_DATASETS = {"cmb"}
 
 
 def run_sequential_strategy(
@@ -46,6 +47,9 @@ def run_sequential_strategy(
     # CMB uses direct answer format without <answer> tags
     use_direct_format = dataset in DIRECT_ANSWER_DATASETS
 
+    # Multiple-choice questions: respond with option letter only
+    use_mc_format = dataset in MULTIPLE_CHOICE_DATASETS
+
     # Align prompt with the single-question template used elsewhere
     # Only squad dataset has "unknown" labels
     extractive_datasets = {"squad"}
@@ -54,7 +58,12 @@ def run_sequential_strategy(
     else:
         unknown_instruction = ""
 
-    if use_direct_format:
+    if use_mc_format:
+        system_message = (
+            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。\n\n"
+            f"背景信息:\n{background.strip()}"
+        )
+    elif use_direct_format:
         system_message = (
             textwrap.dedent(
                 f"""You are a helpful medical assistant that answers questions given background passages.
@@ -88,12 +97,28 @@ Background:
 
         # Use API or local model for generation
         if api_client is not None:
-            start = time.perf_counter()
-            response = api_client.generate(messages, max_tokens=max_new_tokens)
-            elapsed = time.perf_counter() - start
-            raw_response = clean_model_text(response.text)
-            prompt_tokens = response.prompt_tokens
-            gen_tokens = response.completion_tokens
+            max_retries = 3
+            retry_delay = 2.0
+            response = None
+            elapsed = 0.0
+            for attempt in range(max_retries):
+                start = time.perf_counter()
+                response = api_client.generate(messages, max_tokens=max_new_tokens)
+                elapsed += time.perf_counter() - start
+                if response.text and response.text.strip():
+                    break
+                elif attempt < max_retries - 1:
+                    logging.warning(
+                        "API returned empty response, retrying (%d/%d) after %.1fs delay...",
+                        attempt + 1, max_retries, retry_delay
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5
+                else:
+                    logging.warning("API returned empty response after %d retries", max_retries)
+            raw_response = clean_model_text(response.text) if response else ""
+            prompt_tokens = response.prompt_tokens if response else 0
+            gen_tokens = response.completion_tokens if response else 0
             chat_prompt = str(messages)  # For logging
         else:
             import torch
@@ -133,7 +158,7 @@ Background:
             raw_response = clean_model_text(raw_response)
             gen_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
 
-        final_answer, strict_valid = extract_box_answer(raw_response)
+        final_answer, strict_valid = extract_answer(raw_response, dataset)
         messages.append({"role": "assistant", "content": raw_response})
 
         answer_records[question.qid] = (final_answer, strict_valid)
@@ -209,24 +234,40 @@ def run_full_batch_strategy(
 
     # Use API or local model for generation
     if api_client is not None:
-        # API mode: process each question sequentially
+        # API mode: process each question sequentially with retry logic
         raw_texts = []
         boxes = []
         generated_token_counts = []
         input_lengths = []
         total_latency = 0.0
+        max_retries = 3
+        retry_delay = 2.0
 
         for messages in batch_messages:
-            start = time.perf_counter()
-            response = api_client.generate(messages, max_tokens=max_new_tokens)
-            elapsed = time.perf_counter() - start
-            total_latency += elapsed
+            response = None
+            current_delay = retry_delay
+            for attempt in range(max_retries):
+                start = time.perf_counter()
+                response = api_client.generate(messages, max_tokens=max_new_tokens)
+                elapsed = time.perf_counter() - start
+                total_latency += elapsed
+                if response.text and response.text.strip():
+                    break
+                elif attempt < max_retries - 1:
+                    logging.warning(
+                        "API returned empty response, retrying (%d/%d) after %.1fs delay...",
+                        attempt + 1, max_retries, current_delay
+                    )
+                    time.sleep(current_delay)
+                    current_delay *= 1.5
+                else:
+                    logging.warning("API returned empty response after %d retries", max_retries)
 
-            raw_text = clean_model_text(response.text)
+            raw_text = clean_model_text(response.text) if response else ""
             raw_texts.append(raw_text)
-            boxes.append(extract_box_answer(raw_text))
-            generated_token_counts.append(response.completion_tokens)
-            input_lengths.append(response.prompt_tokens)
+            boxes.append(extract_answer(raw_text, dataset))
+            generated_token_counts.append(response.completion_tokens if response else 0)
+            input_lengths.append(response.prompt_tokens if response else 0)
 
         total_prompt_tokens = sum(input_lengths)
         total_generated_tokens = sum(generated_token_counts)
@@ -270,7 +311,7 @@ def run_full_batch_strategy(
             raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
             raw_text = strip_assistant_prefix(strip_think_prefix(raw_text))
             raw_texts.append(raw_text)
-            box = extract_box_answer(raw_text)
+            box = extract_answer(raw_text, dataset)
             boxes.append(box)
             generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
 
@@ -358,24 +399,40 @@ def run_batch_multi_strategy(
 
     # Use API or local model for generation
     if api_client is not None:
-        # API mode: process each item sequentially
+        # API mode: process each item sequentially with retry logic
         raw_texts = []
         boxes = []
         generated_token_counts = []
         input_lengths = []
         total_latency = 0.0
+        max_retries = 3
+        retry_delay = 2.0
 
         for messages in batch_messages:
-            start = time.perf_counter()
-            response = api_client.generate(messages, max_tokens=max_new_tokens)
-            elapsed = time.perf_counter() - start
-            total_latency += elapsed
+            response = None
+            current_delay = retry_delay
+            for attempt in range(max_retries):
+                start = time.perf_counter()
+                response = api_client.generate(messages, max_tokens=max_new_tokens)
+                elapsed = time.perf_counter() - start
+                total_latency += elapsed
+                if response.text and response.text.strip():
+                    break
+                elif attempt < max_retries - 1:
+                    logging.warning(
+                        "API returned empty response, retrying (%d/%d) after %.1fs delay...",
+                        attempt + 1, max_retries, current_delay
+                    )
+                    time.sleep(current_delay)
+                    current_delay *= 1.5
+                else:
+                    logging.warning("API returned empty response after %d retries", max_retries)
 
-            raw_text = clean_model_text(response.text)
+            raw_text = clean_model_text(response.text) if response else ""
             raw_texts.append(raw_text)
-            boxes.append(extract_box_answer(raw_text))
-            generated_token_counts.append(response.completion_tokens)
-            input_lengths.append(response.prompt_tokens)
+            boxes.append(extract_answer(raw_text, dataset))
+            generated_token_counts.append(response.completion_tokens if response else 0)
+            input_lengths.append(response.prompt_tokens if response else 0)
 
         total_prompt_tokens = sum(input_lengths)
         total_generated_tokens = sum(generated_token_counts)
@@ -419,7 +476,7 @@ def run_batch_multi_strategy(
             raw_text = tokenizer.decode(tokens, skip_special_tokens=True).strip()
             raw_text = clean_model_text(raw_text)
             raw_texts.append(raw_text)
-            box = extract_box_answer(raw_text)
+            box = extract_answer(raw_text, dataset)
             boxes.append(box)
             generated_token_counts.append(int(tokenizer(raw_text, return_tensors="pt").input_ids.shape[1]))
 
@@ -490,6 +547,9 @@ def run_sequential_multi_strategy(
     # CMB uses direct answer format without <answer> tags
     use_direct_format = dataset in DIRECT_ANSWER_DATASETS
 
+    # Multiple-choice questions: respond with option letter only
+    use_mc_format = dataset in MULTIPLE_CHOICE_DATASETS
+
     # Only squad dataset has "unknown" labels
     extractive_datasets = {"squad"}
     if dataset in extractive_datasets:
@@ -497,7 +557,11 @@ def run_sequential_multi_strategy(
     else:
         unknown_instruction = ""
 
-    if use_direct_format:
+    if use_mc_format:
+        system_message = (
+            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。"
+        )
+    elif use_direct_format:
         system_message = (
             f"You are a helpful medical assistant that answers questions given background passages.\n"
             f"Provide the answer directly without any special formatting."
@@ -516,12 +580,28 @@ def run_sequential_multi_strategy(
 
         # Use API or local model for generation
         if api_client is not None:
-            start = time.perf_counter()
-            response = api_client.generate(messages, max_tokens=max_new_tokens)
-            elapsed = time.perf_counter() - start
-            raw_response = clean_model_text(response.text)
-            prompt_tokens = response.prompt_tokens
-            gen_tokens = response.completion_tokens
+            max_retries = 3
+            retry_delay = 2.0
+            response = None
+            elapsed = 0.0
+            for attempt in range(max_retries):
+                start = time.perf_counter()
+                response = api_client.generate(messages, max_tokens=max_new_tokens)
+                elapsed += time.perf_counter() - start
+                if response.text and response.text.strip():
+                    break
+                elif attempt < max_retries - 1:
+                    logging.warning(
+                        "API returned empty response, retrying (%d/%d) after %.1fs delay...",
+                        attempt + 1, max_retries, retry_delay
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5
+                else:
+                    logging.warning("API returned empty response after %d retries", max_retries)
+            raw_response = clean_model_text(response.text) if response else ""
+            prompt_tokens = response.prompt_tokens if response else 0
+            gen_tokens = response.completion_tokens if response else 0
             chat_prompt = str(messages)  # For logging
         else:
             import torch
@@ -561,7 +641,7 @@ def run_sequential_multi_strategy(
             raw_response = clean_model_text(raw_response)
             gen_tokens = int(tokenizer(raw_response, return_tensors="pt").input_ids.shape[1])
 
-        final_answer, strict_valid = extract_box_answer(raw_response)
+        final_answer, strict_valid = extract_answer(raw_response, dataset)
         messages.append({"role": "assistant", "content": raw_response})
 
         qid = item["qid"]

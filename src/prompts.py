@@ -12,6 +12,9 @@ EXTRACTIVE_QA_DATASETS = {"squad", "quac", "hotpot"}
 # Datasets that use direct answer format (no <answer> tags required)
 DIRECT_ANSWER_DATASETS = {"cmb"}
 
+# Multiple-choice datasets (respond with option letter only)
+MULTIPLE_CHOICE_DATASETS = {"cmb_exam"}
+
 
 def build_dependency_prompt(
     background: str,
@@ -23,6 +26,9 @@ def build_dependency_prompt(
 ) -> Tuple[str, str]:
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
+
+    # Multiple-choice questions: respond with option letter only
+    use_mc_format = dataset in MULTIPLE_CHOICE_DATASETS
 
     # CMB uses direct answer format without <answer> tags
     use_direct_format = dataset in DIRECT_ANSWER_DATASETS
@@ -39,7 +45,12 @@ def build_dependency_prompt(
     else:
         extract_instruction = ""
 
-    if use_direct_format:
+    if use_mc_format:
+        system_prompt = (
+            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。\n\n"
+            f"背景信息:\n{effective_background.strip()}"
+        )
+    elif use_direct_format:
         system_prompt = (
             f"You are a helpful medical assistant that answers questions given background passages.\n"
             f"Provide the answer directly without any special formatting.\n\n"
@@ -77,6 +88,9 @@ def build_single_prompt(
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
 
+    # Multiple-choice questions: respond with option letter only
+    use_mc_format = dataset in MULTIPLE_CHOICE_DATASETS
+
     # CMB uses direct answer format without <answer> tags
     use_direct_format = dataset in DIRECT_ANSWER_DATASETS
 
@@ -92,7 +106,12 @@ def build_single_prompt(
     else:
         extract_instruction = ""
 
-    if use_direct_format:
+    if use_mc_format:
+        system_prompt = (
+            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。\n\n"
+            f"背景信息:\n{effective_background.strip()}"
+        )
+    elif use_direct_format:
         system_prompt = (
             f"You are a helpful medical assistant that answers questions given background passages.\n"
             f"Provide the answer directly without any special formatting.\n\n"

@@ -1,24 +1,43 @@
 # Parallel Decoding Experiments
 
-This project explores dependency-aware question answering on SQuAD, HotpotQA, and CMB using local LLM models. It contains core library code in `src/` and runnable scripts in `scripts/`.
+This project explores dependency-aware question answering and cross-batch generation on SQuAD, HotpotQA, CMB, and other datasets using local LLM models. It contains core library code in `src/` and runnable scripts in `scripts/`.
 
 ## Project Structure
 
 ```
-battlenet/
-├── src/                    # Core library
-│   ├── models.py          # Question, EdgeCandidate, etc.
-│   ├── scheduler.py       # DependencyScheduler, HTML visualiser
-│   ├── generators.py      # Dependency generators (Heuristic, LLM, BERT)
-│   ├── inference.py       # Chat prompt building, answer extraction
-│   ├── loaders.py         # SQuAD/HotpotQA data loading
-│   ├── selection.py       # Cost-aware edge selection
-│   ├── strategies/        # Strategy implementations
-│   └── ...
-├── scripts/               # Runnable scripts
-│   ├── compare_strategies.py
-│   ├── run_parallel.py
-│   ├── test_bert_dependencies.py
+parallel-agent/
+├── src/                       # Core library
+│   ├── models.py              # Question, StrategyResult, etc.
+│   ├── generators.py          # Dependency generators (Heuristic, LLM, BERT)
+│   ├── prompts.py             # Prompt building utilities
+│   ├── selection.py           # Cost-aware edge selection
+│   ├── utils.py               # Common utilities
+│   ├── report.py              # Results reporting
+│   ├── datasets/              # Dataset loaders
+│   │   ├── squad.py           # SQuAD dataset
+│   │   ├── hotpot.py          # HotpotQA dataset
+│   │   ├── cmb.py             # CMB (Chinese Medical Benchmark)
+│   │   ├── quac.py            # QuAC conversational QA
+│   │   ├── quality.py         # QuALITY long-context
+│   │   └── drop.py            # DROP discrete reasoning
+│   ├── evaluation/            # Evaluation metrics
+│   │   ├── basic.py           # EM, F1, lenient metrics
+│   │   ├── generation.py      # BLEU, ROUGE metrics
+│   │   └── llm.py             # LLM-based evaluation
+│   ├── strategies/            # Strategy implementations
+│   │   ├── all_in_one.py      # Single prompt strategy
+│   │   ├── sequential_batch.py # Sequential & batch strategies
+│   │   ├── dependency.py      # Dependency-aware strategy
+│   │   └── cross_batch.py     # Cross-batch generation strategy
+│   └── cross_batch/           # Cross-batch generation module
+│       ├── attention.py       # CrossBatchAttention, CrossBatchEmbeddingMixer
+│       ├── generator.py       # CrossBatchGenerator
+│       ├── trainer.py         # Training utilities
+│       └── eval.py            # SQuAD evaluation for cross-batch
+├── scripts/                   # Runnable scripts
+│   ├── compare_strategies.py  # Multi-strategy comparison
+│   ├── run_parallel.py        # Single-context dependency pipeline
+│   ├── test_bert_dependencies.py # BERT-based dependency experiments
 │   └── debug_batch_vs_sequential.py
 └── README.md
 ```
@@ -32,6 +51,7 @@ Runs multiple strategies side-by-side on sampled contexts:
 3. **batch** – all questions answered in one batch.
 4. **parallel** – dependency DAG (LLM edges).
 5. **parallel_bert** – dependency DAG (BERT attention edges).
+6. **cross_batch** – parallel generation with cross-batch attention for information sharing.
 
 For SQuAD, questions share a background; for HotpotQA, each question has its own context and strategies switch to multi-context mode automatically. Metrics reported per strategy: strict/lenient accuracy, prompt/gen tokens, latency, and batch count; averages are shown at the end.
 
@@ -237,3 +257,130 @@ Metrics are automatically selected based on dataset:
 | **Relevance** | How well the answer addresses the question (1-5) |
 | **Completeness** | Coverage of key information (1-5) |
 | **Proficiency** | Medical accuracy and terminology (1-5) |
+
+## Cross-Batch Generation Module
+
+The `src/cross_batch/` module implements cross-batch attention mechanisms that enable information sharing between samples during parallel generation. This can improve answer quality for related questions by allowing the model to leverage context from other samples in the batch.
+
+### Architecture
+
+The cross-batch module uses an additive design: `H_out = H + scale * cross_batch_info`, where the original hidden state is preserved and only additional information from other samples is added.
+
+**Key Components:**
+
+- **CrossBatchAttention**: Multi-head attention mechanism for cross-sample information sharing
+- **CrossBatchEmbeddingMixer**: Similarity-based mixer using cosine similarity for attention weights
+- **CrossBatchGenerator**: Wrapper that hooks into the model's forward pass to apply cross-batch mixing
+
+### Usage
+
+#### Basic Generation
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
+
+# Load model
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
+# Create cross-batch module
+cross_batch_module = CrossBatchAttention(hidden_size=model.config.hidden_size)
+
+# Create generator
+generator = CrossBatchGenerator(
+    model=model,
+    tokenizer=tokenizer,
+    cross_batch_module=cross_batch_module,
+    mix_layer=-1,  # Apply at last layer
+)
+
+# Generate with cross-batch interaction
+prompts = ["Question 1: ...", "Question 2: ...", "Question 3: ..."]
+encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+
+outputs = generator.generate(
+    input_ids=encoded["input_ids"],
+    attention_mask=encoded["attention_mask"],
+    max_new_tokens=50,
+    enable_cross_batch=True,
+)
+```
+
+#### Training the Cross-Batch Module
+
+```python
+from src.cross_batch import CrossBatchTrainer, train_cross_batch_module
+
+# Quick training with convenience function
+history = train_cross_batch_module(
+    model_name="gpt2",
+    mix_method="attention",
+    num_epochs=3,
+    batch_size=8,
+    learning_rate=1e-4,
+    save_dir="./checkpoints",
+)
+
+# Or use the trainer directly for more control
+trainer = CrossBatchTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    cross_batch_module=cross_batch_module,
+    train_lm_head=True,  # Also fine-tune lm_head
+)
+
+history = trainer.train(
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    num_epochs=3,
+    batch_size=8,
+    save_dir="./checkpoints",
+)
+```
+
+#### Evaluation on SQuAD
+
+```python
+from src.cross_batch import SquadEvaluator, run_comparison_eval
+
+# Run comparison evaluation
+results = run_comparison_eval(
+    generator=generator,
+    tokenizer=tokenizer,
+    batch_size=4,
+    max_samples=100,
+    max_new_tokens=32,
+)
+
+print(f"Cross-batch EM: {results['cross_batch']['metrics']['exact_match']:.2f}")
+print(f"Standard EM: {results['standard']['metrics']['exact_match']:.2f}")
+print(f"Improvement: {results['difference']['exact_match']:+.2f}")
+```
+
+### Cross-Batch Strategy in compare_strategies.py
+
+The cross-batch strategy can be used in the main comparison script:
+
+```bash
+python scripts/compare_strategies.py \
+  --dataset squad \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --strategies "batch,cross_batch" \
+  --context-count 10 \
+  --max-new-tokens 128
+```
+
+### Module API Reference
+
+| Class | Description |
+|-------|-------------|
+| `CrossBatchAttention` | Multi-head attention for cross-batch mixing |
+| `CrossBatchEmbeddingMixer` | Similarity-based cross-batch mixer |
+| `CrossBatchGenerator` | Generation wrapper with cross-batch hooks |
+| `CrossBatchTrainer` | Training for cross-batch module |
+| `LMHeadOnlyTrainer` | Baseline trainer (no cross-batch) |
+| `SQuADDataset` | Dataset class for training |
+| `SquadEvaluator` | Evaluation on SQuAD dataset |
+| `train_cross_batch_module` | Convenience training function |
+| `run_comparison_eval` | Compare cross-batch vs standard generation |

@@ -73,6 +73,10 @@ class APIClient:
             "base_url": "https://api.deepseek.com/v1",
             "env_key": "DEEPSEEK_API_KEY",
         },
+        "google-vertex": {
+            "base_url": "https://openrouter.ai/api/v1",  # OpenRouter proxy for Vertex AI
+            "env_key": "OPENROUTER_API_KEY",
+        },
     }
 
     def __init__(
@@ -85,6 +89,7 @@ class APIClient:
         temperature: float = 0.0,
         max_retries: int = 3,
         timeout: float = 120.0,
+        provider_order: Optional[List[str]] = None,
     ) -> None:
         """Initialize API client.
 
@@ -96,11 +101,14 @@ class APIClient:
             temperature: Sampling temperature (0.0 for deterministic)
             max_retries: Maximum retry attempts
             timeout: Request timeout in seconds
+            provider_order: OpenRouter provider routing order (e.g., ['google-vertex', 'together'])
         """
         self.model = model
         self.temperature = temperature
         self.max_retries = max_retries
         self.timeout = timeout
+        self.disable_thinking = self._is_thinking_model(model)
+        self.provider_order = provider_order  # For OpenRouter provider routing
 
         # Auto-detect provider from model name if not specified
         if provider is None:
@@ -114,7 +122,8 @@ class APIClient:
         elif provider and provider in self.PROVIDERS:
             self.base_url = self.PROVIDERS[provider]["base_url"]
         else:
-            self.base_url = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
+            # Default to OpenRouter for provider routing support
+            self.base_url = os.environ.get("API_BASE_URL", "https://openrouter.ai/api/v1")
 
         # Resolve API key
         if api_key:
@@ -123,7 +132,7 @@ class APIClient:
             env_key = self.PROVIDERS[provider]["env_key"]
             self.api_key = os.environ.get(env_key) or os.environ.get("API_KEY")
         else:
-            self.api_key = os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
+            self.api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
 
         if not self.api_key:
             raise ValueError(
@@ -135,9 +144,33 @@ class APIClient:
         self._init_client()
 
         logging.info(
-            "Initialized API client: provider=%s, model=%s, base_url=%s",
-            self.provider, self.model, self.base_url
+            "Initialized API client: provider=%s, model=%s, base_url=%s, provider_order=%s, disable_thinking=%s",
+            self.provider, self.model, self.base_url, self.provider_order, self.disable_thinking
         )
+
+    def _is_thinking_model(self, model: str) -> str:
+        """Check if model is a thinking/reasoning model and return the disable method.
+
+        Returns:
+            - "max_tokens": Use reasoning.max_tokens=0 (Qwen3, DeepSeek)
+            - "mandatory": Reasoning cannot be disabled, will output in reasoning_content field
+            - "": Not a thinking model, no special handling needed
+        """
+        model_lower = model.lower()
+        # Qwen3 models have thinking mode by default - use max_tokens method
+        if "qwen3" in model_lower or "qwen-3" in model_lower:
+            return "max_tokens"
+        # DeepSeek R1 and similar reasoning models - use max_tokens method
+        if "deepseek-r1" in model_lower or "deepseek-reasoner" in model_lower:
+            return "max_tokens"
+        # gpt-oss-120b has mandatory reasoning - cannot be disabled
+        # The actual answer appears in message.content, reasoning in reasoning_content
+        if "gpt-oss" in model_lower:
+            return "mandatory"
+        # o1, o3 reasoning models from OpenAI - reasoning is mandatory
+        if model_lower.startswith(("o1", "o3")):
+            return "mandatory"
+        return ""
 
     def _detect_provider(self, model: str) -> str:
         """Auto-detect provider from model name."""
@@ -179,6 +212,7 @@ class APIClient:
         max_tokens: int = 1024,
         temperature: Optional[float] = None,
         stop: Optional[List[str]] = None,
+        disable_thinking: bool = False,
     ) -> APIResponse:
         """Generate a completion from messages.
 
@@ -187,6 +221,7 @@ class APIClient:
             max_tokens: Maximum tokens to generate
             temperature: Override default temperature
             stop: Stop sequences
+            disable_thinking: If True, disable thinking mode for Qwen3/reasoning models
 
         Returns:
             APIResponse with generated text and token counts
@@ -195,19 +230,64 @@ class APIClient:
 
         start_time = time.perf_counter()
 
+        # Build extra parameters for the API call
+        extra_params: Dict[str, Any] = {}
+
+        # Disable thinking mode for reasoning models (where possible)
+        # Different models use different parameters:
+        # - Qwen3, DeepSeek: reasoning.max_tokens = 0
+        # - gpt-oss-120b, OpenAI o1/o3: reasoning is mandatory, cannot be disabled
+        thinking_method = self.disable_thinking
+        if thinking_method == "max_tokens":
+            extra_params["reasoning"] = {"max_tokens": 0}
+        # Note: "mandatory" models cannot have reasoning disabled, so we don't add any params
+
+        # OpenRouter provider routing: specify which providers to use
+        # See: https://openrouter.ai/docs/provider-routing
+        if self.provider_order:
+            extra_params["provider"] = {
+                "order": self.provider_order,
+                "allow_fallbacks": True,
+            }
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temp,
             stop=stop,
+            extra_body=extra_params if extra_params else None,
         )
 
         latency = time.perf_counter() - start_time
 
-        # Extract response
+        # Extract response with error handling
+        if response is None or not hasattr(response, 'choices') or not response.choices:
+            logging.warning("API returned empty response, returning empty result")
+            return APIResponse(
+                text="",
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                latency=latency,
+            )
         choice = response.choices[0]
-        text = choice.message.content or ""
+        message = choice.message
+        text = message.content or ""
+
+        # Handle thinking models that may output reasoning in a separate field
+        # Some APIs (like DeepSeek, Qwen) use reasoning_content field
+        reasoning = getattr(message, 'reasoning_content', None) or ""
+
+        # If text is empty but we have reasoning, the model might have put
+        # everything in thinking tags. Log a warning.
+        if not text and reasoning:
+            logging.warning(
+                "Model returned empty content but has reasoning_content. "
+                "This model may require thinking mode handling."
+            )
+            # Optionally include reasoning in text for debugging
+            # text = reasoning  # Uncomment if you want to use reasoning as fallback
 
         # Extract usage
         usage = response.usage
@@ -410,6 +490,7 @@ def create_api_inference(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     temperature: float = 0.0,
+    provider_order: Optional[List[str]] = None,
 ) -> Tuple[APITokenizerWrapper, APIModelWrapper, APIClient]:
     """Create API-based inference components.
 
@@ -422,6 +503,7 @@ def create_api_inference(
         base_url: Custom base URL
         api_key: API key
         temperature: Sampling temperature
+        provider_order: OpenRouter provider routing order (e.g., ['google-vertex', 'together'])
 
     Returns:
         Tuple of (tokenizer, model, api_client)
@@ -432,6 +514,7 @@ def create_api_inference(
         base_url=base_url,
         api_key=api_key,
         temperature=temperature,
+        provider_order=provider_order,
     )
 
     tokenizer = APITokenizerWrapper(client)

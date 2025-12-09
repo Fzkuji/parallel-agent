@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 
 def estimate_tokens(text: str) -> int:
@@ -71,3 +71,16 @@ class ScheduleResult:
     total_priority: float
     value_score: float
     total_estimated_latency: float
+
+
+@dataclass
+class StrategyResult:
+    """Aggregated metrics for a single inference strategy."""
+    name: str
+    answers: Dict[str, str]
+    prompt_tokens: int
+    generated_tokens: int
+    latency: float
+    batches: int
+    metrics: Dict[str, float]
+    details: Dict[str, Any]

@@ -91,6 +91,49 @@ def extract_box_answer(text: str) -> Tuple[str, bool]:
     return text.strip(), False
 
 
+def extract_option_letter(text: str) -> Tuple[str, bool]:
+    """Extract first option letter (A-F) from text for multiple-choice questions.
+
+    Strategy:
+    1. Find the first uppercase A-F letter in the text
+    2. This handles formats like "A", "A.", "A、", "答案是A", "<answer>D</answer>"
+
+    Returns:
+        Tuple of (letter, found) where:
+        - letter: The first A-F uppercase letter found, or empty string if none
+        - found: True if a letter was found, False otherwise
+    """
+    # Find the first uppercase A-F letter
+    for char in text:
+        if char in "ABCDEF":
+            return char, True
+
+    # Fallback: check if there's a lowercase a-f (model might output lowercase)
+    for char in text:
+        if char in "abcdef":
+            return char.upper(), True
+
+    return "", False
+
+
+def extract_answer(text: str, dataset: str = None) -> Tuple[str, bool]:
+    """Extract answer from text based on dataset type.
+
+    For multiple-choice datasets (cmb_exam), extracts the first option letter.
+    For other datasets, looks for <answer>...</answer> tags.
+
+    Args:
+        text: Raw model output
+        dataset: Dataset name to determine extraction method
+
+    Returns:
+        Tuple of (answer, valid) where valid indicates clean extraction
+    """
+    if dataset == "cmb_exam":
+        return extract_option_letter(text)
+    return extract_box_answer(text)
+
+
 def extract_json_from_text(text: str) -> dict:
     """Extract JSON from LLM output, handling markdown code blocks and thinking tokens."""
     cleaned = text.strip()

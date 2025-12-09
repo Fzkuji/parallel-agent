@@ -4,13 +4,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from src.models import Question
-from src.inference import build_chat_prompt, extract_box_answer
+from src.models import Question, StrategyResult
+from src.inference import build_chat_prompt, extract_answer
 from src.scheduler import DependencyScheduler
 from src.selection import apply_dependencies, select_dependency_edges
 from src.evaluation import evaluate_predictions
 from src.prompts import build_dependency_prompt
-from src.results import StrategyResult
 from src.utils import DEFAULT_GENERATION_SEED, reset_generation_seed, clean_model_text
 
 if TYPE_CHECKING:
@@ -122,23 +121,43 @@ def run_dependency_batch_strategy(
 
         # Use API or local model for generation
         if api_client is not None:
-            # API mode: process each question sequentially
+            # API mode: process each question sequentially with retry logic
             raw_texts = []
             gen_token_counts = []
             input_lengths = []
             elapsed = 0.0
+            max_retries = 3
+            retry_delay = 2.0  # seconds between retries
 
             for messages in batch_messages:
-                start = time.perf_counter()
-                response = api_client.generate(messages, max_tokens=max_new_tokens)
-                elapsed += time.perf_counter() - start
+                response = None
+                current_delay = retry_delay  # Reset delay for each question
+                for attempt in range(max_retries):
+                    start = time.perf_counter()
+                    response = api_client.generate(messages, max_tokens=max_new_tokens)
+                    elapsed += time.perf_counter() - start
 
-                raw_text = clean_model_text(response.text)
+                    # Check if response is valid (non-empty)
+                    if response.text and response.text.strip():
+                        break
+                    elif attempt < max_retries - 1:
+                        logging.warning(
+                            "API returned empty response, retrying (%d/%d) after %.1fs delay...",
+                            attempt + 1, max_retries, current_delay
+                        )
+                        time.sleep(current_delay)
+                        current_delay *= 1.5  # Exponential backoff
+                    else:
+                        logging.warning(
+                            "API returned empty response after %d retries", max_retries
+                        )
+
+                raw_text = clean_model_text(response.text) if response else ""
                 raw_texts.append(raw_text)
-                gen_token_counts.append(response.completion_tokens)
-                input_lengths.append(response.prompt_tokens)
+                gen_token_counts.append(response.completion_tokens if response else 0)
+                input_lengths.append(response.prompt_tokens if response else 0)
 
-            boxes = list(map(extract_box_answer, raw_texts))
+            boxes = [extract_answer(text, dataset) for text in raw_texts]
         else:
             import torch
             original_padding_side = tokenizer.padding_side
@@ -177,7 +196,7 @@ def run_dependency_batch_strategy(
                 rt = tokenizer.decode(tokens, skip_special_tokens=True).strip()
                 rt = clean_model_text(rt)
                 raw_texts.append(rt)
-            boxes = list(map(extract_box_answer, raw_texts))
+            boxes = [extract_answer(text, dataset) for text in raw_texts]
 
             gen_token_counts = [
                 int(tokenizer(raw_texts[idx], return_tensors="pt").input_ids.shape[1])

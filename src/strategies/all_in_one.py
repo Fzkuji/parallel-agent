@@ -6,10 +6,14 @@ import time
 import textwrap
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from src.models import Question
+from src.models import Question, StrategyResult
 from src.inference import USE_THINK_TOKENS
 from src.evaluation import evaluate_predictions
-from src.results import StrategyResult
+from src.prompts import (
+    EXTRACTIVE_DATASETS,
+    EXTRACTIVE_QA_DATASETS,
+    DIRECT_ANSWER_DATASETS,
+)
 from src.utils import (
     DEFAULT_GENERATION_SEED,
     reset_generation_seed,
@@ -22,16 +26,6 @@ if TYPE_CHECKING:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from src.api_client import APIClient
-
-
-# Only squad dataset has "unknown" labels
-EXTRACTIVE_DATASETS = {"squad"}
-
-# Datasets where answers should be extracted from context (not freely generated)
-EXTRACTIVE_QA_DATASETS = {"squad", "quac", "hotpot"}
-
-# Datasets that use direct answer format (no <answer> tags required)
-DIRECT_ANSWER_DATASETS = {"cmb"}
 
 
 def run_all_in_one_strategy(

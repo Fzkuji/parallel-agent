@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
-from .basic import compute_contains, compute_em, compute_f1
+from .basic import compute_choice_accuracy, compute_contains, compute_em, compute_f1
 from .generation import (
     compute_bleu4,
     compute_rouge1,
@@ -64,6 +64,10 @@ DATASET_METRICS: Dict[str, Dict[str, MetricFunc]] = {
         "strict_acc": compute_em,
         "f1": compute_f1,
         "lenient_acc": compute_contains,
+    },
+    # CMB-Exam: Multiple-choice medical exam questions (all variants use accuracy)
+    "cmb_exam": {
+        "acc": compute_choice_accuracy,
     },
 }
 

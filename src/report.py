@@ -1,9 +1,8 @@
 from typing import List, Optional
 
-from src.models import Question
+from src.models import Question, StrategyResult
 
-from .evaluation import normalize_answer, compute_rouge_l, get_metric_names
-from .results import StrategyResult
+from .evaluation import normalize_answer, compute_rouge_l, compute_choice_accuracy, get_metric_names
 
 # Display names for metrics (shorter names for table headers)
 METRIC_DISPLAY_NAMES = {
@@ -68,6 +67,7 @@ def print_answer_table(
     max_answer_len = 40
     max_question_len = 60
     use_rouge = dataset == "cmb"
+    use_choice = dataset == "cmb_exam"
 
     for question in questions:
         gold = "; ".join(question.references) if question.references else ""
@@ -86,6 +86,11 @@ def print_answer_table(
                 score = compute_rouge_l(ans, question.references)
                 truncated = ans[:max_answer_len] if len(ans) > max_answer_len else ans
                 return f"[{score:.2f}] {truncated}"
+            elif use_choice:
+                # For CMB-Exam: use choice accuracy (compare first A-F letter)
+                if compute_choice_accuracy(ans, question.references) == 1.0:
+                    return f"✓ {ans[:max_answer_len]}"
+                return f"✗ {ans[:max_answer_len]}"
             else:
                 # For SQuAD/HotpotQA: show ✓/✗ based on exact match
                 norm_ans = normalize_answer(ans)

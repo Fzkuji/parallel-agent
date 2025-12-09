@@ -40,6 +40,7 @@ from src import (
     set_think_tokens,
     APIClient,
 )
+from src.datasets import load_cmb_exam_random_groups, load_cmb_exam_subdomain_groups, load_cmb_exam_context_groups
 from src.strategies import (
     StrategyResult,
     run_all_in_one_strategy,
@@ -52,6 +53,23 @@ from src.strategies import (
     run_sequential_multi_strategy,
     summarize_results,
 )
+from src.strategies.cross_batch import (
+    run_cross_batch_strategy,
+    run_cross_batch_multi_strategy,
+)
+
+
+def get_eval_dataset(args: argparse.Namespace) -> str:
+    """Get the dataset identifier for evaluation based on args.
+
+    CMB-Exam subsets (random, subdomain, context) use 'cmb_exam' metrics (accuracy),
+    while CMB-Clin uses 'cmb' metrics (BLEU/ROUGE).
+    """
+    if args.dataset == "cmb":
+        if args.cmb_subset in ("random", "subdomain", "context"):
+            return "cmb_exam"
+        return "cmb"  # CMB-Clin uses BLEU/ROUGE
+    return args.dataset
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,7 +90,8 @@ def parse_args() -> argparse.Namespace:
         help="For SQuAD, sample individual questions randomly instead of grouping by shared context.",
     )
     parser.add_argument("--hotpot-subset", default="distractor", help="HotpotQA subset (e.g., distractor).")
-    parser.add_argument("--cmb-subset", default="CMB-Clin", help="CMB subset (e.g., CMB-Clin).")
+    parser.add_argument("--cmb-subset", default="CMB-Clin",
+                        help="CMB subset: 'CMB-Clin' (clinical cases), 'random' (random grouping baseline), 'subdomain' (grouped by medical terms), 'context' (shared background).")
     parser.add_argument("--quality-hard-only", action="store_true", help="For QuALITY, only use hard questions.")
 
     parser.add_argument("--cost-weight", type=float, default=0.0, help="Cost penalty weight for dependency selection (set to 0 to let model decide).")
@@ -87,11 +106,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Comma-separated list of strategies to test (e.g., 'all_in_one,sequential,batch'). "
-             "Available: all_in_one, sequential, batch, parallel, parallel_bert. "
+             "Available: all_in_one, sequential, batch, parallel, parallel_bert, cross_batch. "
              "If not specified, all strategies will be tested.",
     )
     parser.add_argument("--no-llm-deps", action="store_true", help="Force heuristic dependency generator.")
-    parser.add_argument("--json-out", type=Path, default=None, help="Optional path to dump metrics as JSON.")
+    parser.add_argument("--json-out", type=Path, default=Path("outputs_json"), help="Path to save experiment results (default: outputs_json).")
     parser.add_argument("--no-think-tokens", action="store_true", help="Disable <think></think> markers.")
     parser.add_argument("--use-think-tokens", action="store_true", help="Enable <think></think> markers.")
     parser.add_argument("--verbose-debug", action="store_true", help="Print detailed prompts and responses.")
@@ -165,15 +184,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--api-provider",
         type=str,
-        choices=["openai", "openrouter", "together", "deepseek"],
         default=None,
-        help="API provider (auto-detected from model name if not specified).",
+        help="API provider (e.g., 'openai', 'openrouter', 'together', 'deepseek'). "
+             "Auto-detected from model name if not specified.",
     )
     parser.add_argument(
         "--api-base-url",
         type=str,
         default=None,
         help="Custom API base URL (overrides provider default).",
+    )
+    # Cross-batch strategy arguments
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Path to trained cross-batch module checkpoint for cross_batch strategy.",
+    )
+    parser.add_argument(
+        "--cross-batch-mix-method",
+        type=str,
+        default="attention",
+        choices=["attention", "mixer"],
+        help="Cross-batch mixing method (attention or mixer).",
+    )
+    parser.add_argument(
+        "--cross-batch-mix-layer",
+        type=int,
+        default=-1,
+        help="Which layer's hidden state to mix (-1 for last layer).",
     )
     return parser.parse_args()
 
@@ -210,7 +249,7 @@ def resolve_dependency_generators(
     return dep_generator, bert_dep_generator, bert_conf_threshold
 
 
-ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "parallel", "parallel_bert"]
+ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "parallel", "parallel_bert", "cross_batch"]
 
 
 def run_all_strategies(
@@ -225,12 +264,15 @@ def run_all_strategies(
     bert_conf_threshold: float,
     selected_strategies: Optional[List[str]] = None,
     api_client: Optional[APIClient] = None,
+    eval_dataset: Optional[str] = None,
 ) -> List[StrategyResult]:
     # Default to all strategies if none specified
     if selected_strategies is None:
         selected_strategies = ALL_STRATEGIES
 
     results: List[StrategyResult] = []
+    # Use eval_dataset if provided, otherwise fall back to args.dataset
+    effective_dataset = eval_dataset or args.dataset
 
     # Multi-context mode: if questions is None and items provided, use items-based strategies
     if background is None and isinstance(questions, list) and questions and isinstance(questions[0], dict) and "context" in questions[0]:
@@ -242,7 +284,7 @@ def run_all_strategies(
                 model,
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="all_in_one",
-                dataset=args.dataset,
+                dataset=effective_dataset,
                 api_client=api_client,
             ))
         if "sequential" in selected_strategies:
@@ -252,7 +294,7 @@ def run_all_strategies(
                 model,
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="sequential",
-                dataset=args.dataset,
+                dataset=effective_dataset,
                 api_client=api_client,
             ))
         if "batch" in selected_strategies:
@@ -262,7 +304,7 @@ def run_all_strategies(
                 model,
                 max_new_tokens=args.max_new_tokens,
                 strategy_name="batch",
-                dataset=args.dataset,
+                dataset=effective_dataset,
                 api_client=api_client,
             ))
         # For dependency strategies in multi-context mode, store context per question
@@ -293,7 +335,7 @@ def run_all_strategies(
                     total_cost_budget=args.total_cost_budget,
                     max_new_tokens=args.max_new_tokens,
                     strategy_name="parallel",
-                    dataset=args.dataset,
+                    dataset=effective_dataset,
                     api_client=api_client,
                 ))
             if "parallel_bert" in selected_strategies:
@@ -309,9 +351,22 @@ def run_all_strategies(
                     total_cost_budget=args.total_cost_budget,
                     max_new_tokens=args.max_new_tokens,
                     strategy_name="parallel_bert",
-                    dataset=args.dataset,
+                    dataset=effective_dataset,
                     api_client=api_client,
                 ))
+        if "cross_batch" in selected_strategies:
+            results.append(run_cross_batch_multi_strategy(
+                items,
+                tokenizer,
+                model,
+                max_new_tokens=args.max_new_tokens,
+                strategy_name="cross_batch",
+                dataset=effective_dataset,
+                mix_method=args.cross_batch_mix_method,
+                mix_layer=args.cross_batch_mix_layer,
+                checkpoint_path=args.checkpoint_path,
+                enable_cross_batch=True,
+            ))
         return results
 
     if "all_in_one" in selected_strategies:
@@ -321,7 +376,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
-            dataset=args.dataset,
+            dataset=effective_dataset,
             api_client=api_client,
         ))
     if "sequential" in selected_strategies:
@@ -331,7 +386,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
-            dataset=args.dataset,
+            dataset=effective_dataset,
             api_client=api_client,
         ))
     if "batch" in selected_strategies:
@@ -341,7 +396,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
-            dataset=args.dataset,
+            dataset=effective_dataset,
             api_client=api_client,
         ))
     if "parallel" in selected_strategies:
@@ -357,7 +412,7 @@ def run_all_strategies(
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel",
-            dataset=args.dataset,
+            dataset=effective_dataset,
             api_client=api_client,
         ))
     if "parallel_bert" in selected_strategies:
@@ -373,14 +428,30 @@ def run_all_strategies(
             total_cost_budget=args.total_cost_budget,
             max_new_tokens=args.max_new_tokens,
             strategy_name="parallel_bert",
-            dataset=args.dataset,
+            dataset=effective_dataset,
             api_client=api_client,
+        ))
+    if "cross_batch" in selected_strategies:
+        results.append(run_cross_batch_strategy(
+            background,
+            questions,
+            tokenizer,
+            model,
+            max_new_tokens=args.max_new_tokens,
+            dataset=effective_dataset,
+            mix_method=args.cross_batch_mix_method,
+            mix_layer=args.cross_batch_mix_layer,
+            checkpoint_path=args.checkpoint_path,
+            enable_cross_batch=True,
         ))
     return results
 
 
 def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "squad") -> str:
     """Compute and format aggregate metrics across all contexts and strategies.
+
+    Metrics are weighted by the number of questions in each context group,
+    so groups with more questions contribute proportionally more to the average.
 
     Args:
         serialized_contexts: List of serialized context results
@@ -405,6 +476,11 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
 
     for ctx in serialized_contexts:
         strategies = ctx.get("strategies", {})
+        # Get number of questions in this context
+        # Try different ways to get question count
+        questions_text = ctx.get("questions_text", [])
+        n_questions = len(questions_text) if isinstance(questions_text, list) else 1
+
         # Handle both dict format (new) and list format (legacy)
         if isinstance(strategies, list):
             strategy_items = [(s.get("name", "unknown"), s) for s in strategies]
@@ -413,33 +489,42 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
 
         for name, strategy in strategy_items:
             metrics = strategy.get("metrics", {})
+            # Fallback: try to get question count from answers dict
+            if n_questions <= 1:
+                answers = strategy.get("answers", {})
+                if answers:
+                    n_questions = len(answers)
+
             if name not in strategy_totals:
                 strategy_totals[name] = {
                     "prompt_tokens": 0,
                     "generated_tokens": 0,
                     "latency": 0.0,
-                    "count": 0,
+                    "context_count": 0,  # Number of context groups
+                    "question_count": 0,  # Total number of questions (for weighted avg)
                     "batches": 0,
                 }
-                # Initialize dataset-specific metrics
+                # Initialize dataset-specific metrics (weighted sums)
                 for m in metric_names:
                     strategy_totals[name][m] = 0.0
-                # Initialize LLM metrics
+                # Initialize LLM metrics (weighted sums)
                 for m in llm_metric_names:
                     strategy_totals[name][m] = 0.0
 
             stats = strategy_totals[name]
-            # Accumulate dataset-specific metrics
+            # Accumulate dataset-specific metrics weighted by question count
+            # metrics[m] is the average for this context, multiply by n_questions to get sum
             for m in metric_names:
-                stats[m] += metrics.get(m, 0.0)
-            # Accumulate LLM metrics
+                stats[m] += metrics.get(m, 0.0) * n_questions
+            # Accumulate LLM metrics weighted by question count
             for m in llm_metric_names:
-                stats[m] += metrics.get(m, 0.0)
+                stats[m] += metrics.get(m, 0.0) * n_questions
             stats["prompt_tokens"] += strategy.get("prompt_tokens", 0)
             stats["generated_tokens"] += strategy.get("generated_tokens", 0)
             stats["latency"] += strategy.get("latency", 0.0)
             stats["batches"] += strategy.get("batches", 0)
-            stats["count"] += 1
+            stats["context_count"] += 1
+            stats["question_count"] += n_questions
 
     summary_lines = ["\n=== Aggregate Metrics ==="]
 
@@ -455,6 +540,8 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
             header = "Strategy | BLEU-4 | R-1 | R-2 | R-L | LLM-Avg | Latency(s) | Batches"
         else:
             header = "Strategy | BLEU-4 | R-1 | R-2 | R-L | PromptTok | GenTok | Latency(s) | Batches"
+    elif dataset == "cmb_exam":
+        header = "Strategy | Acc | PromptTok | GenTok | Latency(s) | Batches"
     else:
         header = "Strategy | EM | F1 | Lenient | PromptTok | GenTok | Latency(s) | Batches"
     separator = "-" * len(header)
@@ -467,42 +554,53 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
         stats = strategy_totals.get(name)
         if not stats:
             continue
-        count = stats["count"] or 1
-        avg_prompt = stats["prompt_tokens"] / count
-        avg_gen = stats["generated_tokens"] / count
-        avg_latency = stats["latency"] / count
-        avg_batches = stats["batches"] / count
+        # Use question_count for metrics (weighted average), context_count for other stats
+        q_count = stats["question_count"] or 1
+        ctx_count = stats["context_count"] or 1
+        avg_prompt = stats["prompt_tokens"] / ctx_count
+        avg_gen = stats["generated_tokens"] / ctx_count
+        avg_latency = stats["latency"] / ctx_count
+        avg_batches = stats["batches"] / ctx_count
 
         if dataset == "cmb":
             if has_llm_metrics:
                 summary_lines.append(
                     f"{name:<13} | "
-                    f"{stats['bleu4']/count:.3f} | "
-                    f"{stats['rouge1']/count:.3f} | "
-                    f"{stats['rouge2']/count:.3f} | "
-                    f"{stats['rougeL']/count:.3f} | "
-                    f"{stats['llm_average']/count:.2f} | "
+                    f"{stats['bleu4']/q_count:.3f} | "
+                    f"{stats['rouge1']/q_count:.3f} | "
+                    f"{stats['rouge2']/q_count:.3f} | "
+                    f"{stats['rougeL']/q_count:.3f} | "
+                    f"{stats['llm_average']/q_count:.2f} | "
                     f"{avg_latency:.2f} | "
                     f"{avg_batches:.2f}"
                 )
             else:
                 summary_lines.append(
                     f"{name:<13} | "
-                    f"{stats['bleu4']/count:.3f} | "
-                    f"{stats['rouge1']/count:.3f} | "
-                    f"{stats['rouge2']/count:.3f} | "
-                    f"{stats['rougeL']/count:.3f} | "
+                    f"{stats['bleu4']/q_count:.3f} | "
+                    f"{stats['rouge1']/q_count:.3f} | "
+                    f"{stats['rouge2']/q_count:.3f} | "
+                    f"{stats['rougeL']/q_count:.3f} | "
                     f"{avg_prompt:.2f} | "
                     f"{avg_gen:.2f} | "
                     f"{avg_latency:.2f} | "
                     f"{avg_batches:.2f}"
                 )
+        elif dataset == "cmb_exam":
+            summary_lines.append(
+                f"{name:<13} | "
+                f"{stats.get('acc', 0)/q_count:.3f} | "
+                f"{avg_prompt:.2f} | "
+                f"{avg_gen:.2f} | "
+                f"{avg_latency:.2f} | "
+                f"{avg_batches:.2f}"
+            )
         else:
             summary_lines.append(
                 f"{name:<13} | "
-                f"{stats['strict_acc']/count:.3f} | "
-                f"{stats['f1']/count:.3f} | "
-                f"{stats['lenient_acc']/count:.3f} | "
+                f"{stats['strict_acc']/q_count:.3f} | "
+                f"{stats['f1']/q_count:.3f} | "
+                f"{stats['lenient_acc']/q_count:.3f} | "
                 f"{avg_prompt:.2f} | "
                 f"{avg_gen:.2f} | "
                 f"{avg_latency:.2f} | "
@@ -518,14 +616,14 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
             stats = strategy_totals.get(name)
             if not stats:
                 continue
-            count = stats["count"] or 1
+            q_count = stats["question_count"] or 1
             summary_lines.append(
                 f"{name:<13} | "
-                f"{stats['llm_fluency']/count:.2f} | "
-                f"{stats['llm_relevance']/count:.2f} | "
-                f"{stats['llm_completeness']/count:.2f} | "
-                f"{stats['llm_proficiency']/count:.2f} | "
-                f"{stats['llm_average']/count:.2f}"
+                f"{stats['llm_fluency']/q_count:.2f} | "
+                f"{stats['llm_relevance']/q_count:.2f} | "
+                f"{stats['llm_completeness']/q_count:.2f} | "
+                f"{stats['llm_proficiency']/q_count:.2f} | "
+                f"{stats['llm_average']/q_count:.2f}"
             )
 
     return "\n".join(summary_lines)
@@ -609,7 +707,9 @@ def extract_error_cases(serialized_contexts: List[dict]) -> List[dict]:
 
 def generate_output_folder_name(args: argparse.Namespace, timestamp: str) -> str:
     """Generate descriptive output folder name with timestamp and experiment parameters."""
-    model_short = args.model_name.split("/")[-1]
+    # Use api_model if specified, otherwise use model_name
+    model_name = args.api_model if args.use_api and args.api_model else args.model_name
+    model_short = model_name.split("/")[-1]
     # Build dataset identifier: squad_train, hotpot_distractor_train, cmb_CMB-Clin_test, quac_train
     if args.dataset == "hotpot":
         dataset_id = f"hotpot_{args.hotpot_subset}_{args.split}"
@@ -624,8 +724,8 @@ def generate_output_folder_name(args: argparse.Namespace, timestamp: str) -> str
         dataset_id = f"drop_{args.split}"
     else:
         dataset_id = f"squad_{args.split}"
-    # Format: timestamp_dataset_model_n{samples}_q{questions}
-    return f"{timestamp}_{dataset_id}_{model_short}_n{args.context_count}_q{args.min_questions}-{args.max_questions}"
+    # Format: timestamp_dataset_model_ctx{context_count}_q{questions}
+    return f"{timestamp}_{dataset_id}_{model_short}_ctx{args.context_count}_q{args.min_questions}-{args.max_questions}"
 
 
 def save_experiment_results(
@@ -722,6 +822,8 @@ def save_experiment_results(
 
 def main() -> None:
     args = parse_args()
+    # Determine evaluation dataset (CMB-Exam subsets use accuracy, CMB-Clin uses BLEU/ROUGE)
+    eval_dataset = get_eval_dataset(args)
     # Default: disable think tokens for batch compatibility; allow opt-in via --use-think-tokens
     use_think = args.use_think_tokens and not args.no_think_tokens
     set_think_tokens(use_think)
@@ -742,11 +844,13 @@ def main() -> None:
 
     if args.use_api:
         api_model = args.api_model or args.model_name
-        logging.info("Using API mode with model: %s (provider: %s)", api_model, args.api_provider or "auto")
+        # Convert api_provider to provider_order list for OpenRouter routing
+        provider_order = [args.api_provider] if args.api_provider else None
+        logging.info("Using API mode with model: %s (provider_order: %s)", api_model, provider_order or "auto")
         api_client = APIClient(
             model=api_model,
-            provider=args.api_provider,
             base_url=args.api_base_url,
+            provider_order=provider_order,
         )
         # For API mode, we still need a tokenizer for prompt formatting (use a small one)
         # Try to load a lightweight tokenizer for chat template
@@ -818,14 +922,40 @@ def main() -> None:
             seed=args.seed,
         )
     elif args.dataset == "cmb":
-        contexts = load_cmb_groups(
-            args.split,
-            subset=args.cmb_subset,
-            min_questions=args.min_questions,
-            max_questions=args.max_questions,
-            max_contexts=args.context_count,
-            seed=args.seed,
-        )
+        if args.cmb_subset == "random":
+            # Original CMB-Exam with random grouping (no shared context)
+            contexts = load_cmb_exam_random_groups(
+                args.split,
+                questions_per_group=args.max_questions or 5,
+                max_contexts=args.context_count,
+                seed=args.seed,
+            )
+        elif args.cmb_subset == "subdomain":
+            contexts = load_cmb_exam_subdomain_groups(
+                args.split,
+                min_questions=args.min_questions,
+                max_questions=args.max_questions,
+                max_contexts=args.context_count,
+                seed=args.seed,
+            )
+        elif args.cmb_subset == "context":
+            contexts = load_cmb_exam_context_groups(
+                args.split,
+                min_questions=args.min_questions,
+                max_questions=args.max_questions,
+                max_contexts=args.context_count,
+                seed=args.seed,
+            )
+        else:
+            # Original CMB-Clin or other FreedomIntelligence/CMB subsets
+            contexts = load_cmb_groups(
+                args.split,
+                subset=args.cmb_subset,
+                min_questions=args.min_questions,
+                max_questions=args.max_questions,
+                max_contexts=args.context_count,
+                seed=args.seed,
+            )
     elif args.dataset == "quac":
         contexts = load_quac_groups(
             args.split,
@@ -913,6 +1043,7 @@ def main() -> None:
                 bert_conf_threshold=bert_conf_threshold,
                 selected_strategies=selected_strategies,
                 api_client=api_client,
+                eval_dataset=eval_dataset,
             )
             questions = [
                 Question(
@@ -943,19 +1074,20 @@ def main() -> None:
                 bert_conf_threshold=bert_conf_threshold,
                 selected_strategies=selected_strategies,
                 api_client=api_client,
+                eval_dataset=eval_dataset,
             )
         overall_results[title] = strategy_list
 
         print(f"\n=== Context: {title} ===")
-        print(summarize_results(strategy_list, dataset=args.dataset))
-        print_answer_table(questions, strategy_list, dataset=args.dataset)
+        print(summarize_results(strategy_list, dataset=eval_dataset))
+        print_answer_table(questions, strategy_list, dataset=eval_dataset)
 
         # Build serialization structure (simple list format)
         questions_text = [f"{q.qid}: {q.text.strip()}" for q in questions]
         gold_answers = [f"{q.qid}: {q.references[0] if q.references else ''}" for q in questions]
 
         # Get dataset-specific metrics
-        dataset_metrics = get_dataset_metrics(args.dataset)
+        dataset_metrics = get_dataset_metrics(eval_dataset)
 
         strategies_data = {}
         for res in strategy_list:
@@ -1030,11 +1162,11 @@ def main() -> None:
                 if ctx_list:
                     merged.extend(ctx_list)
             # Print aggregate metrics from all ranks (only on rank 0)
-            print(compute_aggregate_metrics(merged, dataset=args.dataset))
+            print(compute_aggregate_metrics(merged, dataset=eval_dataset))
             save_experiment_results(args.json_out, merged, args, output_folder_name)
     else:
         # Single process mode: print and save local results
-        print(compute_aggregate_metrics(serialized_contexts, dataset=args.dataset))
+        print(compute_aggregate_metrics(serialized_contexts, dataset=eval_dataset))
         save_experiment_results(args.json_out, serialized_contexts, args, output_folder_name)
 
     # Cleanup distributed backend
