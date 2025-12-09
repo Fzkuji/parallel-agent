@@ -1,6 +1,6 @@
 # Parallel Decoding Experiments
 
-This project explores dependency-aware question answering and cross-batch generation on SQuAD, HotpotQA, CMB, and other datasets using local LLM models. It contains core library code in `src/` and runnable scripts in `scripts/`.
+This project explores dependency-aware question answering and collaborative generation strategies on SQuAD, HotpotQA, CMB, and other datasets. It contains core library code in `src/` and runnable scripts in `scripts/`.
 
 ## Project Structure
 
@@ -33,63 +33,119 @@ parallel-agent/
 │       ├── attention.py       # CrossBatchAttention, CrossBatchEmbeddingMixer
 │       ├── generator.py       # CrossBatchGenerator
 │       ├── trainer.py         # Training utilities
-│       └── eval.py            # SQuAD evaluation for cross-batch
+│       └── eval.py            # Evaluation for cross-batch
 ├── scripts/                   # Runnable scripts
 │   ├── compare_strategies.py  # Multi-strategy comparison
+│   ├── train_cross_batch.py   # Train cross-batch module
 │   ├── run_parallel.py        # Single-context dependency pipeline
-│   ├── test_bert_dependencies.py # BERT-based dependency experiments
-│   └── debug_batch_vs_sequential.py
+│   └── test_bert_dependencies.py # BERT-based dependency experiments
 └── README.md
 ```
 
-## scripts/compare_strategies.py
+## Strategies Overview
 
-Runs multiple strategies side-by-side on sampled contexts:
+The main comparison script (`scripts/compare_strategies.py`) supports the following strategies:
 
-1. **all_in_one** – single prompt with all questions (paired with their contexts).
-2. **sequential** – one question per turn (history grows).
-3. **batch** – all questions answered in one batch.
-4. **parallel** – dependency DAG (LLM edges).
-5. **parallel_bert** – dependency DAG (BERT attention edges).
-6. **cross_batch** – parallel generation with cross-batch attention for information sharing.
+| Strategy | Description |
+|----------|-------------|
+| `all_in_one` | Single prompt with all questions |
+| `sequential` | One question per turn (history grows) |
+| `batch` | All questions answered in one parallel batch |
+| `collab_llm` | Dependency DAG via LLM analysis, answers in dependency order |
+| `collab_bert` | Dependency DAG via BERT attention, answers in dependency order |
+| `collab_hidden` | Cross-batch hidden state mixing during generation (requires trained checkpoint) |
 
-For SQuAD, questions share a background; for HotpotQA, each question has its own context and strategies switch to multi-context mode automatically. Metrics reported per strategy: strict/lenient accuracy, prompt/gen tokens, latency, and batch count; averages are shown at the end.
+**Note:** The `collab_hidden` strategy requires a trained checkpoint (`--collab-hidden-checkpoint`). It will be automatically skipped if no checkpoint is provided. This strategy is only available with local models, not with API-based inference.
 
-Use the `--bert-*` flags (model name, thresholds, token caps, and cost weight) to tune attention-based dependencies; `--no-llm-deps` disables LLM edge generation.
+## Quick Start
 
-### Key arguments
+### Basic Usage
 
-- `--dataset {squad,hotpot,quac,cmb,quality,drop}`: choose dataset. Hotpot enables multi-context mode (each question has its own context). CMB is Chinese Medical Benchmark with clinical case analysis. QuALITY is long-context reading comprehension (~5000 words per article). DROP requires discrete reasoning (arithmetic, counting, sorting).
-- `--model-name`: HF model id or local path.
-- `--context-count`: number of sampled groups/steps.
-- `--min-questions / --max-questions`: number of questions per group.
-- `--hotpot-subset`: HotpotQA subset (e.g., `distractor`).
-- `--cmb-subset`: CMB subset (default: `CMB-Clin`).
-- `--max-new-tokens`: generation cap.
-- `--json-out`: write summary JSON; on multi-GPU a single merged file is produced.
-- `--log-level`: logging verbosity.
-- `--strategies`: comma-separated list of strategies to test (e.g., `--strategies "all_in_one,sequential,batch"`). Available: `all_in_one`, `sequential`, `batch`, `parallel`, `parallel_bert`. If not specified, all strategies will be tested.
-- `--no-llm-deps`: disable LLM edge generation (parallel uses heuristics/attention only).
-- `--max-dependencies`: cap edges per target.
-- `--min-confidence`: minimum edge confidence.
-- `--cost-weight` / `--total-cost-budget`: tune dependency selection cost.
-- `--eval-model`: OpenRouter model ID for LLM-based evaluation (e.g., `openai/gpt-4o`). Requires `OPENROUTER_API_KEY` env var.
+```bash
+python scripts/compare_strategies.py \
+  --dataset squad \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --context-count 10 \
+  --min-questions 5 \
+  --max-questions 5 \
+  --max-new-tokens 128
+```
 
-### SQuAD (multi-GPU)
+### Multi-GPU Usage
 
 ```bash
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --dataset squad \
   --model-name Qwen/Qwen2.5-7B-Instruct \
-  --context-count 10 \
+  --context-count 100 \
   --min-questions 8 \
   --max-questions 8 \
   --max-new-tokens 1024 \
-  --json-out outputs_json/results_squad.json \
-  --log-level INFO
+  --json-out outputs_json/results_squad.json
 ```
 
-### HotpotQA (multi-GPU, multi-context)
+### API-Based Inference
+
+Use `--use-api` for API-based inference instead of local models. Supports OpenRouter, DeepSeek, and other providers.
+
+```bash
+export OPENROUTER_API_KEY=your_key_here
+
+python scripts/compare_strategies.py \
+  --dataset squad \
+  --use-api \
+  --api-model "qwen/qwen3-30b-a3b" \
+  --context-count 10 \
+  --strategies "all_in_one,sequential,batch,collab_llm,collab_bert"
+```
+
+**Note:** `collab_hidden` is not supported with API inference as it requires access to model hidden states.
+
+## Key Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--dataset` | Dataset: `squad`, `hotpot`, `quac`, `cmb`, `quality`, `drop` |
+| `--model-name` | HuggingFace model ID or local path |
+| `--context-count` | Number of sampled groups |
+| `--min-questions` / `--max-questions` | Questions per group |
+| `--max-new-tokens` | Generation token limit |
+| `--strategies` | Comma-separated list (e.g., `all_in_one,batch,collab_llm`) |
+| `--json-out` | Output directory for results |
+| `--use-api` | Use API-based inference |
+| `--api-model` | Model ID for API inference |
+
+### Collaborative Strategy Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--no-llm-deps` | Use heuristic instead of LLM for dependency generation |
+| `--max-dependencies` | Max edges per question |
+| `--min-confidence` | Minimum edge confidence threshold |
+| `--bert-model-name` | BERT model for `collab_bert` (default: `bert-base-uncased`) |
+| `--bert-attention-threshold` | Attention threshold for BERT edges |
+| `--collab-hidden-checkpoint` | Path to trained collab_hidden module checkpoint |
+| `--collab-hidden-mix-method` | Mixing method: `attention` or `mixer` |
+| `--collab-hidden-mix-layer` | Which layer to apply mixing (-1 for last) |
+
+## Dataset Examples
+
+### SQuAD
+
+```bash
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset squad \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --context-count 100 \
+  --min-questions 8 \
+  --max-questions 8 \
+  --max-new-tokens 1024 \
+  --json-out outputs_json/results_squad.json
+```
+
+### HotpotQA (Multi-Context)
+
+Each question has its own context. Strategies automatically switch to multi-context mode.
 
 ```bash
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
@@ -100,16 +156,15 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --min-questions 4 \
   --max-questions 4 \
   --max-new-tokens 1024 \
-  --json-out outputs_json/results_hotpot.json \
-  --log-level INFO
+  --json-out outputs_json/results_hotpot.json
 ```
 
 ### CMB (Chinese Medical Benchmark)
 
-CMB uses BLEU-4 and ROUGE metrics automatically. Optionally add `--eval-model` for LLM-based evaluation (requires `OPENROUTER_API_KEY`).
+Uses BLEU-4 and ROUGE metrics. Optionally add `--eval-model` for LLM-based evaluation.
 
 ```bash
-export OPENROUTER_API_KEY=your_key_here  # Optional: for LLM evaluation
+export OPENROUTER_API_KEY=your_key_here  # Optional
 
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --dataset cmb \
@@ -121,13 +176,12 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --max-questions 4 \
   --max-new-tokens 1024 \
   --json-out outputs_json/results_cmb.json \
-  --log-level INFO \
-  --eval-model openai/gpt-4o  # Optional: requires OPENROUTER_API_KEY
+  --eval-model openai/gpt-4o  # Optional
 ```
 
 ### QuAC (Conversational QA)
 
-QuAC is a conversational QA dataset where questions build on each other. Uses EM, F1, and Lenient metrics.
+Questions build on each other in a conversation.
 
 ```bash
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
@@ -138,28 +192,12 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --min-questions 3 \
   --max-questions 6 \
   --max-new-tokens 256 \
-  --json-out outputs_json/results_quac.json \
-  --log-level INFO
+  --json-out outputs_json/results_quac.json
 ```
 
-### QuALITY (Long-Context Reading Comprehension)
+### QuALITY (Long-Context)
 
-QuALITY is a challenging long-context multiple-choice reading comprehension dataset. Each article is ~5000 words with ~18 questions per article. Use `--quality-hard-only` to focus on difficult questions that require full document understanding.
-
-```bash
-torchrun --nproc_per_node=8 scripts/compare_strategies.py \
-  --dataset quality \
-  --split validation \
-  --model-name Qwen/Qwen2.5-14B-Instruct \
-  --context-count 20 \
-  --min-questions 5 \
-  --max-questions 10 \
-  --max-new-tokens 256 \
-  --json-out outputs_json/results_quality.json \
-  --log-level INFO
-```
-
-For hard questions only (recommended for testing complex reasoning):
+Long-context reading comprehension (~5000 words per article).
 
 ```bash
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
@@ -171,13 +209,12 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --min-questions 5 \
   --max-questions 10 \
   --max-new-tokens 256 \
-  --json-out outputs_json/results_quality_hard.json \
-  --log-level INFO
+  --json-out outputs_json/results_quality.json
 ```
 
-### DROP (Discrete Reasoning Over Paragraphs)
+### DROP (Discrete Reasoning)
 
-DROP is a reading comprehension benchmark requiring discrete reasoning (arithmetic, counting, sorting). Each passage has ~16 questions on average.
+Requires arithmetic, counting, and sorting.
 
 ```bash
 torchrun --nproc_per_node=8 scripts/compare_strategies.py \
@@ -188,13 +225,42 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --min-questions 5 \
   --max-questions 10 \
   --max-new-tokens 128 \
-  --json-out outputs_json/results_drop.json \
-  --log-level INFO
+  --json-out outputs_json/results_drop.json
 ```
 
-## scripts/run_parallel.py
+## Cross-Batch Module (collab_hidden)
 
-Single-context dependency pipeline with heuristic/LLM edges, cost-aware scheduling, and optional HTML output. Useful for debugging or exploring dependency-based scheduling on individual contexts.
+The `collab_hidden` strategy uses cross-batch attention mechanisms that enable information sharing between samples during parallel generation. This requires training a cross-batch module first.
+
+### Training
+
+```bash
+python scripts/train_cross_batch.py \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --mix-method attention \
+  --num-epochs 3 \
+  --batch-size 8 \
+  --learning-rate 1e-4 \
+  --save-dir ./checkpoints
+```
+
+### Using with compare_strategies.py
+
+```bash
+python scripts/compare_strategies.py \
+  --dataset squad \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --strategies "batch,collab_hidden" \
+  --collab-hidden-checkpoint ./checkpoints/best_model.pt \
+  --context-count 10 \
+  --max-new-tokens 128
+```
+
+## Other Scripts
+
+### run_parallel.py
+
+Single-context dependency pipeline for debugging.
 
 ```bash
 python scripts/run_parallel.py \
@@ -204,9 +270,9 @@ python scripts/run_parallel.py \
   --max-questions 5
 ```
 
-## scripts/test_bert_dependencies.py
+### test_bert_dependencies.py
 
-Offline BERT-based dependency experiments. Packs every question into a single BERT encoder pass, aggregates token-to-token attentions, and converts those weights into dependency confidences.
+Offline BERT-based dependency experiments.
 
 ```bash
 python scripts/test_bert_dependencies.py \
@@ -215,172 +281,39 @@ python scripts/test_bert_dependencies.py \
   --attention-threshold 0.02 \
   --dependency-threshold 0.02 \
   --max-dependencies 3 \
-  --show-attention-summary \
-  --show-attention-matrix
+  --show-attention-summary
 ```
-
-## Notes
-
-- Requires `transformers`, `datasets`, `torch`.
-- Optional dependencies:
-  - `nltk` for BLEU-4 metric (fallback implementation available)
-  - `rouge-chinese` + `jieba` for Chinese ROUGE metrics (fallback implementation available)
-  - `httpx` or `requests` for LLM-based evaluation via OpenRouter API
-- Ensure you have enough GPU RAM (Qwen3-4B needs ~10 GB).
-- Fallback heuristics trigger automatically if the LLM fails to return valid JSON.
-- Generation length now trims at the first EOS, so `GenTok` reflects actual answer length rather than `max_new_tokens`.
-- Answers are returned as JSON (`{"answer": ...}`) so strict accuracy can be computed reliably; lenient accuracy still checks substring containment.
 
 ## Evaluation Metrics
 
 Metrics are automatically selected based on dataset:
 
-### SQuAD / HotpotQA / QuAC / QuALITY / DROP (Short-form QA)
+### Short-form QA (SQuAD, HotpotQA, QuAC, QuALITY, DROP)
+
 | Metric | Description |
 |--------|-------------|
 | **EM (Strict)** | Exact match after normalization |
 | **F1** | Token-level F1 score |
 | **Lenient** | Bidirectional substring containment |
 
-### CMB (Long-form Medical QA)
+### Long-form QA (CMB)
+
 | Metric | Description |
 |--------|-------------|
 | **BLEU-4** | 4-gram precision with brevity penalty |
-| **ROUGE-1** | Unigram overlap F1 |
-| **ROUGE-2** | Bigram overlap F1 |
-| **ROUGE-L** | Longest common subsequence F1 |
+| **ROUGE-1/2/L** | Unigram/Bigram/LCS overlap F1 |
 
 ### LLM Evaluation (Optional, via `--eval-model`)
+
 | Dimension | Description |
 |-----------|-------------|
-| **Fluency** | Language quality and readability (1-5) |
-| **Relevance** | How well the answer addresses the question (1-5) |
-| **Completeness** | Coverage of key information (1-5) |
-| **Proficiency** | Medical accuracy and terminology (1-5) |
+| **Fluency** | Language quality (1-5) |
+| **Relevance** | Answer relevance (1-5) |
+| **Completeness** | Information coverage (1-5) |
+| **Proficiency** | Domain accuracy (1-5) |
 
-## Cross-Batch Generation Module
+## Requirements
 
-The `src/cross_batch/` module implements cross-batch attention mechanisms that enable information sharing between samples during parallel generation. This can improve answer quality for related questions by allowing the model to leverage context from other samples in the batch.
-
-### Architecture
-
-The cross-batch module uses an additive design: `H_out = H + scale * cross_batch_info`, where the original hidden state is preserved and only additional information from other samples is added.
-
-**Key Components:**
-
-- **CrossBatchAttention**: Multi-head attention mechanism for cross-sample information sharing
-- **CrossBatchEmbeddingMixer**: Similarity-based mixer using cosine similarity for attention weights
-- **CrossBatchGenerator**: Wrapper that hooks into the model's forward pass to apply cross-batch mixing
-
-### Usage
-
-#### Basic Generation
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
-
-# Load model
-model = AutoModelForCausalLM.from_pretrained("gpt2")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-# Create cross-batch module
-cross_batch_module = CrossBatchAttention(hidden_size=model.config.hidden_size)
-
-# Create generator
-generator = CrossBatchGenerator(
-    model=model,
-    tokenizer=tokenizer,
-    cross_batch_module=cross_batch_module,
-    mix_layer=-1,  # Apply at last layer
-)
-
-# Generate with cross-batch interaction
-prompts = ["Question 1: ...", "Question 2: ...", "Question 3: ..."]
-encoded = tokenizer(prompts, return_tensors="pt", padding=True)
-
-outputs = generator.generate(
-    input_ids=encoded["input_ids"],
-    attention_mask=encoded["attention_mask"],
-    max_new_tokens=50,
-    enable_cross_batch=True,
-)
-```
-
-#### Training the Cross-Batch Module
-
-```python
-from src.cross_batch import CrossBatchTrainer, train_cross_batch_module
-
-# Quick training with convenience function
-history = train_cross_batch_module(
-    model_name="gpt2",
-    mix_method="attention",
-    num_epochs=3,
-    batch_size=8,
-    learning_rate=1e-4,
-    save_dir="./checkpoints",
-)
-
-# Or use the trainer directly for more control
-trainer = CrossBatchTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    cross_batch_module=cross_batch_module,
-    train_lm_head=True,  # Also fine-tune lm_head
-)
-
-history = trainer.train(
-    train_dataset=train_dataset,
-    val_dataset=val_dataset,
-    num_epochs=3,
-    batch_size=8,
-    save_dir="./checkpoints",
-)
-```
-
-#### Evaluation on SQuAD
-
-```python
-from src.cross_batch import SquadEvaluator, run_comparison_eval
-
-# Run comparison evaluation
-results = run_comparison_eval(
-    generator=generator,
-    tokenizer=tokenizer,
-    batch_size=4,
-    max_samples=100,
-    max_new_tokens=32,
-)
-
-print(f"Cross-batch EM: {results['cross_batch']['metrics']['exact_match']:.2f}")
-print(f"Standard EM: {results['standard']['metrics']['exact_match']:.2f}")
-print(f"Improvement: {results['difference']['exact_match']:+.2f}")
-```
-
-### Cross-Batch Strategy in compare_strategies.py
-
-The cross-batch strategy can be used in the main comparison script:
-
-```bash
-python scripts/compare_strategies.py \
-  --dataset squad \
-  --model-name Qwen/Qwen2.5-7B-Instruct \
-  --strategies "batch,cross_batch" \
-  --context-count 10 \
-  --max-new-tokens 128
-```
-
-### Module API Reference
-
-| Class | Description |
-|-------|-------------|
-| `CrossBatchAttention` | Multi-head attention for cross-batch mixing |
-| `CrossBatchEmbeddingMixer` | Similarity-based cross-batch mixer |
-| `CrossBatchGenerator` | Generation wrapper with cross-batch hooks |
-| `CrossBatchTrainer` | Training for cross-batch module |
-| `LMHeadOnlyTrainer` | Baseline trainer (no cross-batch) |
-| `SQuADDataset` | Dataset class for training |
-| `SquadEvaluator` | Evaluation on SQuAD dataset |
-| `train_cross_batch_module` | Convenience training function |
-| `run_comparison_eval` | Compare cross-batch vs standard generation |
+- `transformers`, `datasets`, `torch`
+- Optional: `nltk` (BLEU), `rouge-chinese` + `jieba` (Chinese ROUGE), `httpx` (API calls)
+- GPU with sufficient RAM (7B model needs ~16GB, 14B needs ~32GB)
