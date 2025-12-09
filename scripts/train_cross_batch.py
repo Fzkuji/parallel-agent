@@ -43,7 +43,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.cross_batch.trainer import LMHeadOnlyTrainer, CrossBatchTrainer, SQuADDataset
 from src.cross_batch.attention import CrossBatchAttention
 from src.cross_batch.generator import CrossBatchGenerator
-from src.cross_batch.eval import SquadEvaluator
+from src.strategies.cross_batch import run_cross_batch_multi_strategy
+from src import load_squad_random_questions
 
 
 def parse_args():
@@ -91,6 +92,52 @@ def print_rank0(msg, rank):
         print(msg)
 
 
+def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_samples,
+                           enable_cross_batch=True, strategy_name="eval"):
+    """使用和 compare_strategies.py 相同的评估逻辑"""
+    # 加载 SQuAD 验证集
+    questions = load_squad_random_questions(
+        split="validation",
+        num_questions=eval_samples,
+        seed=42,
+    )
+
+    # 转换为 items 格式
+    items = []
+    for q in questions:
+        items.append({
+            "qid": q.qid,
+            "question": q.text,
+            "context": q.context if hasattr(q, 'context') else "",
+            "references": q.references,
+        })
+
+    # 创建 generator
+    generator = CrossBatchGenerator(
+        model=model,
+        tokenizer=tokenizer,
+        cross_batch_module=cross_batch_module,
+        device=device,
+    )
+
+    # 运行评估
+    result = run_cross_batch_multi_strategy(
+        items=items,
+        tokenizer=tokenizer,
+        model=model,
+        max_new_tokens=32,
+        strategy_name=strategy_name,
+        dataset="squad",
+        cross_batch_generator=generator,
+        enable_cross_batch=enable_cross_batch,
+    )
+
+    return {
+        "exact_match": result.metrics.get("em", 0.0) * 100,
+        "f1": result.metrics.get("f1", 0.0) * 100,
+    }
+
+
 def main():
     args = parse_args()
     rank, local_rank, world_size = setup_ddp()
@@ -122,19 +169,17 @@ def main():
     if is_main_process(rank):
         print('\n[1/3] 评估原始模型 (未微调)')
         print('-' * 40)
-        model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
-        generator_original = CrossBatchGenerator(
-            model=model_original,
-            tokenizer=tokenizer,
-            cross_batch_module=CrossBatchAttention(hidden_size=model_original.config.hidden_size),
-            device=device,
-        )
-        evaluator_original = SquadEvaluator(generator_original, tokenizer, split='validation', max_samples=args.eval_samples)
-        results_original = evaluator_original.evaluate(batch_size=args.batch_size, max_new_tokens=32, enable_cross_batch=False)
-        all_results['original'] = results_original['metrics']
-        print(f'原始模型 - EM: {results_original["metrics"]["exact_match"]:.2f}, F1: {results_original["metrics"]["f1"]:.2f}')
+        model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
+        cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size)
 
-        del model_original, generator_original, evaluator_original
+        metrics_original = evaluate_with_strategy(
+            model_original, tokenizer, cross_batch_original, device,
+            args.eval_samples, enable_cross_batch=False, strategy_name="original"
+        )
+        all_results['original'] = metrics_original
+        print(f'原始模型 - EM: {metrics_original["exact_match"]:.2f}, F1: {metrics_original["f1"]:.2f}')
+
+        del model_original, cross_batch_original
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -167,16 +212,14 @@ def main():
 
     # 只在 rank 0 上评估
     if is_main_process(rank):
-        generator_baseline = CrossBatchGenerator(
-            model=model_baseline,
-            tokenizer=tokenizer,
-            device=device,
+        cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size)
+        metrics_baseline = evaluate_with_strategy(
+            model_baseline, tokenizer, cross_batch_baseline, device,
+            args.eval_samples, enable_cross_batch=False, strategy_name="baseline"
         )
-        evaluator_baseline = SquadEvaluator(generator_baseline, tokenizer, split='validation', max_samples=args.eval_samples)
-        results_baseline = evaluator_baseline.evaluate(batch_size=args.batch_size, max_new_tokens=32, enable_cross_batch=False)
-        all_results['baseline'] = results_baseline['metrics']
-        print(f'Baseline - EM: {results_baseline["metrics"]["exact_match"]:.2f}, F1: {results_baseline["metrics"]["f1"]:.2f}')
-        del generator_baseline, evaluator_baseline
+        all_results['baseline'] = metrics_baseline
+        print(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}')
+        del cross_batch_baseline
 
     del trainer_baseline, model_baseline
     gc.collect()
@@ -213,17 +256,12 @@ def main():
 
     # 只在 rank 0 上评估
     if is_main_process(rank):
-        generator_crossbatch = CrossBatchGenerator(
-            model=model_crossbatch,
-            tokenizer=tokenizer,
-            cross_batch_module=trainer_crossbatch.cross_batch_module,
-            device=device,
+        metrics_crossbatch = evaluate_with_strategy(
+            model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device,
+            args.eval_samples, enable_cross_batch=True, strategy_name="crossbatch"
         )
-        evaluator_crossbatch = SquadEvaluator(generator_crossbatch, tokenizer, split='validation', max_samples=args.eval_samples)
-        results_crossbatch = evaluator_crossbatch.evaluate(batch_size=args.batch_size, max_new_tokens=32, enable_cross_batch=True)
-        all_results['crossbatch'] = results_crossbatch['metrics']
-        print(f'Cross-Batch - EM: {results_crossbatch["metrics"]["exact_match"]:.2f}, F1: {results_crossbatch["metrics"]["f1"]:.2f}')
-        del generator_crossbatch, evaluator_crossbatch
+        all_results['crossbatch'] = metrics_crossbatch
+        print(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}')
 
     del trainer_crossbatch, model_crossbatch, cross_batch_module
     gc.collect()
