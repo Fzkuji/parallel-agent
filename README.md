@@ -59,6 +59,12 @@ The main comparison script (`scripts/compare_strategies.py`) supports the follow
 
 ## Quick Start
 
+### Requirements
+
+- `transformers`, `datasets`, `torch`
+- Optional: `nltk` (BLEU), `rouge-chinese` + `jieba` (Chinese ROUGE), `httpx` (API calls)
+- GPU with sufficient RAM (7B model needs ~16GB, 14B needs ~32GB)
+
 ### Basic Usage
 
 ```bash
@@ -311,9 +317,3 @@ Metrics are automatically selected based on dataset:
 | **Relevance** | Answer relevance (1-5) |
 | **Completeness** | Information coverage (1-5) |
 | **Proficiency** | Domain accuracy (1-5) |
-
-## Requirements
-
-- `transformers`, `datasets`, `torch`
-- Optional: `nltk` (BLEU), `rouge-chinese` + `jieba` (Chinese ROUGE), `httpx` (API calls)
-- GPU with sufficient RAM (7B model needs ~16GB, 14B needs ~32GB)
