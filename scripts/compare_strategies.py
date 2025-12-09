@@ -438,6 +438,7 @@ def run_all_strategies(
             tokenizer,
             model,
             max_new_tokens=args.max_new_tokens,
+            strategy_name="collab_hidden",
             dataset=effective_dataset,
             mix_method=args.collab_hidden_mix_method,
             mix_layer=args.collab_hidden_mix_layer,

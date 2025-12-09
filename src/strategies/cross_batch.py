@@ -23,6 +23,7 @@ def run_cross_batch_strategy(
     model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
+    strategy_name: str = "collab_hidden",
     dataset: str = None,
     cross_batch_generator: Optional["CrossBatchGenerator"] = None,
     mix_method: str = "attention",
@@ -170,7 +171,7 @@ def run_cross_batch_strategy(
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
-        name="cross_batch",
+        name=strategy_name,
         answers=answers_text,
         prompt_tokens=int(total_prompt_tokens),
         generated_tokens=int(total_generated_tokens),
@@ -192,7 +193,7 @@ def run_cross_batch_multi_strategy(
     model: "AutoModelForCausalLM",
     *,
     max_new_tokens: int,
-    strategy_name: str = "cross_batch",
+    strategy_name: str = "collab_hidden",
     dataset: str = None,
     cross_batch_generator: Optional["CrossBatchGenerator"] = None,
     mix_method: str = "attention",
