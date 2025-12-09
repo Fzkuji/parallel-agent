@@ -61,9 +61,11 @@ The main comparison script (`scripts/compare_strategies.py`) supports the follow
 
 ### Requirements
 
-- `transformers`, `datasets`, `torch`
-- Optional: `nltk` (BLEU), `rouge-chinese` + `jieba` (Chinese ROUGE), `httpx` (API calls)
-- GPU with sufficient RAM (7B model needs ~16GB, 14B needs ~32GB)
+```bash
+pip install -r requirements.txt
+```
+
+GPU with sufficient RAM: 7B model needs ~16GB, 14B needs ~32GB.
 
 ### Basic Usage
 
