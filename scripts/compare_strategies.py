@@ -1022,9 +1022,15 @@ def main() -> None:
         invalid = [s for s in selected_strategies if s not in ALL_STRATEGIES]
         if invalid:
             raise ValueError(f"Invalid strategies: {invalid}. Available: {ALL_STRATEGIES}")
-        logging.info("Running selected strategies: %s", selected_strategies)
     else:
-        logging.info("Running all strategies: %s", ALL_STRATEGIES)
+        selected_strategies = ALL_STRATEGIES.copy()
+
+    # Skip collab_hidden if no checkpoint provided
+    if "collab_hidden" in selected_strategies and not args.collab_hidden_checkpoint:
+        logging.warning("Skipping collab_hidden strategy: --collab-hidden-checkpoint not provided")
+        selected_strategies.remove("collab_hidden")
+
+    logging.info("Running strategies: %s", selected_strategies)
 
     overall_results: Dict[str, List[StrategyResult]] = {}
     serialized_contexts: List[dict] = []
