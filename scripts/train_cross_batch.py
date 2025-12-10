@@ -104,8 +104,9 @@ def print_rank0(msg, rank):
 
 
 def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_samples,
-                           enable_cross_batch=True, strategy_name="eval", eval_batch_size=8):
-    """使用和 compare_strategies.py 相同的评估逻辑，分 batch 处理避免 OOM"""
+                           enable_cross_batch=True, strategy_name="eval", eval_batch_size=8,
+                           rank=0, world_size=1):
+    """使用和 compare_strategies.py 相同的评估逻辑，支持分布式评估"""
     # 加载 SQuAD 验证集 (随机采样问题，每个问题有自己的 context)
     groups = load_squad_random_questions(
         split="validation",
@@ -114,18 +115,24 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
     )
 
     # 转换为 items 格式 (和 run_cross_batch_multi_strategy 兼容)
-    items = []
+    all_items = []
     for group_idx, group in enumerate(groups):
         context = group["context"]
         for q_idx, q in enumerate(group["questions"]):
             # 生成唯一 qid，避免所有问题都叫 Q1
             unique_qid = f"G{group_idx}_Q{q_idx}"
-            items.append({
+            all_items.append({
                 "qid": unique_qid,
                 "question": q["text"],
                 "context": context,
                 "references": q["references"],
             })
+
+    # 分布式评估：每个 rank 处理一部分数据
+    items_per_rank = len(all_items) // world_size
+    start_idx = rank * items_per_rank
+    end_idx = start_idx + items_per_rank if rank < world_size - 1 else len(all_items)
+    items = all_items[start_idx:end_idx]
 
     # 创建 generator
     generator = CrossBatchGenerator(
@@ -136,8 +143,9 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
     )
 
     # 分 batch 评估，避免 OOM
-    all_strict_acc = []
-    all_f1 = []
+    local_strict_acc_sum = 0.0
+    local_f1_sum = 0.0
+    local_count = 0
 
     for i in range(0, len(items), eval_batch_size):
         batch_items = items[i:i + eval_batch_size]
@@ -151,13 +159,26 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
             cross_batch_generator=generator,
             enable_cross_batch=enable_cross_batch,
         )
-        all_strict_acc.append(result.metrics.get("strict_acc", 0.0) * len(batch_items))
-        all_f1.append(result.metrics.get("f1", 0.0) * len(batch_items))
+        local_strict_acc_sum += result.metrics.get("strict_acc", 0.0) * len(batch_items)
+        local_f1_sum += result.metrics.get("f1", 0.0) * len(batch_items)
+        local_count += len(batch_items)
 
-    total = len(items)
+    # 汇总所有 rank 的结果
+    if world_size > 1:
+        local_tensor = torch.tensor([local_strict_acc_sum, local_f1_sum, local_count],
+                                     dtype=torch.float64, device=device)
+        dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
+        total_strict_acc = local_tensor[0].item()
+        total_f1 = local_tensor[1].item()
+        total_count = local_tensor[2].item()
+    else:
+        total_strict_acc = local_strict_acc_sum
+        total_f1 = local_f1_sum
+        total_count = local_count
+
     return {
-        "exact_match": sum(all_strict_acc) / total * 100 if total > 0 else 0.0,
-        "f1": sum(all_f1) / total * 100 if total > 0 else 0.0,
+        "exact_match": total_strict_acc / total_count * 100 if total_count > 0 else 0.0,
+        "f1": total_f1 / total_count * 100 if total_count > 0 else 0.0,
     }
 
 
@@ -188,24 +209,23 @@ def main():
         os.makedirs('outputs/inference_results', exist_ok=True)
     all_results = {}
 
-    # 1. 评估原始模型 (只在 rank 0 上做)
-    if is_main_process(rank):
-        print('\n[1/3] 评估原始模型 (未微调)')
-        print('-' * 40)
-        model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size)
+    # 1. 评估原始模型 (所有卡并行评估)
+    print_rank0('\n[1/3] 评估原始模型 (未微调)', rank)
+    print_rank0('-' * 40, rank)
+    model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
+    cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size)
 
-        metrics_original = evaluate_with_strategy(
-            model_original, tokenizer, cross_batch_original, device,
-            args.eval_samples, enable_cross_batch=False, strategy_name="original",
-            eval_batch_size=args.batch_size
-        )
-        all_results['original'] = metrics_original
-        print(f'原始模型 - EM: {metrics_original["exact_match"]:.2f}, F1: {metrics_original["f1"]:.2f}')
+    metrics_original = evaluate_with_strategy(
+        model_original, tokenizer, cross_batch_original, device,
+        args.eval_samples, enable_cross_batch=False, strategy_name="original",
+        eval_batch_size=args.batch_size, rank=rank, world_size=world_size
+    )
+    all_results['original'] = metrics_original
+    print_rank0(f'原始模型 - EM: {metrics_original["exact_match"]:.2f}, F1: {metrics_original["f1"]:.2f}', rank)
 
-        del model_original, cross_batch_original
-        gc.collect()
-        torch.cuda.empty_cache()
+    del model_original, cross_batch_original
+    gc.collect()
+    torch.cuda.empty_cache()
 
     if world_size > 1:
         dist.barrier()
@@ -234,17 +254,16 @@ def main():
     )
     print_rank0(f'Baseline 最终 Loss: {history_baseline["train_loss"][-1]:.4f}', rank)
 
-    # 只在 rank 0 上评估
-    if is_main_process(rank):
-        cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size)
-        metrics_baseline = evaluate_with_strategy(
-            model_baseline, tokenizer, cross_batch_baseline, device,
-            args.eval_samples, enable_cross_batch=False, strategy_name="baseline",
-            eval_batch_size=args.batch_size
-        )
-        all_results['baseline'] = metrics_baseline
-        print(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}')
-        del cross_batch_baseline
+    # 所有卡并行评估
+    cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size)
+    metrics_baseline = evaluate_with_strategy(
+        model_baseline, tokenizer, cross_batch_baseline, device,
+        args.eval_samples, enable_cross_batch=False, strategy_name="baseline",
+        eval_batch_size=args.batch_size, rank=rank, world_size=world_size
+    )
+    all_results['baseline'] = metrics_baseline
+    print_rank0(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}', rank)
+    del cross_batch_baseline
 
     del trainer_baseline, model_baseline
     gc.collect()
@@ -279,16 +298,17 @@ def main():
     )
     print_rank0(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}', rank)
 
-    # 只在 rank 0 上评估和保存
-    if is_main_process(rank):
-        metrics_crossbatch = evaluate_with_strategy(
-            model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device,
-            args.eval_samples, enable_cross_batch=True, strategy_name="crossbatch",
-            eval_batch_size=args.batch_size
-        )
-        all_results['crossbatch'] = metrics_crossbatch
-        print(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}')
+    # 所有卡并行评估
+    metrics_crossbatch = evaluate_with_strategy(
+        model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device,
+        args.eval_samples, enable_cross_batch=True, strategy_name="crossbatch",
+        eval_batch_size=args.batch_size, rank=rank, world_size=world_size
+    )
+    all_results['crossbatch'] = metrics_crossbatch
+    print_rank0(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}', rank)
 
+    # 只在 rank 0 上保存 checkpoint
+    if is_main_process(rank):
         # 保存 checkpoint
         os.makedirs(args.save_dir, exist_ok=True)
         model_name = args.model.replace('/', '_')
