@@ -66,7 +66,9 @@ class SQuADDataset(Dataset):
         self.examples = []
         for idx, item in enumerate(dataset):
             prompt = self._format_prompt(item["context"], item["question"], idx)
-            answer = item["answers"]["text"][0] if item["answers"]["text"] else ""
+            raw_answer = item["answers"]["text"][0] if item["answers"]["text"] else ""
+            # Format answer with <answer> tags to match inference prompt requirements
+            answer = f"<answer>{raw_answer}</answer>"
             self.examples.append({
                 "prompt": prompt,
                 "answer": answer,
