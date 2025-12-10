@@ -4,27 +4,23 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
 
 参数:
   --model         模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)
-  --max-samples   训练样本数 (default: 2000)
+  --max-samples   训练样本数 (default: None, 使用全部 SQuAD 训练集 ~87k)
   --epochs        训练轮数 (default: 1)
   --batch-size    每卡 batch size (default: 8)
-  --eval-samples  评估样本数 (default: 100)
+  --eval-samples  评估样本数 (default: None, 使用全部 SQuAD 验证集 ~10k)
   --lr            学习率 (default: 1e-4)
   --save-dir      保存 checkpoint 的目录 (default: outputs/checkpoints)
 
 训练用法:
-  # 0.5B 模型 (单卡)
-  python scripts/train_cross_batch.py
-
-  # 0.5B 模型 (8卡并行)
-  torchrun --nproc_per_node=8 scripts/train_cross_batch.py
-
-  # 7B 模型 (8卡并行)
+  # 使用全部数据训练 (默认)
   torchrun --nproc_per_node=8 scripts/train_cross_batch.py \\
       --model Qwen/Qwen2.5-7B-Instruct \\
-      --batch-size 4 \\
-      --max-samples 50000 \\
-      --epochs 1 \\
-      --eval-samples 1000
+      --batch-size 4
+
+  # 快速测试 (少量数据)
+  python scripts/train_cross_batch.py \\
+      --max-samples 1000 \\
+      --eval-samples 100
 
 推理用法 (加载训练好的 checkpoint):
   python scripts/compare_strategies.py \\
@@ -60,14 +56,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Cross-batch 模块训练脚本')
     parser.add_argument('--model', type=str, default='Qwen/Qwen2.5-0.5B-Instruct',
                         help='模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)')
-    parser.add_argument('--max-samples', type=int, default=2000,
-                        help='训练样本数 (default: 2000)')
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='训练样本数 (default: None, 使用全部数据)')
     parser.add_argument('--epochs', type=int, default=1,
                         help='训练轮数 (default: 1)')
     parser.add_argument('--batch-size', type=int, default=8,
                         help='每卡 batch size (default: 8)')
-    parser.add_argument('--eval-samples', type=int, default=100,
-                        help='评估样本数 (default: 100)')
+    parser.add_argument('--eval-samples', type=int, default=None,
+                        help='评估样本数 (default: None, 使用全部验证集)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='学习率 (default: 1e-4)')
     parser.add_argument('--save-dir', type=str, default='outputs/checkpoints',

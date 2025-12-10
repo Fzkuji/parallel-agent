@@ -83,12 +83,17 @@ def load_squad_groups(
 def load_squad_random_questions(
     split: str,
     *,
-    max_contexts: int = 3,
+    max_contexts: Optional[int] = None,
     seed: int = 13,
 ) -> List[dict]:
     """
     Sample individual SQuAD questions without grouping by shared context.
     Each question becomes its own context group.
+
+    Args:
+        split: Dataset split (e.g., "train", "validation").
+        max_contexts: Maximum number of contexts to return. None = use all.
+        seed: Random seed for shuffling.
     """
     if load_dataset is None:
         raise RuntimeError("datasets package not available; install with `pip install datasets`.")
@@ -96,7 +101,7 @@ def load_squad_random_questions(
     raw_dataset = list(load_dataset("squad", split=split))
     rng = random.Random(seed)
     rng.shuffle(raw_dataset)
-    selected = raw_dataset[:max_contexts]
+    selected = raw_dataset[:max_contexts] if max_contexts else raw_dataset
 
     groups: List[dict] = []
     for idx, row in enumerate(selected, start=1):
