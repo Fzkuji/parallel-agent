@@ -22,6 +22,9 @@ from tqdm import tqdm
 
 from .generator import CrossBatchGenerator
 from .attention import CrossBatchAttention, CrossBatchEmbeddingMixer
+from src.prompts import build_single_prompt
+from src.inference import build_chat_prompt
+from src.models import Question
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,7 +42,11 @@ def is_instruct_model(model_name_or_tokenizer) -> bool:
 
 
 class SQuADDataset(Dataset):
-    """SQuAD dataset for training cross-batch module."""
+    """SQuAD dataset for training cross-batch module.
+
+    Uses the same prompt format as inference (build_single_prompt + build_chat_prompt)
+    to ensure training and inference consistency.
+    """
 
     def __init__(
         self,
@@ -47,16 +54,9 @@ class SQuADDataset(Dataset):
         split: str = "train",
         max_samples: Optional[int] = None,
         max_length: int = 512,
-        use_chat_template: bool = None,  # None = auto-detect
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
-
-        # Auto-detect whether to use chat template
-        if use_chat_template is None:
-            self.use_chat_template = is_instruct_model(tokenizer) and hasattr(tokenizer, 'apply_chat_template')
-        else:
-            self.use_chat_template = use_chat_template
 
         # Load dataset
         dataset = load_dataset("squad", split=split)
@@ -64,37 +64,31 @@ class SQuADDataset(Dataset):
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
         self.examples = []
-        for item in dataset:
-            prompt = self._format_prompt(item["context"], item["question"])
+        for idx, item in enumerate(dataset):
+            prompt = self._format_prompt(item["context"], item["question"], idx)
             answer = item["answers"]["text"][0] if item["answers"]["text"] else ""
             self.examples.append({
                 "prompt": prompt,
                 "answer": answer,
-                "full_text": prompt + answer,  # No space for chat template
+                "full_text": prompt + answer,
             })
 
-    def _format_prompt(self, context: str, question: str) -> str:
-        if self.use_chat_template:
-            # Use chat template for instruct models
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant. Answer the question based only on the given context. Give a short, direct answer without explanation."
-                },
-                {
-                    "role": "user",
-                    "content": f"Context: {context}\n\nQuestion: {question}\n\nAnswer with only the answer, nothing else."
-                }
-            ]
-            prompt = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            return prompt
-        else:
-            # Simple completion format for base models
-            return f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+    def _format_prompt(self, context: str, question_text: str, idx: int) -> str:
+        """Use the same format as inference: build_single_prompt + build_chat_prompt."""
+        # Create a Question object to use build_single_prompt
+        q = Question(
+            qid=f"Q{idx}",
+            text=question_text,
+            priority=1.0,
+            answer_tokens=12,
+            type_hint=None,
+            references=[],
+            context=context,  # Use question-specific context
+        )
+        # Get system and user prompts (same as inference)
+        system_prompt, user_prompt = build_single_prompt(context, q, dataset="squad")
+        # Apply chat template (same as inference)
+        return build_chat_prompt(self.tokenizer, user_prompt, system_prompt=system_prompt)
 
     def __len__(self):
         return len(self.examples)

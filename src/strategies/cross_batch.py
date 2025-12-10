@@ -5,7 +5,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.models import Question, StrategyResult
-from src.inference import extract_answer
+from src.inference import extract_answer, build_chat_prompt
 from src.evaluation import evaluate_predictions
 from src.prompts import build_single_prompt
 from src.utils import clean_model_text
@@ -89,12 +89,11 @@ def run_cross_batch_strategy(
             device=device,
         )
 
-    # Build prompts for all questions
+    # Build prompts for all questions (using chat template like other strategies)
     batch_prompts: List[str] = []
     for question in questions:
         system_prompt, user_prompt = build_single_prompt(background, question, dataset)
-        # Combine system and user prompts into a single prompt
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
         batch_prompts.append(full_prompt)
 
     # Tokenize all prompts with left padding
@@ -267,12 +266,12 @@ def run_cross_batch_multi_strategy(
             device=device,
         )
 
-    # Build prompts for all items
+    # Build prompts for all items (using chat template like other strategies)
     batch_prompts: List[str] = []
     for item in items:
         q = question_lookup[item["qid"]]
         system_prompt, user_prompt = build_single_prompt(item["context"], q, dataset)
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
         batch_prompts.append(full_prompt)
 
     # Tokenize all prompts with left padding
