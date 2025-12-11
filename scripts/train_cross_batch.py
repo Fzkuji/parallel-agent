@@ -102,7 +102,7 @@ def print_rank0(msg, rank):
 def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_samples,
                            enable_cross_batch=True, strategy_name="eval", eval_batch_size=8,
                            rank=0, world_size=1):
-    """使用和 compare_strategies.py 相同的评估逻辑，支持分布式评估"""
+    """使用和 compare_strategies.py 相同的评估逻辑，支持分布式评估，返回详细推理结果"""
     # 加载 SQuAD 验证集 (随机采样问题，每个问题有自己的 context)
     groups = load_squad_random_questions(
         split="validation",
@@ -142,6 +142,7 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
     local_strict_acc_sum = 0.0
     local_f1_sum = 0.0
     local_count = 0
+    all_details = []  # 保存详细推理结果
 
     for i in range(0, len(items), eval_batch_size):
         batch_items = items[i:i + eval_batch_size]
@@ -158,6 +159,9 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
         local_strict_acc_sum += result.metrics.get("strict_acc", 0.0) * len(batch_items)
         local_f1_sum += result.metrics.get("f1", 0.0) * len(batch_items)
         local_count += len(batch_items)
+        # 保存详细结果
+        if result.details and "questions" in result.details:
+            all_details.extend(result.details["questions"])
 
     # 汇总所有 rank 的结果
     if world_size > 1:
@@ -175,6 +179,7 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
     return {
         "exact_match": total_strict_acc / total_count * 100 if total_count > 0 else 0.0,
         "f1": total_f1 / total_count * 100 if total_count > 0 else 0.0,
+        "details": all_details,  # 包含每个问题的详细推理结果
     }
 
 
@@ -328,6 +333,19 @@ def main():
 
     # 保存结果 (只在 rank 0)
     if is_main_process(rank):
+        # 提取详细结果用于单独保存
+        inference_details = {
+            'original': all_results['original'].get('details', []),
+            'baseline': all_results['baseline'].get('details', []),
+            'crossbatch': all_results['crossbatch'].get('details', []),
+        }
+
+        # metrics 中不包含 details（太大）
+        metrics_only = {
+            k: {key: val for key, val in v.items() if key != 'details'}
+            for k, v in all_results.items()
+        }
+
         summary = {
             'config': {
                 'model': args.model,
@@ -341,7 +359,7 @@ def main():
                 'baseline': history_baseline['train_loss'],
                 'crossbatch': history_crossbatch['train_loss'],
             },
-            'metrics': all_results,
+            'metrics': metrics_only,
         }
 
         os.makedirs('outputs', exist_ok=True)
@@ -349,6 +367,12 @@ def main():
         output_file = f'outputs/training_{timestamp}.json'
         with open(output_file, 'w') as f:
             json.dump(summary, f, indent=2)
+
+        # 保存详细推理结果到单独文件
+        details_file = f'outputs/inference_details_{timestamp}.json'
+        with open(details_file, 'w', encoding='utf-8') as f:
+            json.dump(inference_details, f, indent=2, ensure_ascii=False)
+        print(f'\n详细推理结果已保存到: {details_file}')
 
         # 打印总结
         print('\n' + '=' * 60)
