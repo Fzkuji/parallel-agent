@@ -391,6 +391,11 @@ class LMHeadOnlyTrainer:
             self.optimizer.zero_grad()
             loss_dict = self.compute_loss(input_ids, attention_mask, labels, labels_attention_mask)
             loss = loss_dict["loss"]
+
+            # Skip if no valid tokens (loss doesn't require grad)
+            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+                continue
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.lm_head.parameters(), 1.0)
             self.optimizer.step()
@@ -748,6 +753,11 @@ class CrossBatchTrainer:
             )
 
             loss = loss_dict["loss"]
+
+            # Skip if no valid tokens (loss doesn't require grad)
+            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+                continue
+
             loss.backward()
 
             # Gradient clipping
