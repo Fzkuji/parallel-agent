@@ -114,6 +114,22 @@ class CrossBatchGenerator:
         if eos_token_id is None:
             eos_token_id = self.tokenizer.eos_token_id
 
+        # Build set of all stop token IDs (handle multiple stop tokens for chat models)
+        stop_token_ids = {eos_token_id, pad_token_id}
+        # Add additional stop tokens from model config
+        if hasattr(self.model.config, 'eos_token_id'):
+            config_eos = self.model.config.eos_token_id
+            if isinstance(config_eos, list):
+                stop_token_ids.update(config_eos)
+            elif config_eos is not None:
+                stop_token_ids.add(config_eos)
+        # Add common chat model stop tokens by name
+        for stop_name in ['<|im_end|>', '<|endoftext|>', '<|eot_id|>', '</s>']:
+            stop_id = self.tokenizer.convert_tokens_to_ids(stop_name)
+            if stop_id != self.tokenizer.unk_token_id:
+                stop_token_ids.add(stop_id)
+        stop_token_ids.discard(None)
+
         # Track which sequences have finished
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
 
@@ -201,9 +217,10 @@ class CrossBatchGenerator:
             # Update past_key_values
             past_key_values = outputs.past_key_values
 
-            # Check for EOS
+            # Check for any stop token
             if step >= min_new_tokens - 1:
-                finished = finished | (next_tokens == eos_token_id)
+                for stop_id in stop_token_ids:
+                    finished = finished | (next_tokens == stop_id)
 
             if finished.all():
                 break
