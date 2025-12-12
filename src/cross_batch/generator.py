@@ -222,18 +222,6 @@ class CrossBatchGenerator:
                 for stop_id in stop_token_ids:
                     finished = finished | (next_tokens == stop_id)
 
-            # Check for </answer> tag in generated text (for QA tasks)
-            # This handles cases where cross-batch mixing prevents stop token generation
-            if step >= min_new_tokens - 1 and step % 5 == 0:  # Check every 5 tokens
-                for i in range(batch_size):
-                    if not finished[i]:
-                        gen_text = self.tokenizer.decode(
-                            generated_ids[i, input_ids.size(1):],
-                            skip_special_tokens=True
-                        )
-                        if '</answer>' in gen_text:
-                            finished[i] = True
-
             if finished.all():
                 break
 
