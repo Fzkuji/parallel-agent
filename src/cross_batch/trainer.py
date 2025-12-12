@@ -63,12 +63,18 @@ class SQuADDataset(Dataset):
         if max_samples is not None:
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
+        # Get EOS token for chat models (e.g., <|im_end|> for Qwen)
+        eos_token = tokenizer.eos_token or ""
+        # For Qwen models, use <|im_end|> as the stop token
+        if hasattr(tokenizer, 'im_end_id') or '<|im_end|>' in tokenizer.get_vocab():
+            eos_token = "<|im_end|>"
+
         self.examples = []
         for idx, item in enumerate(dataset):
             prompt = self._format_prompt(item["context"], item["question"], idx)
             raw_answer = item["answers"]["text"][0] if item["answers"]["text"] else ""
-            # Format answer with <answer> tags to match inference prompt requirements
-            answer = f"<answer>{raw_answer}</answer>"
+            # Format answer with <answer> tags and EOS token to match inference
+            answer = f"<answer>{raw_answer}</answer>{eos_token}"
             self.examples.append({
                 "prompt": prompt,
                 "answer": answer,
@@ -118,6 +124,12 @@ class SQuADGroupedDataset(Dataset):
         self.dataset_name = dataset_name
         self.context_groups = []
 
+        # Get EOS token for chat models (e.g., <|im_end|> for Qwen)
+        eos_token = tokenizer.eos_token or ""
+        # For Qwen models, use <|im_end|> as the stop token
+        if hasattr(tokenizer, 'im_end_id') or '<|im_end|>' in tokenizer.get_vocab():
+            eos_token = "<|im_end|>"
+
         for group_idx, group in enumerate(groups):
             context = group["context"]
             questions = group["questions"]
@@ -125,7 +137,8 @@ class SQuADGroupedDataset(Dataset):
             for q_idx, q in enumerate(questions):
                 prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
                 raw_answer = q["references"][0] if q["references"] else ""
-                answer = f"<answer>{raw_answer}</answer>"
+                # Include EOS token so model learns to stop after answer
+                answer = f"<answer>{raw_answer}</answer>{eos_token}"
                 examples.append({
                     "prompt": prompt,
                     "answer": answer,
