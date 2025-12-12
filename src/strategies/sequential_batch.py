@@ -205,6 +205,7 @@ def run_full_batch_strategy(
     max_new_tokens: int,
     dataset: str = None,
     api_client: Optional["APIClient"] = None,
+    strategy_name: str = "batch",
 ) -> StrategyResult:
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
@@ -339,7 +340,7 @@ def run_full_batch_strategy(
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     return StrategyResult(
-        name="batch",
+        name=strategy_name,
         answers=answers_text,
         prompt_tokens=int(total_prompt_tokens),
         generated_tokens=int(total_generated_tokens),

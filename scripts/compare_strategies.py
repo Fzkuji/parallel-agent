@@ -214,6 +214,13 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Which layer's hidden state to mix (-1 for last layer).",
     )
+    # Batch finetuned (baseline) checkpoint
+    parser.add_argument(
+        "--baseline-checkpoint",
+        type=str,
+        default=None,
+        help="Path to trained baseline (lm_head only) checkpoint for batch_finetuned strategy.",
+    )
     return parser.parse_args()
 
 
@@ -249,7 +256,7 @@ def resolve_dependency_generators(
     return dep_generator, bert_dep_generator, bert_conf_threshold
 
 
-ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "collab_llm", "collab_bert", "collab_hidden"]
+ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "finetuned", "collab_llm", "collab_bert", "collab_hidden"]
 
 
 def run_all_strategies(
@@ -307,6 +314,26 @@ def run_all_strategies(
                 dataset=effective_dataset,
                 api_client=api_client,
             ))
+        if "finetuned" in selected_strategies:
+            # Load baseline checkpoint and temporarily replace lm_head
+            import torch
+            if args.baseline_checkpoint and hasattr(model, 'lm_head'):
+                checkpoint = torch.load(args.baseline_checkpoint, map_location=model.device)
+                original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
+                model.lm_head.load_state_dict(checkpoint["lm_head"])
+                results.append(run_batch_multi_strategy(
+                    items,
+                    tokenizer,
+                    model,
+                    max_new_tokens=args.max_new_tokens,
+                    strategy_name="finetuned",
+                    dataset=effective_dataset,
+                    api_client=api_client,
+                ))
+                # Restore original lm_head
+                model.lm_head.load_state_dict(original_lm_head_state)
+            else:
+                logging.warning("Skipping finetuned strategy: --baseline-checkpoint not provided or model has no lm_head")
         # For dependency strategies in multi-context mode, store context per question
         # This ensures consistent prompt format with batch strategy (context in system message)
         if "collab_llm" in selected_strategies or "collab_bert" in selected_strategies:
@@ -399,6 +426,27 @@ def run_all_strategies(
             dataset=effective_dataset,
             api_client=api_client,
         ))
+    if "finetuned" in selected_strategies:
+        # Load baseline checkpoint and temporarily replace lm_head
+        import torch
+        if args.baseline_checkpoint and hasattr(model, 'lm_head'):
+            checkpoint = torch.load(args.baseline_checkpoint, map_location=model.device)
+            original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
+            model.lm_head.load_state_dict(checkpoint["lm_head"])
+            results.append(run_full_batch_strategy(
+                background,
+                questions,
+                tokenizer,
+                model,
+                max_new_tokens=args.max_new_tokens,
+                dataset=effective_dataset,
+                api_client=api_client,
+                strategy_name="finetuned",
+            ))
+            # Restore original lm_head
+            model.lm_head.load_state_dict(original_lm_head_state)
+        else:
+            logging.warning("Skipping finetuned strategy: --baseline-checkpoint not provided or model has no lm_head")
     if "collab_llm" in selected_strategies:
         results.append(run_dependency_batch_strategy(
             background,
@@ -465,6 +513,7 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
         "all_in_one",
         "sequential",
         "batch",
+        "finetuned",
         "collab_llm",
         "collab_bert",
         "collab_hidden",

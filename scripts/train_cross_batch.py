@@ -411,6 +411,23 @@ def main():
     print_rank0(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}', rank)
     del cross_batch_baseline
 
+    # 保存 baseline lm_head checkpoint
+    if is_main_process(rank):
+        os.makedirs(args.save_dir, exist_ok=True)
+        model_name = args.model.replace('/', '_')
+        baseline_checkpoint_path = os.path.join(args.save_dir, f'{model_name}_baseline.pt')
+        baseline_checkpoint = {
+            'lm_head': model_baseline.lm_head.state_dict(),
+            'config': {
+                'model': args.model,
+                'hidden_size': model_baseline.config.hidden_size,
+                'train_samples': args.max_samples,
+                'epochs': args.epochs,
+            },
+        }
+        torch.save(baseline_checkpoint, baseline_checkpoint_path)
+        print(f'\nBaseline checkpoint 已保存到: {baseline_checkpoint_path}')
+
     del trainer_baseline, model_baseline
     gc.collect()
     torch.cuda.empty_cache()
