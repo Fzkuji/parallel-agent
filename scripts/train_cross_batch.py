@@ -1,15 +1,18 @@
 """
 Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
-包含训练和三方对比评估
+包含训练和三方对比评估，支持多数据集
 
 参数:
-  --model         模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)
-  --max-samples   训练样本数 (default: None, 使用全部 SQuAD 训练集 ~87k)
-  --epochs        训练轮数 (default: 1)
-  --batch-size    每卡 batch size (default: 8)
-  --eval-samples  评估样本数 (default: None, 使用全部 SQuAD 验证集 ~10k)
-  --lr            学习率 (default: 1e-4)
-  --save-dir      保存 checkpoint 的目录 (default: outputs/checkpoints)
+  --model           模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)
+  --dataset         数据集 (default: squad, 可选: squad, hotpot, quac, drop)
+  --max-samples     训练样本数 (default: None, 使用全部训练集)
+  --eval-samples    评估样本数/context数 (default: None, 使用全部验证集)
+  --min-questions   每个 context 最少问题数 (default: 3)
+  --max-questions   每个 context 最多问题数 (default: 5)
+  --epochs          训练轮数 (default: 1)
+  --batch-size      每卡 batch size (default: 8)
+  --lr              学习率 (default: 1e-4)
+  --save-dir        保存 checkpoint 的目录 (default: outputs/checkpoints)
 
 训练用法:
   # 使用全部数据训练 (默认)
@@ -20,6 +23,12 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
   # 快速测试 (少量数据)
   python scripts/train_cross_batch.py \\
       --max-samples 1000 \\
+      --eval-samples 100
+
+  # 指定每个 context 的问题数量
+  python scripts/train_cross_batch.py \\
+      --min-questions 5 \\
+      --max-questions 5 \\
       --eval-samples 100
 
 推理用法 (加载训练好的 checkpoint):
@@ -49,13 +58,35 @@ from src.cross_batch.trainer import LMHeadOnlyTrainer, CrossBatchTrainer, SQuADD
 from src.cross_batch.attention import CrossBatchAttention
 from src.cross_batch.generator import CrossBatchGenerator
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
-from src import load_squad_random_questions
+from src import (
+    load_squad_random_questions,
+    load_squad_groups,
+    load_hotpot_groups,
+    load_quac_groups,
+    load_drop_groups,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Cross-batch 模块训练脚本')
+    # 模型参数
     parser.add_argument('--model', type=str, default='Qwen/Qwen2.5-0.5B-Instruct',
                         help='模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)')
+
+    # 数据集参数
+    parser.add_argument('--dataset', type=str, default='squad',
+                        choices=['squad', 'hotpot', 'quac', 'drop'],
+                        help='数据集 (default: squad)')
+    parser.add_argument('--split', type=str, default='validation',
+                        help='评估用的数据集 split (default: validation)')
+    parser.add_argument('--min-questions', type=int, default=3,
+                        help='每个 context 最少问题数 (default: 3)')
+    parser.add_argument('--max-questions', type=int, default=5,
+                        help='每个 context 最多问题数 (default: 5)')
+    parser.add_argument('--squad-random-questions', action='store_true',
+                        help='SQuAD: 随机采样问题而非按 context 分组')
+
+    # 训练参数
     parser.add_argument('--max-samples', type=int, default=None,
                         help='训练样本数 (default: None, 使用全部数据)')
     parser.add_argument('--epochs', type=int, default=1,
@@ -63,11 +94,13 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=8,
                         help='每卡 batch size (default: 8)')
     parser.add_argument('--eval-samples', type=int, default=None,
-                        help='评估样本数 (default: None, 使用全部验证集)')
+                        help='评估 context 数 (default: None, 使用全部验证集)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='学习率 (default: 1e-4)')
     parser.add_argument('--save-dir', type=str, default='outputs/checkpoints',
                         help='保存 checkpoint 的目录 (default: outputs/checkpoints)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子 (default: 42)')
     return parser.parse_args()
 
 
@@ -99,16 +132,69 @@ def print_rank0(msg, rank):
         print(msg)
 
 
-def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_samples,
+def load_eval_data(args):
+    """根据数据集参数加载评估数据，返回统一格式的 groups"""
+    dataset = args.dataset
+    split = args.split
+    max_contexts = args.eval_samples
+    min_questions = args.min_questions
+    max_questions = args.max_questions
+    seed = args.seed
+
+    if dataset == "squad":
+        if args.squad_random_questions:
+            # 随机采样问题，每个问题有自己的 context
+            groups = load_squad_random_questions(
+                split=split,
+                max_contexts=max_contexts,
+                seed=seed,
+            )
+        else:
+            # 按 context 分组
+            groups = load_squad_groups(
+                split=split,
+                min_questions=min_questions,
+                max_questions=max_questions,
+                max_contexts=max_contexts,
+                seed=seed,
+            )
+    elif dataset == "hotpot":
+        groups = load_hotpot_groups(
+            split=split,
+            subset="fullwiki",  # 默认使用 fullwiki
+            max_contexts=max_contexts,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            seed=seed,
+        )
+    elif dataset == "quac":
+        groups = load_quac_groups(
+            split=split,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "drop":
+        groups = load_drop_groups(
+            split=split,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
+
+    return groups
+
+
+def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
                            enable_cross_batch=True, strategy_name="eval", eval_batch_size=8,
                            rank=0, world_size=1):
     """使用和 compare_strategies.py 相同的评估逻辑，支持分布式评估，返回详细推理结果"""
-    # 加载 SQuAD 验证集 (随机采样问题，每个问题有自己的 context)
-    groups = load_squad_random_questions(
-        split="validation",
-        max_contexts=eval_samples,
-        seed=42,
-    )
+    # 加载评估数据
+    groups = load_eval_data(args)
 
     # 转换为 items 格式 (和 run_cross_batch_multi_strategy 兼容)
     all_items = []
@@ -152,7 +238,7 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, eval_sa
             model=model,
             max_new_tokens=32,
             strategy_name=strategy_name,
-            dataset="squad",
+            dataset=args.dataset,
             cross_batch_generator=generator,
             enable_cross_batch=enable_cross_batch,
         )
@@ -193,6 +279,7 @@ def main():
 
     print_rank0('=' * 60, rank)
     print_rank0(f'训练配置: {args.model}', rank)
+    print_rank0(f'数据集: {args.dataset}, 问题数: {args.min_questions}-{args.max_questions}', rank)
     print_rank0(f'样本数: {args.max_samples}, Epochs: {args.epochs}, Batch: {args.batch_size}', rank)
     print_rank0(f'World size: {world_size}, 总 batch size: {args.batch_size * world_size}', rank)
     print_rank0('=' * 60, rank)
@@ -217,8 +304,8 @@ def main():
     cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size)
 
     metrics_original = evaluate_with_strategy(
-        model_original, tokenizer, cross_batch_original, device,
-        args.eval_samples, enable_cross_batch=False, strategy_name="original",
+        model_original, tokenizer, cross_batch_original, device, args,
+        enable_cross_batch=False, strategy_name="original",
         eval_batch_size=args.batch_size, rank=rank, world_size=world_size
     )
     all_results['original'] = metrics_original
@@ -258,8 +345,8 @@ def main():
     # 所有卡并行评估
     cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size)
     metrics_baseline = evaluate_with_strategy(
-        model_baseline, tokenizer, cross_batch_baseline, device,
-        args.eval_samples, enable_cross_batch=False, strategy_name="baseline",
+        model_baseline, tokenizer, cross_batch_baseline, device, args,
+        enable_cross_batch=False, strategy_name="baseline",
         eval_batch_size=args.batch_size, rank=rank, world_size=world_size
     )
     all_results['baseline'] = metrics_baseline
@@ -301,8 +388,8 @@ def main():
 
     # 所有卡并行评估
     metrics_crossbatch = evaluate_with_strategy(
-        model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device,
-        args.eval_samples, enable_cross_batch=True, strategy_name="crossbatch",
+        model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device, args,
+        enable_cross_batch=True, strategy_name="crossbatch",
         eval_batch_size=args.batch_size, rank=rank, world_size=world_size
     )
     all_results['crossbatch'] = metrics_crossbatch
@@ -349,6 +436,9 @@ def main():
         summary = {
             'config': {
                 'model': args.model,
+                'dataset': args.dataset,
+                'min_questions': args.min_questions,
+                'max_questions': args.max_questions,
                 'train_samples': args.max_samples,
                 'eval_samples': args.eval_samples,
                 'epochs': args.epochs,
