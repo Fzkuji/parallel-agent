@@ -190,31 +190,20 @@ def load_eval_data(args):
 
 
 def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
-                           enable_cross_batch=True, strategy_name="eval", eval_batch_size=8,
+                           enable_cross_batch=True, strategy_name="eval",
                            rank=0, world_size=1):
-    """使用和 compare_strategies.py 相同的评估逻辑，支持分布式评估，返回详细推理结果"""
+    """使用和 compare_strategies.py 相同的评估逻辑，支持分布式评估，返回详细推理结果
+
+    每个 context 作为一个独立的 batch 处理，确保同一 context 的问题能够互相共享信息
+    """
     # 加载评估数据
     groups = load_eval_data(args)
 
-    # 转换为 items 格式 (和 run_cross_batch_multi_strategy 兼容)
-    all_items = []
-    for group_idx, group in enumerate(groups):
-        context = group["context"]
-        for q_idx, q in enumerate(group["questions"]):
-            # 生成唯一 qid，避免所有问题都叫 Q1
-            unique_qid = f"G{group_idx}_Q{q_idx}"
-            all_items.append({
-                "qid": unique_qid,
-                "question": q["text"],
-                "context": context,
-                "references": q["references"],
-            })
-
-    # 分布式评估：每个 rank 处理一部分数据
-    items_per_rank = len(all_items) // world_size
-    start_idx = rank * items_per_rank
-    end_idx = start_idx + items_per_rank if rank < world_size - 1 else len(all_items)
-    items = all_items[start_idx:end_idx]
+    # 分布式评估：每个 rank 处理一部分 context
+    groups_per_rank = len(groups) // world_size if world_size > 1 else len(groups)
+    start_idx = rank * groups_per_rank
+    end_idx = start_idx + groups_per_rank if rank < world_size - 1 else len(groups)
+    local_groups = groups[start_idx:end_idx]
 
     # 创建 generator
     generator = CrossBatchGenerator(
@@ -224,14 +213,24 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
         device=device,
     )
 
-    # 分 batch 评估，避免 OOM
+    # 按 context 评估，每个 context 的问题作为一个 batch
     local_strict_acc_sum = 0.0
     local_f1_sum = 0.0
     local_count = 0
     all_details = []  # 保存详细推理结果
 
-    for i in range(0, len(items), eval_batch_size):
-        batch_items = items[i:i + eval_batch_size]
+    for group_idx, group in enumerate(local_groups):
+        # 将该 context 的所有问题转换为 items
+        context = group["context"]
+        batch_items = []
+        for q_idx, q in enumerate(group["questions"]):
+            unique_qid = f"G{start_idx + group_idx}_Q{q_idx}"
+            batch_items.append({
+                "qid": unique_qid,
+                "question": q["text"],
+                "context": context,
+                "references": q["references"],
+            })
         result = run_cross_batch_multi_strategy(
             items=batch_items,
             tokenizer=tokenizer,
@@ -306,7 +305,7 @@ def main():
     metrics_original = evaluate_with_strategy(
         model_original, tokenizer, cross_batch_original, device, args,
         enable_cross_batch=False, strategy_name="original",
-        eval_batch_size=args.batch_size, rank=rank, world_size=world_size
+        rank=rank, world_size=world_size
     )
     all_results['original'] = metrics_original
     print_rank0(f'原始模型 - EM: {metrics_original["exact_match"]:.2f}, F1: {metrics_original["f1"]:.2f}', rank)
@@ -347,7 +346,7 @@ def main():
     metrics_baseline = evaluate_with_strategy(
         model_baseline, tokenizer, cross_batch_baseline, device, args,
         enable_cross_batch=False, strategy_name="baseline",
-        eval_batch_size=args.batch_size, rank=rank, world_size=world_size
+        rank=rank, world_size=world_size
     )
     all_results['baseline'] = metrics_baseline
     print_rank0(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}', rank)
@@ -390,7 +389,7 @@ def main():
     metrics_crossbatch = evaluate_with_strategy(
         model_crossbatch, tokenizer, trainer_crossbatch.cross_batch_module, device, args,
         enable_cross_batch=True, strategy_name="crossbatch",
-        eval_batch_size=args.batch_size, rank=rank, world_size=world_size
+        rank=rank, world_size=world_size
     )
     all_results['crossbatch'] = metrics_crossbatch
     print_rank0(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}', rank)
