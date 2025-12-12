@@ -54,7 +54,12 @@ import os
 from datetime import datetime
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.cross_batch.trainer import LMHeadOnlyTrainer, CrossBatchTrainer, SQuADDataset
+from src.cross_batch.trainer import (
+    LMHeadOnlyTrainer,
+    CrossBatchTrainer,
+    SQuADDataset,
+    SQuADGroupedDataset,
+)
 from src.cross_batch.attention import CrossBatchAttention
 from src.cross_batch.generator import CrossBatchGenerator
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
@@ -189,6 +194,53 @@ def load_eval_data(args):
     return groups
 
 
+def load_train_data(args):
+    """加载训练数据，返回统一格式的 groups（用于分组训练）"""
+    dataset = args.dataset
+    max_contexts = args.max_samples  # 训练时用 max_samples 控制数量
+    min_questions = args.min_questions
+    max_questions = args.max_questions
+    seed = args.seed
+
+    if dataset == "squad":
+        groups = load_squad_groups(
+            split="train",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "hotpot":
+        groups = load_hotpot_groups(
+            split="train",
+            subset="fullwiki",
+            max_contexts=max_contexts,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            seed=seed,
+        )
+    elif dataset == "quac":
+        groups = load_quac_groups(
+            split="train",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "drop":
+        groups = load_drop_groups(
+            split="train",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
+
+    return groups
+
+
 def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
                            enable_cross_batch=True, strategy_name="eval",
                            rank=0, world_size=1):
@@ -288,9 +340,15 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 加载数据集
-    train_dataset = SQuADDataset(tokenizer=tokenizer, split='train', max_samples=args.max_samples)
-    print_rank0(f'训练数据集大小: {len(train_dataset)}', rank)
+    # 加载数据集 (按 context 分组)
+    train_groups = load_train_data(args)
+    train_dataset = SQuADGroupedDataset(
+        tokenizer=tokenizer,
+        groups=train_groups,
+        dataset_name=args.dataset,
+    )
+    total_questions = sum(len(g["questions"]) for g in train_groups)
+    print_rank0(f'训练数据集: {len(train_dataset)} 个 context, {total_questions} 个问题', rank)
 
     if is_main_process(rank):
         os.makedirs('outputs/inference_results', exist_ok=True)
@@ -329,7 +387,7 @@ def main():
         learning_rate=args.lr,
     )
 
-    # DDP 训练
+    # DDP 训练 (按 context 分组，每个 context 一个 batch)
     history_baseline = trainer_baseline.train(
         train_dataset=train_dataset,
         num_epochs=args.epochs,
@@ -338,6 +396,7 @@ def main():
         distributed=(world_size > 1),
         rank=rank,
         world_size=world_size,
+        grouped=True,
     )
     print_rank0(f'Baseline 最终 Loss: {history_baseline["train_loss"][-1]:.4f}', rank)
 
@@ -382,6 +441,7 @@ def main():
         distributed=(world_size > 1),
         rank=rank,
         world_size=world_size,
+        grouped=True,
     )
     print_rank0(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}', rank)
 

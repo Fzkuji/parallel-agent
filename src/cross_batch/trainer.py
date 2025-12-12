@@ -99,6 +99,69 @@ class SQuADDataset(Dataset):
         return self.examples[idx]
 
 
+class SQuADGroupedDataset(Dataset):
+    """SQuAD dataset grouped by context.
+
+    Each item is a list of examples from the same context.
+    Use with batch_size=1 in DataLoader, each context becomes one batch.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        groups: List[Dict],
+        max_length: int = 512,
+        dataset_name: str = "squad",
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.dataset_name = dataset_name
+        self.context_groups = []
+
+        for group_idx, group in enumerate(groups):
+            context = group["context"]
+            questions = group["questions"]
+            examples = []
+            for q_idx, q in enumerate(questions):
+                prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
+                raw_answer = q["references"][0] if q["references"] else ""
+                answer = f"<answer>{raw_answer}</answer>"
+                examples.append({
+                    "prompt": prompt,
+                    "answer": answer,
+                    "full_text": prompt + answer,
+                })
+            self.context_groups.append(examples)
+
+    def _format_prompt(self, context: str, question_text: str, group_idx: int, q_idx: int) -> str:
+        """Use the same format as inference."""
+        q = Question(
+            qid=f"G{group_idx}_Q{q_idx}",
+            text=question_text,
+            priority=1.0,
+            answer_tokens=12,
+            type_hint=None,
+            references=[],
+            context=context,
+        )
+        system_prompt, user_prompt = build_single_prompt(context, q, dataset=self.dataset_name)
+        return build_chat_prompt(self.tokenizer, user_prompt, system_prompt=system_prompt)
+
+    def __len__(self):
+        return len(self.context_groups)
+
+    def __getitem__(self, idx):
+        # Return list of examples for this context
+        return self.context_groups[idx]
+
+
+def grouped_collate_fn(batch: List[List[Dict]], tokenizer: PreTrainedTokenizer, max_length: int = 512):
+    """Collate function for grouped dataset. batch is a list containing one context group."""
+    # batch is [[example1, example2, ...]] since DataLoader batch_size=1
+    examples = batch[0]  # Get the single context group
+    return collate_fn(examples, tokenizer, max_length)
+
+
 def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: int = 512):
     """Collate function for DataLoader."""
     prompts = [item["prompt"] for item in batch]
@@ -351,6 +414,7 @@ class LMHeadOnlyTrainer:
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        grouped: bool = False,
     ) -> Dict[str, Any]:
         if save_dir and rank == 0:
             os.makedirs(save_dir, exist_ok=True)
@@ -363,12 +427,20 @@ class LMHeadOnlyTrainer:
             sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
             shuffle = False
 
+        # Use grouped collate_fn if dataset is grouped by context
+        if grouped:
+            actual_collate_fn = lambda b: grouped_collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = 1  # Each context is one batch
+        else:
+            actual_collate_fn = lambda b: collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = batch_size
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=actual_batch_size,
             shuffle=shuffle,
             sampler=sampler,
-            collate_fn=lambda b: collate_fn(b, self.tokenizer, max_length),
+            collate_fn=actual_collate_fn,
             drop_last=True,
         )
 
@@ -714,6 +786,7 @@ class CrossBatchTrainer:
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
+        grouped: bool = False,
     ) -> Dict[str, Any]:
         """
         Full training loop.
@@ -728,6 +801,7 @@ class CrossBatchTrainer:
             distributed: Whether to use DDP
             rank: Process rank
             world_size: Total number of processes
+            grouped: If True, dataset is grouped by context (use batch_size=1)
 
         Returns:
             Training history
@@ -743,13 +817,21 @@ class CrossBatchTrainer:
             sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
             shuffle = False
 
+        # Use grouped collate_fn if dataset is grouped by context
+        if grouped:
+            actual_collate_fn = lambda b: grouped_collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = 1  # Each context is one batch
+        else:
+            actual_collate_fn = lambda b: collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = batch_size
+
         # Create dataloader
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=actual_batch_size,
             shuffle=shuffle,
             sampler=sampler,
-            collate_fn=lambda b: collate_fn(b, self.tokenizer, max_length),
+            collate_fn=actual_collate_fn,
             drop_last=True,  # Ensure we always have full batches for cross-batch
         )
 
