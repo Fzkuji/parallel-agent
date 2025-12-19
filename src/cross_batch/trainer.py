@@ -175,6 +175,32 @@ def grouped_collate_fn(batch: List[List[Dict]], tokenizer: PreTrainedTokenizer, 
     return collate_fn(examples, tokenizer, max_length)
 
 
+def multi_context_collate_fn(batch: List[List[Dict]], tokenizer: PreTrainedTokenizer, max_length: int = 512):
+    """Collate function for batching multiple contexts together.
+
+    Args:
+        batch: List of context groups, each group is a list of examples
+        tokenizer: Tokenizer for encoding
+        max_length: Maximum sequence length
+
+    Returns:
+        Dict with input_ids, attention_mask, labels, labels_attention_mask, context_ids
+        context_ids indicates which context each question belongs to
+    """
+    all_examples = []
+    context_ids = []
+
+    for context_idx, context_group in enumerate(batch):
+        for example in context_group:
+            all_examples.append(example)
+            context_ids.append(context_idx)
+
+    # Use base collate_fn for tokenization
+    result = collate_fn(all_examples, tokenizer, max_length)
+    result["context_ids"] = torch.tensor(context_ids, dtype=torch.long)
+    return result
+
+
 def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: int = 512):
     """Collate function for DataLoader."""
     prompts = [item["prompt"] for item in batch]
@@ -445,10 +471,11 @@ class LMHeadOnlyTrainer:
             sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
             shuffle = False
 
-        # Use grouped collate_fn if dataset is grouped by context
+        # Use multi-context collate_fn if dataset is grouped by context
+        # batch_size = number of contexts to process in parallel
         if grouped:
-            actual_collate_fn = lambda b: grouped_collate_fn(b, self.tokenizer, max_length)
-            actual_batch_size = 1  # Each context is one batch
+            actual_collate_fn = lambda b: multi_context_collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = batch_size  # Number of contexts per batch
         else:
             actual_collate_fn = lambda b: collate_fn(b, self.tokenizer, max_length)
             actual_batch_size = batch_size
@@ -586,24 +613,68 @@ class CrossBatchTrainer:
         else:
             raise ValueError("Could not find output projection layer")
 
+    def _apply_cross_batch_per_context(
+        self,
+        hidden: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply cross-batch attention separately for each context group.
+
+        Args:
+            hidden: [batch, hidden_size] hidden states
+            context_ids: [batch] tensor indicating which context each sample belongs to
+                        If None, apply cross-batch to all samples together
+
+        Returns:
+            mixed_hidden: [batch, hidden_size] after per-context cross-batch attention
+        """
+        if context_ids is None:
+            return self.cross_batch_module(hidden)
+
+        batch_size = hidden.size(0)
+        mixed_hidden = torch.zeros_like(hidden)
+
+        # Get unique context IDs
+        unique_contexts = context_ids.unique()
+
+        for ctx_id in unique_contexts:
+            # Get indices for this context
+            ctx_mask = context_ids == ctx_id
+            ctx_hidden = hidden[ctx_mask]  # [num_questions_in_ctx, hidden_size]
+
+            # Skip if only 1 question (no cross-batch possible)
+            if ctx_hidden.size(0) < 2:
+                mixed_hidden[ctx_mask] = ctx_hidden
+            else:
+                # Apply cross-batch attention within this context
+                ctx_mixed = self.cross_batch_module(ctx_hidden)
+                mixed_hidden[ctx_mask] = ctx_mixed
+
+        return mixed_hidden
+
     def compute_loss(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
         labels_attention_mask: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute training loss over the FULL answer sequence with KV cache optimization.
 
         For each token position in the answer, we:
         1. Get hidden states from the model (using KV cache for efficiency)
-        2. Apply cross-batch mixing
+        2. Apply cross-batch mixing (per-context if context_ids provided)
         3. Predict next token
         4. Accumulate loss
 
         Uses dynamic answer length based on actual labels, with early stopping
         when all samples have finished.
+
+        Args:
+            context_ids: Optional tensor indicating which context each sample belongs to.
+                        If provided, cross-batch attention is applied per-context.
         """
         batch_size = input_ids.size(0)
         prompt_lengths = attention_mask.sum(dim=1)  # [batch]
@@ -647,8 +718,8 @@ class CrossBatchTrainer:
 
         # Generate answer tokens one by one using KV cache
         for step in range(max_answer_len):
-            # Apply cross-batch interaction
-            mixed_hidden = self.cross_batch_module(last_hidden)
+            # Apply cross-batch interaction (per-context if context_ids provided)
+            mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
 
             # Compute logits
             if use_lm_head_module:
@@ -751,6 +822,9 @@ class CrossBatchTrainer:
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
             labels_attention_mask = batch["labels_attention_mask"].to(self.device)
+            context_ids = batch.get("context_ids")
+            if context_ids is not None:
+                context_ids = context_ids.to(self.device)
 
             # Skip batches with only 1 sample (no cross-batch possible)
             if input_ids.size(0) < 2:
@@ -763,6 +837,7 @@ class CrossBatchTrainer:
                 attention_mask=attention_mask,
                 labels=labels,
                 labels_attention_mask=labels_attention_mask,
+                context_ids=context_ids,
             )
 
             loss = loss_dict["loss"]
@@ -840,10 +915,11 @@ class CrossBatchTrainer:
             sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
             shuffle = False
 
-        # Use grouped collate_fn if dataset is grouped by context
+        # Use multi-context collate_fn if dataset is grouped by context
+        # batch_size = number of contexts to process in parallel
         if grouped:
-            actual_collate_fn = lambda b: grouped_collate_fn(b, self.tokenizer, max_length)
-            actual_batch_size = 1  # Each context is one batch
+            actual_collate_fn = lambda b: multi_context_collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = batch_size  # Number of contexts per batch
         else:
             actual_collate_fn = lambda b: collate_fn(b, self.tokenizer, max_length)
             actual_batch_size = batch_size
