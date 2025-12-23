@@ -1341,6 +1341,302 @@ except ImportError:
     TaskType = None
 
 
+class LoRACrossBatchTrainer:
+    """
+    Trainer that combines LoRA fine-tuning with cross-batch attention training.
+
+    Trains:
+    - LoRA adapters on the base model
+    - lm_head (output projection)
+    - cross_batch_module (cross-batch attention)
+    """
+
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        cross_batch_module: nn.Module,
+        device: str = "cuda",
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+    ):
+        self.tokenizer = tokenizer
+        self.device = device
+        self.model_dtype = next(model.parameters()).dtype
+
+        # Configure and apply LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            bias="none",
+        )
+        self.model = get_peft_model(model, lora_config).to(device)
+        self.base_model = _resolve_base_model(self.model.base_model)
+
+        # Setup cross-batch module
+        self.cross_batch_module = cross_batch_module.to(device=device, dtype=self.model_dtype)
+
+        # Get lm_head reference
+        if hasattr(self.model.base_model, 'lm_head'):
+            self.lm_head = self.model.base_model.lm_head
+        else:
+            self.lm_head = None
+
+        # Enable training for lm_head
+        if self.lm_head is not None:
+            for param in self.lm_head.parameters():
+                param.requires_grad = True
+
+        # Collect all trainable parameters
+        trainable_params = []
+        # LoRA parameters (already requires_grad=True from get_peft_model)
+        trainable_params.extend([p for p in self.model.parameters() if p.requires_grad])
+        # Cross-batch module parameters
+        trainable_params.extend(self.cross_batch_module.parameters())
+
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_count = sum(p.numel() for p in trainable_params)
+        logger.info(f"Training LoRA + lm_head + cross-batch")
+        logger.info(f"Trainable params: {trainable_count:,} / {total_params:,} ({100*trainable_count/total_params:.2f}%)")
+
+        self.optimizer = AdamW(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        self.scheduler = None
+        self.best_lora_state = None
+        self.best_lm_head_state = None
+        self.best_cross_batch_state = None
+
+    def _apply_cross_batch_per_context(
+        self,
+        hidden: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply cross-batch attention separately for each context group."""
+        if context_ids is None:
+            return self.cross_batch_module(hidden)
+
+        batch_size = hidden.size(0)
+        mixed_hidden = torch.zeros_like(hidden)
+        unique_contexts = context_ids.unique()
+
+        for ctx_id in unique_contexts:
+            ctx_mask = context_ids == ctx_id
+            ctx_hidden = hidden[ctx_mask]
+            if ctx_hidden.size(0) < 2:
+                mixed_hidden[ctx_mask] = ctx_hidden
+            else:
+                mixed_hidden[ctx_mask] = self.cross_batch_module(ctx_hidden)
+
+        return mixed_hidden
+
+    def compute_loss(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        labels_attention_mask: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute cross-entropy loss with cross-batch mixing."""
+        batch_size = input_ids.size(0)
+        prompt_lengths = attention_mask.sum(dim=1)
+        answer_lengths = labels_attention_mask.sum(dim=1) - prompt_lengths
+        max_answer_len = min(answer_lengths.max().item(), 32)
+
+        total_loss = 0.0
+        num_tokens = 0
+        current_mask = attention_mask.clone()
+        past_key_values = None
+
+        # First step: process full prompt
+        with torch.no_grad():
+            hidden_states, past_key_values = _forward_hidden_states(
+                self.base_model,
+                input_ids,
+                current_mask,
+                past_key_values=None,
+                use_cache=True,
+            )
+            seq_lengths = current_mask.sum(dim=1) - 1
+            last_hidden = hidden_states[-1][torch.arange(batch_size, device=self.device), seq_lengths]
+
+        for step in range(max_answer_len):
+            # Apply cross-batch mixing
+            mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+
+            # Compute logits
+            logits = self.lm_head(mixed_hidden)
+
+            target_positions = prompt_lengths + step
+            valid_mask = target_positions < labels.size(1)
+            target_positions_clamped = target_positions.clamp(max=labels.size(1) - 1)
+            target_tokens = labels[torch.arange(batch_size, device=self.device), target_positions_clamped]
+
+            if valid_mask.any():
+                valid_logits = logits[valid_mask]
+                valid_targets = target_tokens[valid_mask]
+                non_pad_mask = valid_targets != self.tokenizer.pad_token_id
+                if non_pad_mask.any():
+                    step_loss = F.cross_entropy(
+                        valid_logits[non_pad_mask],
+                        valid_targets[non_pad_mask],
+                    )
+                    total_loss = total_loss + step_loss
+                    num_tokens += non_pad_mask.sum().item()
+
+            all_finished = (~valid_mask).all() or (valid_mask.any() and non_pad_mask.sum() == 0)
+            if all_finished:
+                break
+
+            # Prepare next step
+            next_tokens = target_tokens.unsqueeze(1)
+            next_mask = valid_mask.long().unsqueeze(1)
+            current_mask = torch.cat([current_mask, next_mask], dim=1)
+
+            with torch.no_grad():
+                hidden_states, past_key_values = _forward_hidden_states(
+                    self.base_model,
+                    next_tokens,
+                    current_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                last_hidden = hidden_states[-1][:, -1, :]
+
+        if num_tokens > 0:
+            avg_loss = total_loss / num_tokens
+        else:
+            avg_loss = torch.tensor(0.0, device=self.device)
+
+        return {"loss": avg_loss, "num_tokens": num_tokens}
+
+    def train_epoch(self, dataloader: DataLoader, epoch: int, rank: int = 0) -> Dict[str, float]:
+        self.model.train()
+        self.cross_batch_module.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = batch["labels"].to(self.device)
+            labels_attention_mask = batch["labels_attention_mask"].to(self.device)
+            context_ids = batch.get("context_ids")
+            if context_ids is not None:
+                context_ids = context_ids.to(self.device)
+
+            if input_ids.size(0) < 2:
+                continue
+
+            self.optimizer.zero_grad()
+            loss_dict = self.compute_loss(input_ids, attention_mask, labels, labels_attention_mask, context_ids)
+            loss = loss_dict["loss"]
+
+            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad] +
+                list(self.cross_batch_module.parameters()), 1.0
+            )
+            self.optimizer.step()
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        return {"loss": total_loss / max(num_batches, 1)}
+
+    def train(
+        self,
+        train_dataset: Dataset,
+        num_epochs: int = 3,
+        batch_size: int = 8,
+        max_length: int = 512,
+        save_dir: Optional[str] = None,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        grouped: bool = False,
+    ) -> Dict[str, Any]:
+        if save_dir and rank == 0:
+            os.makedirs(save_dir, exist_ok=True)
+
+        sampler = None
+        shuffle = True
+        if distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            shuffle = False
+
+        if grouped:
+            actual_collate_fn = lambda b: multi_context_collate_fn(b, self.tokenizer, max_length)
+        else:
+            actual_collate_fn = lambda b: collate_fn(b, self.tokenizer, max_length)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            collate_fn=actual_collate_fn,
+            drop_last=True,
+        )
+
+        total_steps = len(train_loader) * num_epochs
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=1e-6)
+
+        history = {"train_loss": []}
+        best_loss = float('inf')
+
+        for epoch in range(1, num_epochs + 1):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+
+            if rank == 0:
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Epoch {epoch}/{num_epochs} (LoRA + lm_head + cross-batch)")
+                logger.info(f"{'='*50}")
+
+            metrics = self.train_epoch(train_loader, epoch, rank=rank)
+            history["train_loss"].append(metrics["loss"])
+            if rank == 0:
+                logger.info(f"Epoch {epoch} - Loss: {metrics['loss']:.4f}")
+
+            if metrics["loss"] < best_loss:
+                best_loss = metrics["loss"]
+                self.best_lora_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items() if 'lora' in k.lower()}
+                if self.lm_head is not None:
+                    self.best_lm_head_state = _clone_state_dict(self.lm_head)
+                self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module)
+
+        # Restore best state
+        if self.best_lora_state is not None:
+            current_state = self.model.state_dict()
+            current_state.update({k: v.to(self.device) for k, v in self.best_lora_state.items()})
+            self.model.load_state_dict(current_state)
+        if self.best_lm_head_state is not None and self.lm_head is not None:
+            self.lm_head.load_state_dict(self.best_lm_head_state)
+        if self.best_cross_batch_state is not None:
+            self.cross_batch_module.load_state_dict(self.best_cross_batch_state)
+
+        return history
+
+
 def train_cross_batch_module(
     model_name: str = "gpt2",
     mix_method: str = "attention",
