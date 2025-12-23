@@ -1025,6 +1025,322 @@ class CrossBatchTrainer:
         logger.info(f"Checkpoint loaded from {path} ({', '.join(loaded_modules)})")
 
 
+class LoRATrainer:
+    """
+    Trainer for fine-tuning the model with LoRA adapters.
+
+    Supports two saving modes:
+    - LoRA only: Just the LoRA adapter weights
+    - LoRA + lm_head: LoRA weights plus the final embedding layer
+    """
+
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        device: str = "cuda",
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        train_lm_head: bool = True,
+    ):
+        self.tokenizer = tokenizer
+        self.device = device
+        self.train_lm_head = train_lm_head
+        self.model_dtype = next(model.parameters()).dtype
+
+        # Configure LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            bias="none",
+        )
+
+        # Apply LoRA to model
+        self.model = get_peft_model(model, lora_config).to(device)
+        self.base_model = _resolve_base_model(self.model.base_model)
+
+        # Store reference to original lm_head
+        if hasattr(self.model.base_model, 'lm_head'):
+            self.lm_head = self.model.base_model.lm_head
+        else:
+            self.lm_head = None
+
+        # Optionally train lm_head together with LoRA
+        if train_lm_head and self.lm_head is not None:
+            for param in self.lm_head.parameters():
+                param.requires_grad = True
+            logger.info("Training LoRA adapters + lm_head")
+        else:
+            logger.info("Training LoRA adapters only")
+
+        # Collect trainable parameters
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_count = sum(p.numel() for p in trainable_params)
+        logger.info(f"Trainable params: {trainable_count:,} / {total_params:,} ({100*trainable_count/total_params:.2f}%)")
+
+        self.optimizer = AdamW(
+            trainable_params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        self.scheduler = None
+        self.best_lora_state = None
+        self.best_lm_head_state = None
+
+    def compute_loss(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        labels_attention_mask: torch.Tensor,
+        context_ids: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute cross-entropy loss over the answer sequence."""
+        batch_size = input_ids.size(0)
+        prompt_lengths = attention_mask.sum(dim=1)
+        answer_lengths = labels_attention_mask.sum(dim=1) - prompt_lengths
+        max_answer_len = answer_lengths.max().item()
+
+        total_loss = 0.0
+        num_tokens = 0
+
+        current_ids = input_ids.clone()
+        current_mask = attention_mask.clone()
+        max_gen_steps = min(max_answer_len, 32)
+
+        # First step: process the full prompt and get KV cache
+        past_key_values = None
+        with torch.no_grad():
+            hidden_states, past_key_values = _forward_hidden_states(
+                self.base_model,
+                current_ids,
+                current_mask,
+                past_key_values=None,
+                use_cache=True,
+            )
+            seq_lengths = current_mask.sum(dim=1) - 1
+            last_hidden = hidden_states[-1][torch.arange(batch_size, device=self.device), seq_lengths]
+
+        for step in range(max_gen_steps):
+            # Use lm_head directly (no cross-batch mixing)
+            if self.lm_head is not None:
+                logits = self.lm_head(last_hidden)
+            else:
+                logits = self.model.base_model.lm_head(last_hidden)
+
+            target_positions = prompt_lengths + step
+            valid_mask = target_positions < labels.size(1)
+            target_positions_clamped = target_positions.clamp(max=labels.size(1) - 1)
+            target_tokens = labels[torch.arange(batch_size, device=self.device), target_positions_clamped]
+
+            if valid_mask.any():
+                valid_logits = logits[valid_mask]
+                valid_targets = target_tokens[valid_mask]
+                non_pad_mask = valid_targets != self.tokenizer.pad_token_id
+                if non_pad_mask.any():
+                    step_loss = F.cross_entropy(
+                        valid_logits[non_pad_mask],
+                        valid_targets[non_pad_mask],
+                    )
+                    total_loss = total_loss + step_loss
+                    num_tokens += non_pad_mask.sum().item()
+
+            # Early stopping
+            all_finished = (~valid_mask).all() or (valid_mask.any() and non_pad_mask.sum() == 0)
+            if all_finished:
+                break
+
+            # Prepare next step with KV cache
+            next_tokens = target_tokens.unsqueeze(1)
+            next_mask = valid_mask.long().unsqueeze(1)
+            current_mask = torch.cat([current_mask, next_mask], dim=1)
+
+            with torch.no_grad():
+                hidden_states, past_key_values = _forward_hidden_states(
+                    self.base_model,
+                    next_tokens,
+                    current_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                last_hidden = hidden_states[-1][:, -1, :]
+
+        if num_tokens > 0:
+            avg_loss = total_loss / num_tokens
+        else:
+            avg_loss = torch.tensor(0.0, device=self.device)
+
+        return {"loss": avg_loss, "num_tokens": num_tokens}
+
+    def train_epoch(self, dataloader: DataLoader, epoch: int, rank: int = 0) -> Dict[str, float]:
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = batch["labels"].to(self.device)
+            labels_attention_mask = batch["labels_attention_mask"].to(self.device)
+            context_ids = batch.get("context_ids")
+            if context_ids is not None:
+                context_ids = context_ids.to(self.device)
+
+            self.optimizer.zero_grad()
+            loss_dict = self.compute_loss(input_ids, attention_mask, labels, labels_attention_mask, context_ids)
+            loss = loss_dict["loss"]
+
+            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad], 1.0
+            )
+            self.optimizer.step()
+
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        return {"loss": total_loss / max(num_batches, 1)}
+
+    def train(
+        self,
+        train_dataset: Dataset,
+        num_epochs: int = 3,
+        batch_size: int = 8,
+        max_length: int = 512,
+        save_dir: Optional[str] = "checkpoints_lora",
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        grouped: bool = False,
+    ) -> Dict[str, Any]:
+        if save_dir and rank == 0:
+            os.makedirs(save_dir, exist_ok=True)
+
+        sampler = None
+        shuffle = True
+        if distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            shuffle = False
+
+        if grouped:
+            actual_collate_fn = lambda b: multi_context_collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = batch_size
+        else:
+            actual_collate_fn = lambda b: collate_fn(b, self.tokenizer, max_length)
+            actual_batch_size = batch_size
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=actual_batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            collate_fn=actual_collate_fn,
+            drop_last=True,
+        )
+
+        total_steps = len(train_loader) * num_epochs
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps, eta_min=1e-6)
+
+        history = {"train_loss": []}
+        best_loss = float('inf')
+
+        for epoch in range(1, num_epochs + 1):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+
+            if rank == 0:
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Epoch {epoch}/{num_epochs} (LoRA" + (" + lm_head" if self.train_lm_head else "") + ")")
+                logger.info(f"{'='*50}")
+
+            metrics = self.train_epoch(train_loader, epoch, rank=rank)
+            history["train_loss"].append(metrics["loss"])
+            if rank == 0:
+                logger.info(f"Epoch {epoch} - Loss: {metrics['loss']:.4f}")
+
+            if metrics["loss"] < best_loss:
+                best_loss = metrics["loss"]
+                # Save best LoRA state
+                self.best_lora_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items() if 'lora' in k.lower()}
+                if self.train_lm_head and self.lm_head is not None:
+                    self.best_lm_head_state = _clone_state_dict(self.lm_head)
+                if save_dir and rank == 0:
+                    self.save_checkpoint(os.path.join(save_dir, "best_model.pt"))
+
+        # Restore best state
+        if self.best_lora_state is not None:
+            current_state = self.model.state_dict()
+            current_state.update({k: v.to(self.device) for k, v in self.best_lora_state.items()})
+            self.model.load_state_dict(current_state)
+        if self.best_lm_head_state is not None and self.lm_head is not None:
+            self.lm_head.load_state_dict(self.best_lm_head_state)
+
+        if save_dir and rank == 0:
+            self.save_checkpoint(os.path.join(save_dir, "final_model.pt"))
+            with open(os.path.join(save_dir, "training_history.json"), "w") as f:
+                json.dump(history, f, indent=2)
+
+        return history
+
+    def save_checkpoint(self, path: str):
+        """Save LoRA checkpoint. Always saves both LoRA-only and LoRA+lm_head versions."""
+        # Extract LoRA weights
+        lora_state = {k: v for k, v in self.model.state_dict().items() if 'lora' in k.lower()}
+
+        # Save LoRA only
+        lora_only_path = path.replace('.pt', '_lora_only.pt')
+        torch.save({'lora': lora_state}, lora_only_path)
+        logger.info(f"LoRA-only checkpoint saved to {lora_only_path}")
+
+        # Save LoRA + lm_head
+        if self.lm_head is not None:
+            lora_lmhead_path = path.replace('.pt', '_lora_lmhead.pt')
+            save_dict = {
+                'lora': lora_state,
+                'lm_head': self.lm_head.state_dict(),
+            }
+            torch.save(save_dict, lora_lmhead_path)
+            logger.info(f"LoRA + lm_head checkpoint saved to {lora_lmhead_path}")
+
+    def load_checkpoint(self, path: str):
+        """Load LoRA checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        if 'lora' in checkpoint:
+            current_state = self.model.state_dict()
+            current_state.update(checkpoint['lora'])
+            self.model.load_state_dict(current_state)
+            logger.info(f"LoRA weights loaded from {path}")
+        if 'lm_head' in checkpoint and self.lm_head is not None:
+            self.lm_head.load_state_dict(checkpoint['lm_head'])
+            logger.info(f"lm_head weights loaded from {path}")
+
+
+# Import peft at module level for LoRATrainer
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+except ImportError:
+    logger.warning("peft not installed. LoRATrainer will not be available.")
+    LoraConfig = None
+    get_peft_model = None
+    TaskType = None
+
+
 def train_cross_batch_module(
     model_name: str = "gpt2",
     mix_method: str = "attention",

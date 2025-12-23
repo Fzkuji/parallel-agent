@@ -59,6 +59,296 @@ from src.strategies.cross_batch import (
 )
 
 
+def get_checkpoint_path(base_dir: str, dataset: str, model_name: str, mode: str) -> str:
+    """
+    Generate checkpoint path in format: {base_dir}/{dataset}/{model_name}_{mode}.pt
+
+    Args:
+        base_dir: Base checkpoint directory (e.g., outputs/checkpoints)
+        dataset: Dataset name (e.g., squad, hotpot)
+        model_name: Model name (e.g., Qwen/Qwen2.5-14B-Instruct)
+        mode: Checkpoint mode (e.g., baseline, crossbatch, lora_only, lora_lmhead)
+
+    Returns:
+        Full checkpoint path
+    """
+    safe_model_name = model_name.replace('/', '_')
+    return os.path.join(base_dir, dataset, f'{safe_model_name}_{mode}.pt')
+
+
+def auto_find_checkpoints(args) -> dict:
+    """
+    Auto-find checkpoint paths based on model name and dataset.
+
+    Returns dict with keys: baseline, crossbatch, lora, lora_lmhead
+    Each value is either the found path or None if not found.
+    """
+    base_dir = getattr(args, 'checkpoint_dir', 'outputs/checkpoints')
+    dataset = args.dataset
+    model_name = args.model_name
+
+    checkpoints = {}
+    modes = {
+        'baseline': 'baseline',
+        'crossbatch': 'crossbatch',
+        'lora': 'lora_only',
+        'lora_lmhead': 'lora_lmhead',
+    }
+
+    for key, mode in modes.items():
+        path = get_checkpoint_path(base_dir, dataset, model_name, mode)
+        if os.path.exists(path):
+            checkpoints[key] = path
+            logging.info(f"Found {key} checkpoint: {path}")
+        else:
+            checkpoints[key] = None
+            logging.debug(f"No {key} checkpoint at: {path}")
+
+    return checkpoints
+
+
+def create_vllm_model(model_name: str, tensor_parallel_size: int = 1):
+    """Create a vLLM model for fast inference."""
+    try:
+        from vllm import LLM, SamplingParams
+        model = LLM(
+            model=model_name,
+            tensor_parallel_size=tensor_parallel_size,
+            trust_remote_code=True,
+            dtype="bfloat16",
+        )
+        return model
+    except ImportError:
+        logging.warning("vLLM not installed. Install with: pip install vllm")
+        return None
+
+
+def run_vllm_batch_strategy(
+    items: List[Dict],
+    vllm_model,
+    tokenizer: "AutoTokenizer",
+    *,
+    max_new_tokens: int,
+    strategy_name: str = "batch_vllm",
+    dataset: str = None,
+) -> "StrategyResult":
+    """Run batch strategy using vLLM for fast inference."""
+    from vllm import SamplingParams
+    from src.prompts import build_single_prompt
+    from src.inference import build_chat_prompt, extract_answer
+    from src.evaluation import evaluate_predictions
+    from src.models import Question, StrategyResult
+
+    question_lookup = {
+        item["qid"]: Question(
+            qid=item["qid"],
+            text=item["question"],
+            priority=1.0,
+            answer_tokens=item.get("answer_tokens", 12),
+            type_hint=None,
+            references=item.get("references", []),
+        )
+        for item in items
+    }
+
+    # Build prompts for all items
+    batch_chat_prompts = []
+    for item in items:
+        q = question_lookup[item["qid"]]
+        system_prompt, user_prompt = build_single_prompt(item["context"], q, dataset)
+        batch_chat_prompts.append(
+            build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+        )
+
+    # Use vLLM for inference
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    start = time.perf_counter()
+    outputs = vllm_model.generate(batch_chat_prompts, sampling_params)
+    total_latency = time.perf_counter() - start
+
+    # Process outputs
+    answer_records = {}
+    answers_text = {}
+    per_question = []
+    total_prompt_tokens = 0
+    total_generated_tokens = 0
+
+    for idx, (item, output) in enumerate(zip(items, outputs)):
+        qid = item["qid"]
+        raw_text = output.outputs[0].text.strip()
+        final_answer, strict_valid = extract_answer(raw_text, dataset)
+        answer_records[qid] = (final_answer, strict_valid)
+        answers_text[qid] = final_answer
+
+        prompt_tokens = len(output.prompt_token_ids)
+        gen_tokens = len(output.outputs[0].token_ids)
+        total_prompt_tokens += prompt_tokens
+        total_generated_tokens += gen_tokens
+
+        per_question.append({
+            "question_id": qid,
+            "question": item["question"],
+            "gold_answers": item.get("references", []),
+            "prompt": batch_chat_prompts[idx],
+            "raw_response": raw_text,
+            "final_answer": final_answer,
+            "strict_valid": strict_valid,
+            "latency": total_latency / len(items),
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": gen_tokens,
+        })
+
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+    return StrategyResult(
+        name=strategy_name,
+        answers=answers_text,
+        prompt_tokens=total_prompt_tokens,
+        generated_tokens=total_generated_tokens,
+        latency=total_latency,
+        batches=1,
+        metrics=metrics,
+        details={"questions": per_question},
+    )
+
+
+def run_vllm_sequential_strategy(
+    items: List[Dict],
+    vllm_model,
+    tokenizer: "AutoTokenizer",
+    *,
+    max_new_tokens: int,
+    strategy_name: str = "sequential_vllm",
+    dataset: str = None,
+) -> "StrategyResult":
+    """Run sequential strategy using vLLM (one prompt at a time for fair comparison)."""
+    from vllm import SamplingParams
+    from src.prompts import build_single_prompt
+    from src.inference import build_chat_prompt, extract_answer
+    from src.evaluation import evaluate_predictions
+    from src.models import Question, StrategyResult
+
+    question_lookup = {
+        item["qid"]: Question(
+            qid=item["qid"],
+            text=item["question"],
+            priority=1.0,
+            answer_tokens=item.get("answer_tokens", 12),
+            type_hint=None,
+            references=item.get("references", []),
+        )
+        for item in items
+    }
+
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    answer_records = {}
+    answers_text = {}
+    per_question = []
+    total_prompt_tokens = 0
+    total_generated_tokens = 0
+    total_latency = 0.0
+
+    for item in items:
+        qid = item["qid"]
+        q = question_lookup[qid]
+        system_prompt, user_prompt = build_single_prompt(item["context"], q, dataset)
+        chat_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+
+        start = time.perf_counter()
+        outputs = vllm_model.generate([chat_prompt], sampling_params)
+        elapsed = time.perf_counter() - start
+        total_latency += elapsed
+
+        output = outputs[0]
+        raw_text = output.outputs[0].text.strip()
+        final_answer, strict_valid = extract_answer(raw_text, dataset)
+        answer_records[qid] = (final_answer, strict_valid)
+        answers_text[qid] = final_answer
+
+        prompt_tokens = len(output.prompt_token_ids)
+        gen_tokens = len(output.outputs[0].token_ids)
+        total_prompt_tokens += prompt_tokens
+        total_generated_tokens += gen_tokens
+
+        per_question.append({
+            "question_id": qid,
+            "question": item["question"],
+            "gold_answers": item.get("references", []),
+            "prompt": chat_prompt,
+            "raw_response": raw_text,
+            "final_answer": final_answer,
+            "strict_valid": strict_valid,
+            "latency": elapsed,
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": gen_tokens,
+        })
+
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+    return StrategyResult(
+        name=strategy_name,
+        answers=answers_text,
+        prompt_tokens=total_prompt_tokens,
+        generated_tokens=total_generated_tokens,
+        latency=total_latency,
+        batches=len(items),
+        metrics=metrics,
+        details={"turns": per_question},
+    )
+
+
+def run_vllm_strategies(
+    items: List[Dict],
+    vllm_model,
+    tokenizer: "AutoTokenizer",
+    dep_generator,
+    bert_dep_generator,
+    *,
+    args,
+    bert_conf_threshold: float,
+    selected_strategies: List[str],
+    eval_dataset: str = None,
+) -> List["StrategyResult"]:
+    """Run vLLM-compatible strategies."""
+    results = []
+    effective_dataset = eval_dataset or args.dataset
+
+    if "sequential" in selected_strategies:
+        results.append(run_vllm_sequential_strategy(
+            items,
+            vllm_model,
+            tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="sequential_vllm",
+            dataset=effective_dataset,
+        ))
+
+    if "batch" in selected_strategies:
+        results.append(run_vllm_batch_strategy(
+            items,
+            vllm_model,
+            tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="batch_vllm",
+            dataset=effective_dataset,
+        ))
+
+    # For collab_llm and collab_bert, we use the vLLM model for the main generation
+    # but the dependency generation still uses the regular model or API
+    # This is a simplified version - the full implementation would require
+    # modifying the dependency batch strategy to use vLLM
+
+    return results
+
+
 def get_eval_dataset(args: argparse.Namespace) -> str:
     """Get the dataset identifier for evaluation based on args.
 
@@ -201,6 +491,38 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to trained collab_hidden module checkpoint.",
     )
+    # Checkpoint directory for auto-discovery
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="outputs/checkpoints",
+        help="Base directory for checkpoint auto-discovery (default: outputs/checkpoints). "
+             "Checkpoints are expected at: {checkpoint-dir}/{dataset}/{model_name}_{mode}.pt",
+    )
+    parser.add_argument(
+        "--auto-checkpoints",
+        action="store_true",
+        help="Auto-discover checkpoints based on --checkpoint-dir, --dataset, and --model-name.",
+    )
+    # LoRA checkpoint arguments (explicit paths override auto-discovery)
+    parser.add_argument(
+        "--lora-checkpoint",
+        type=str,
+        default=None,
+        help="Path to LoRA-only checkpoint for lora strategy (overrides auto-discovery).",
+    )
+    parser.add_argument(
+        "--lora-lmhead-checkpoint",
+        type=str,
+        default=None,
+        help="Path to LoRA+lm_head checkpoint for lora_lmhead strategy (overrides auto-discovery).",
+    )
+    # vLLM inference
+    parser.add_argument(
+        "--use-vllm",
+        action="store_true",
+        help="Also run strategies with vLLM for comparison. Only for non-finetuned strategies.",
+    )
     parser.add_argument(
         "--collab-hidden-mix-method",
         type=str,
@@ -256,7 +578,10 @@ def resolve_dependency_generators(
     return dep_generator, bert_dep_generator, bert_conf_threshold
 
 
-ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "finetuned", "collab_llm", "collab_bert", "collab_hidden"]
+ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "finetuned", "collab_llm", "collab_bert", "collab_hidden", "lora", "lora_lmhead"]
+
+# Strategies that can be run with vLLM (no finetuning required)
+VLLM_STRATEGIES = ["sequential", "batch", "collab_llm", "collab_bert"]
 
 
 def run_all_strategies(
@@ -394,6 +719,76 @@ def run_all_strategies(
                 checkpoint_path=args.collab_hidden_checkpoint,
                 enable_cross_batch=True,
             ))
+        if "lora" in selected_strategies:
+            import torch
+            if args.lora_checkpoint and hasattr(model, 'lm_head'):
+                try:
+                    from peft import LoraConfig, get_peft_model, TaskType
+                    checkpoint = torch.load(args.lora_checkpoint, map_location=model.device)
+                    lora_config = LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        r=16,
+                        lora_alpha=32,
+                        lora_dropout=0.05,
+                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                        bias="none",
+                    )
+                    lora_model = get_peft_model(model, lora_config)
+                    if 'lora' in checkpoint:
+                        current_state = lora_model.state_dict()
+                        current_state.update(checkpoint['lora'])
+                        lora_model.load_state_dict(current_state)
+                    results.append(run_batch_multi_strategy(
+                        items,
+                        tokenizer,
+                        lora_model,
+                        max_new_tokens=args.max_new_tokens,
+                        strategy_name="lora",
+                        dataset=effective_dataset,
+                        api_client=api_client,
+                    ))
+                    del lora_model
+                except Exception as e:
+                    logging.warning(f"Skipping lora strategy: {e}")
+            else:
+                logging.warning("Skipping lora strategy: --lora-checkpoint not provided or model has no lm_head")
+        if "lora_lmhead" in selected_strategies:
+            import torch
+            if args.lora_lmhead_checkpoint and hasattr(model, 'lm_head'):
+                try:
+                    from peft import LoraConfig, get_peft_model, TaskType
+                    checkpoint = torch.load(args.lora_lmhead_checkpoint, map_location=model.device)
+                    original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
+                    if 'lm_head' in checkpoint:
+                        model.lm_head.load_state_dict(checkpoint['lm_head'])
+                    lora_config = LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        r=16,
+                        lora_alpha=32,
+                        lora_dropout=0.05,
+                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                        bias="none",
+                    )
+                    lora_model = get_peft_model(model, lora_config)
+                    if 'lora' in checkpoint:
+                        current_state = lora_model.state_dict()
+                        current_state.update(checkpoint['lora'])
+                        lora_model.load_state_dict(current_state)
+                    results.append(run_batch_multi_strategy(
+                        items,
+                        tokenizer,
+                        lora_model,
+                        max_new_tokens=args.max_new_tokens,
+                        strategy_name="lora_lmhead",
+                        dataset=effective_dataset,
+                        api_client=api_client,
+                    ))
+                    del lora_model
+                    model.lm_head.load_state_dict(original_lm_head_state)
+                except Exception as e:
+                    logging.warning(f"Skipping lora_lmhead strategy: {e}")
+            else:
+                logging.warning("Skipping lora_lmhead strategy: --lora-lmhead-checkpoint not provided or model has no lm_head")
         return results
 
     if "all_in_one" in selected_strategies:
@@ -493,6 +888,89 @@ def run_all_strategies(
             checkpoint_path=args.collab_hidden_checkpoint,
             enable_cross_batch=True,
         ))
+    if "lora" in selected_strategies:
+        # Load LoRA checkpoint and run batch strategy
+        import torch
+        if args.lora_checkpoint and hasattr(model, 'lm_head'):
+            try:
+                from peft import LoraConfig, get_peft_model, TaskType
+                # Load checkpoint
+                checkpoint = torch.load(args.lora_checkpoint, map_location=model.device)
+                # Apply LoRA configuration
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=16,
+                    lora_alpha=32,
+                    lora_dropout=0.05,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                    bias="none",
+                )
+                lora_model = get_peft_model(model, lora_config)
+                # Load LoRA weights
+                if 'lora' in checkpoint:
+                    current_state = lora_model.state_dict()
+                    current_state.update(checkpoint['lora'])
+                    lora_model.load_state_dict(current_state)
+                results.append(run_full_batch_strategy(
+                    background,
+                    questions,
+                    tokenizer,
+                    lora_model,
+                    max_new_tokens=args.max_new_tokens,
+                    dataset=effective_dataset,
+                    api_client=api_client,
+                    strategy_name="lora",
+                ))
+                # Clean up LoRA model (restore original model state)
+                del lora_model
+            except Exception as e:
+                logging.warning(f"Skipping lora strategy: {e}")
+        else:
+            logging.warning("Skipping lora strategy: --lora-checkpoint not provided or model has no lm_head")
+    if "lora_lmhead" in selected_strategies:
+        # Load LoRA + lm_head checkpoint and run batch strategy
+        import torch
+        if args.lora_lmhead_checkpoint and hasattr(model, 'lm_head'):
+            try:
+                from peft import LoraConfig, get_peft_model, TaskType
+                checkpoint = torch.load(args.lora_lmhead_checkpoint, map_location=model.device)
+                # Save original lm_head state
+                original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
+                # Load lm_head weights
+                if 'lm_head' in checkpoint:
+                    model.lm_head.load_state_dict(checkpoint['lm_head'])
+                # Apply LoRA configuration
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=16,
+                    lora_alpha=32,
+                    lora_dropout=0.05,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                    bias="none",
+                )
+                lora_model = get_peft_model(model, lora_config)
+                # Load LoRA weights
+                if 'lora' in checkpoint:
+                    current_state = lora_model.state_dict()
+                    current_state.update(checkpoint['lora'])
+                    lora_model.load_state_dict(current_state)
+                results.append(run_full_batch_strategy(
+                    background,
+                    questions,
+                    tokenizer,
+                    lora_model,
+                    max_new_tokens=args.max_new_tokens,
+                    dataset=effective_dataset,
+                    api_client=api_client,
+                    strategy_name="lora_lmhead",
+                ))
+                # Clean up and restore
+                del lora_model
+                model.lm_head.load_state_dict(original_lm_head_state)
+            except Exception as e:
+                logging.warning(f"Skipping lora_lmhead strategy: {e}")
+        else:
+            logging.warning("Skipping lora_lmhead strategy: --lora-lmhead-checkpoint not provided or model has no lm_head")
     return results
 
 
@@ -517,6 +995,13 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
         "collab_llm",
         "collab_bert",
         "collab_hidden",
+        "lora",
+        "lora_lmhead",
+        # vLLM strategies
+        "sequential_vllm",
+        "batch_vllm",
+        "collab_llm_vllm",
+        "collab_bert_vllm",
     ]
 
     # Get the metric names for this dataset
@@ -1074,15 +1559,50 @@ def main() -> None:
     else:
         selected_strategies = ALL_STRATEGIES.copy()
 
+    # Auto-discover checkpoints if requested
+    if args.auto_checkpoints:
+        logging.info("Auto-discovering checkpoints from: %s/%s/", args.checkpoint_dir, args.dataset)
+        discovered = auto_find_checkpoints(args)
+        # Use discovered paths if explicit paths not provided
+        if not args.baseline_checkpoint and discovered.get('baseline'):
+            args.baseline_checkpoint = discovered['baseline']
+        if not args.collab_hidden_checkpoint and discovered.get('crossbatch'):
+            args.collab_hidden_checkpoint = discovered['crossbatch']
+        if not args.lora_checkpoint and discovered.get('lora'):
+            args.lora_checkpoint = discovered['lora']
+        if not args.lora_lmhead_checkpoint and discovered.get('lora_lmhead'):
+            args.lora_lmhead_checkpoint = discovered['lora_lmhead']
+
     # Skip collab_hidden if no checkpoint provided
     if "collab_hidden" in selected_strategies and not args.collab_hidden_checkpoint:
         logging.warning("Skipping collab_hidden strategy: --collab-hidden-checkpoint not provided")
         selected_strategies.remove("collab_hidden")
 
+    # Skip lora if no checkpoint provided
+    if "lora" in selected_strategies and not args.lora_checkpoint:
+        logging.warning("Skipping lora strategy: --lora-checkpoint not provided")
+        selected_strategies.remove("lora")
+
+    # Skip lora_lmhead if no checkpoint provided
+    if "lora_lmhead" in selected_strategies and not args.lora_lmhead_checkpoint:
+        logging.warning("Skipping lora_lmhead strategy: --lora-lmhead-checkpoint not provided")
+        selected_strategies.remove("lora_lmhead")
+
     logging.info("Running strategies: %s", selected_strategies)
+
+    # Create vLLM model if requested
+    vllm_model = None
+    if args.use_vllm and not args.use_api:
+        logging.info("Initializing vLLM model for comparison...")
+        vllm_model = create_vllm_model(args.model_name)
+        if vllm_model:
+            logging.info("vLLM model initialized successfully")
+        else:
+            logging.warning("Failed to create vLLM model, skipping vLLM strategies")
 
     overall_results: Dict[str, List[StrategyResult]] = {}
     serialized_contexts: List[dict] = []
+    vllm_serialized_contexts: List[dict] = []  # Separate storage for vLLM results
 
     for idx, context_payload in enumerate(contexts, start=1):
         title = context_payload.get("title", f"context-{idx}")
@@ -1208,27 +1728,125 @@ def main() -> None:
             "strategies": strategies_data,
         })
 
+        # Run vLLM strategies if model is available
+        if vllm_model is not None:
+            # Determine which vLLM strategies to run
+            vllm_strategies_to_run = [s for s in VLLM_STRATEGIES if s in selected_strategies]
+            if vllm_strategies_to_run:
+                # Build items for vLLM (need context per item)
+                if "items" in context_payload:
+                    vllm_items = items
+                else:
+                    vllm_items = [
+                        {
+                            "qid": q.qid,
+                            "question": q.text,
+                            "context": background,
+                            "references": q.references,
+                        }
+                        for q in questions
+                    ]
+
+                vllm_strategy_list = run_vllm_strategies(
+                    vllm_items,
+                    vllm_model,
+                    tokenizer,
+                    dep_generator,
+                    bert_dep_generator,
+                    args=args,
+                    bert_conf_threshold=bert_conf_threshold,
+                    selected_strategies=vllm_strategies_to_run,
+                    eval_dataset=eval_dataset,
+                )
+
+                # Build vLLM serialization structure
+                vllm_strategies_data = {}
+                for res in vllm_strategy_list:
+                    metrics_dict = {k: round(v, 4) for k, v in res.metrics.items()}
+                    metric_sums = {name: 0.0 for name in dataset_metrics}
+                    for q in questions:
+                        pred = res.answers.get(q.qid, "")
+                        refs = q.references
+                        for metric_name, metric_func in dataset_metrics.items():
+                            metric_sums[metric_name] += metric_func(pred, refs)
+                    n_questions = len(questions) or 1
+                    for metric_name, total in metric_sums.items():
+                        metrics_dict[metric_name] = round(total / n_questions, 4)
+
+                    vllm_strategies_data[res.name] = {
+                        "answers": res.answers,
+                        "metrics": metrics_dict,
+                        "prompt_tokens": res.prompt_tokens,
+                        "generated_tokens": res.generated_tokens,
+                        "latency": round(res.latency, 2),
+                        "batches": res.batches,
+                        "details": res.details,
+                    }
+
+                vllm_serialized_contexts.append({
+                    "context": title,
+                    "questions_text": questions_text,
+                    "gold_answers": gold_answers,
+                    "strategies": vllm_strategies_data,
+                })
+
     # Distributed output handling: gather to rank0 and write a single file
     if world_size > 1 and dist.is_initialized():
         # Use torch.distributed to gather results from all ranks
         gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
         dist.all_gather_object(gather_list, serialized_contexts)
+        vllm_gather_list: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore
+        if vllm_serialized_contexts:
+            dist.all_gather_object(vllm_gather_list, vllm_serialized_contexts)
         if rank == 0:
             merged = []
             for ctx_list in gather_list:
                 if ctx_list:
                     merged.extend(ctx_list)
             # Print aggregate metrics from all ranks (only on rank 0)
+            print("\n" + "=" * 60)
+            print("Regular Inference Results")
+            print("=" * 60)
             print(compute_aggregate_metrics(merged, dataset=eval_dataset))
             save_experiment_results(args.json_out, merged, args, output_folder_name)
+
+            # Print vLLM results if available
+            if any(vllm_gather_list):
+                vllm_merged = []
+                for ctx_list in vllm_gather_list:
+                    if ctx_list:
+                        vllm_merged.extend(ctx_list)
+                if vllm_merged:
+                    print("\n" + "=" * 60)
+                    print("vLLM Inference Results")
+                    print("=" * 60)
+                    print(compute_aggregate_metrics(vllm_merged, dataset=eval_dataset))
     else:
         # Single process mode: print and save local results
+        print("\n" + "=" * 60)
+        print("Regular Inference Results")
+        print("=" * 60)
         print(compute_aggregate_metrics(serialized_contexts, dataset=eval_dataset))
         save_experiment_results(args.json_out, serialized_contexts, args, output_folder_name)
+
+        # Print vLLM results if available
+        if vllm_serialized_contexts:
+            print("\n" + "=" * 60)
+            print("vLLM Inference Results")
+            print("=" * 60)
+            print(compute_aggregate_metrics(vllm_serialized_contexts, dataset=eval_dataset))
 
     # Cleanup distributed backend
     if dist.is_initialized():
         dist.destroy_process_group()
+
+    # Cleanup vLLM model
+    if vllm_model is not None:
+        del vllm_model
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
