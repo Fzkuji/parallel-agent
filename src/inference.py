@@ -322,7 +322,13 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
                     continue
             # Position-based confidence: first edge = 1.0, last edge = 0.5
             confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
-            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
+            # Handle case where source is a list (e.g., {"Q3": ["Q1", "Q2"]})
+            if isinstance(source, list):
+                for src in source:
+                    if isinstance(src, str) and isinstance(target, str):
+                        edges.append(EdgeCandidate(source=src, target=target, confidence=confidence))
+            elif isinstance(source, str) and isinstance(target, str):
+                edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
         return edges
 
 
@@ -594,6 +600,12 @@ class APILLMDependencyGenerator(DependencyGraphGenerator):
                     continue
             # Position-based confidence: first edge = 1.0, last edge = 0.5
             confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
-            edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
+            # Handle case where source is a list (e.g., {"Q3": ["Q1", "Q2"]})
+            if isinstance(source, list):
+                for src in source:
+                    if isinstance(src, str) and isinstance(target, str):
+                        edges.append(EdgeCandidate(source=src, target=target, confidence=confidence))
+            elif isinstance(source, str) and isinstance(target, str):
+                edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
 
         return edges
