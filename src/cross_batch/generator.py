@@ -24,9 +24,30 @@ class CrossBatchGenerator:
         mix_layer: int = -1,  # which layer's hidden state to mix (-1 for last)
         device: str = "cuda",
     ):
-        self.model = model.to(device)
+        # Check if model uses device_map (distributed across GPUs)
+        is_distributed = hasattr(model, 'hf_device_map') and model.hf_device_map
+
+        if is_distributed:
+            # Don't move distributed model, use its existing device placement
+            self.model = model
+            # Get the device where lm_head is located (for cross_batch_module)
+            if hasattr(model, 'lm_head'):
+                self.device = str(next(model.lm_head.parameters()).device)
+            else:
+                self.device = device
+            # Get input device (where embeddings are)
+            if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+                self.input_device = str(next(model.model.embed_tokens.parameters()).device)
+            elif hasattr(model, 'transformer') and hasattr(model.transformer, 'wte'):
+                self.input_device = str(next(model.transformer.wte.parameters()).device)
+            else:
+                self.input_device = self.device
+        else:
+            self.model = model.to(device)
+            self.device = device
+            self.input_device = device
+
         self.tokenizer = tokenizer
-        self.device = device
         self.mix_layer = mix_layer
 
         # Get hidden size and dtype from model config
@@ -34,20 +55,21 @@ class CrossBatchGenerator:
         model_dtype = next(model.parameters()).dtype
 
         # Initialize cross-batch module with matching dtype
+        # Place on same device as lm_head (self.device)
         if cross_batch_module is not None:
-            self.cross_batch_module = cross_batch_module.to(device=device, dtype=model_dtype)
+            self.cross_batch_module = cross_batch_module.to(device=self.device, dtype=model_dtype)
         elif mix_method == "attention":
             self.cross_batch_module = CrossBatchAttention(
                 hidden_size=hidden_size,
                 num_heads=8,
                 temperature=1.0,
-            ).to(device=device, dtype=model_dtype)
+            ).to(device=self.device, dtype=model_dtype)
         else:
             self.cross_batch_module = CrossBatchEmbeddingMixer(
                 hidden_size=hidden_size,
                 temperature=1.0,
                 mix_ratio=0.1,
-            ).to(device=device, dtype=model_dtype)
+            ).to(device=self.device, dtype=model_dtype)
 
         self.model.eval()
         self.cross_batch_module.eval()
@@ -103,11 +125,11 @@ class CrossBatchGenerator:
             Dictionary containing generated sequences and metadata
         """
         batch_size = input_ids.size(0)
-        input_ids = input_ids.to(self.device)
+        input_ids = input_ids.to(self.input_device)
 
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
-        attention_mask = attention_mask.to(self.device)
+        attention_mask = attention_mask.to(self.input_device)
 
         if pad_token_id is None:
             pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
@@ -130,8 +152,8 @@ class CrossBatchGenerator:
                 stop_token_ids.add(stop_id)
         stop_token_ids.discard(None)
 
-        # Track which sequences have finished
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        # Track which sequences have finished (on input_device to match attention_mask operations)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.input_device)
 
         # Store cross-batch mixing weights for analysis
         cross_batch_weights_history = []
@@ -166,8 +188,10 @@ class CrossBatchGenerator:
             last_hidden = hidden_states[:, -1, :]  # [batch_size, hidden_size]
 
             # Apply cross-batch interaction
+            # Note: last_hidden is on the device of the last transformer layer (self.device for distributed models)
             if enable_cross_batch and batch_size > 1:
-                valid_mask = ~finished
+                # Move valid_mask to the same device as last_hidden
+                valid_mask = (~finished).to(last_hidden.device)
                 mixed_hidden = self.cross_batch_module(
                     last_hidden,
                     attention_mask=valid_mask,
@@ -203,6 +227,9 @@ class CrossBatchGenerator:
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
             else:
                 next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+            # Move next_tokens to input_device for operations with finished and generated_ids
+            next_tokens = next_tokens.to(self.input_device)
 
             # Replace tokens for finished sequences with pad
             next_tokens = next_tokens.masked_fill(finished, pad_token_id)

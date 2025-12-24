@@ -30,6 +30,7 @@ def run_cross_batch_strategy(
     mix_layer: int = -1,
     checkpoint_path: Optional[str] = None,
     enable_cross_batch: bool = True,
+    cross_batch_module: Optional["torch.nn.Module"] = None,
 ) -> StrategyResult:
     """
     Run cross-batch generation strategy.
@@ -51,6 +52,7 @@ def run_cross_batch_strategy(
         mix_layer: Which layer's hidden state to mix (-1 for last)
         checkpoint_path: Path to trained cross-batch module checkpoint
         enable_cross_batch: Whether to enable cross-batch interaction
+        cross_batch_module: Pre-initialized cross-batch module (optional, overrides checkpoint)
 
     Returns:
         StrategyResult with answers and metrics
@@ -65,21 +67,31 @@ def run_cross_batch_strategy(
 
     # Initialize cross-batch generator if not provided
     if cross_batch_generator is None:
-        device = str(model.device)
+        # Get device - handle distributed models
+        if hasattr(model, 'hf_device_map') and model.hf_device_map:
+            # Distributed model - use lm_head device
+            if hasattr(model, 'lm_head'):
+                device = str(next(model.lm_head.parameters()).device)
+            else:
+                device = "cuda"
+        else:
+            device = str(model.device)
         hidden_size = model.config.hidden_size
 
-        # Create cross-batch module
-        if mix_method == "attention":
-            cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
-        else:
-            cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
+        # Use provided cross_batch_module or create new one
+        if cross_batch_module is None:
+            # Create cross-batch module
+            if mix_method == "attention":
+                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
+            else:
+                cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
 
-        # Load checkpoint if provided
-        if checkpoint_path:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
-            if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
-                model.lm_head.load_state_dict(checkpoint["lm_head"])
+            # Load checkpoint if provided
+            if checkpoint_path:
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
+                if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
+                    model.lm_head.load_state_dict(checkpoint["lm_head"])
 
         cross_batch_generator = CrossBatchGenerator(
             model=model,
@@ -199,6 +211,7 @@ def run_cross_batch_multi_strategy(
     mix_layer: int = -1,
     checkpoint_path: Optional[str] = None,
     enable_cross_batch: bool = True,
+    cross_batch_module: Optional["torch.nn.Module"] = None,
 ) -> StrategyResult:
     """
     Run cross-batch generation strategy for multi-context items.
@@ -218,6 +231,7 @@ def run_cross_batch_multi_strategy(
         mix_layer: Which layer's hidden state to mix (-1 for last)
         checkpoint_path: Path to trained cross-batch module checkpoint
         enable_cross_batch: Whether to enable cross-batch interaction
+        cross_batch_module: Pre-initialized cross-batch module (optional, overrides checkpoint)
 
     Returns:
         StrategyResult with answers and metrics
@@ -242,21 +256,31 @@ def run_cross_batch_multi_strategy(
 
     # Initialize cross-batch generator if not provided
     if cross_batch_generator is None:
-        device = str(model.device)
+        # Get device - handle distributed models
+        if hasattr(model, 'hf_device_map') and model.hf_device_map:
+            # Distributed model - use lm_head device
+            if hasattr(model, 'lm_head'):
+                device = str(next(model.lm_head.parameters()).device)
+            else:
+                device = "cuda"
+        else:
+            device = str(model.device)
         hidden_size = model.config.hidden_size
 
-        # Create cross-batch module
-        if mix_method == "attention":
-            cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
-        else:
-            cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
+        # Use provided cross_batch_module or create new one
+        if cross_batch_module is None:
+            # Create cross-batch module
+            if mix_method == "attention":
+                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
+            else:
+                cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
 
-        # Load checkpoint if provided
-        if checkpoint_path:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
-            if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
-                model.lm_head.load_state_dict(checkpoint["lm_head"])
+            # Load checkpoint if provided
+            if checkpoint_path:
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
+                if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
+                    model.lm_head.load_state_dict(checkpoint["lm_head"])
 
         cross_batch_generator = CrossBatchGenerator(
             model=model,
