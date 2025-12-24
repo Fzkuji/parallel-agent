@@ -91,8 +91,8 @@ def auto_find_checkpoints(args) -> dict:
     modes = {
         'baseline': 'baseline',
         'crossbatch': 'crossbatch',
-        'lora': 'lora_only',
         'lora_lmhead': 'lora_lmhead',
+        'lora_crossbatch': 'lora_crossbatch',
     }
 
     for key, mode in modes.items():
@@ -305,6 +305,100 @@ def run_vllm_sequential_strategy(
     )
 
 
+def run_vllm_all_in_one_strategy(
+    items: List[Dict],
+    vllm_model,
+    tokenizer: "AutoTokenizer",
+    *,
+    max_new_tokens: int,
+    strategy_name: str = "all_in_one_vllm",
+    dataset: str = None,
+) -> "StrategyResult":
+    """Run all-in-one strategy using vLLM (all questions in one prompt)."""
+    from vllm import SamplingParams
+    from src.prompts import build_all_in_one_prompt
+    from src.inference import build_chat_prompt, extract_answer
+    from src.evaluation import evaluate_predictions
+    from src.models import Question, StrategyResult
+
+    question_lookup = {
+        item["qid"]: Question(
+            qid=item["qid"],
+            text=item["question"],
+            priority=1.0,
+            answer_tokens=item.get("answer_tokens", 12),
+            type_hint=None,
+            references=item.get("references", []),
+        )
+        for item in items
+    }
+
+    # Get context (all items should have same context for all_in_one)
+    context = items[0]["context"] if items else ""
+    questions = list(question_lookup.values())
+
+    # Build all-in-one prompt
+    system_prompt, user_prompt = build_all_in_one_prompt(context, questions, dataset)
+    chat_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens * len(items),  # More tokens for multiple answers
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    start = time.perf_counter()
+    outputs = vllm_model.generate([chat_prompt], sampling_params)
+    total_latency = time.perf_counter() - start
+
+    output = outputs[0]
+    raw_text = output.outputs[0].text.strip()
+    prompt_tokens = len(output.prompt_token_ids)
+    gen_tokens = len(output.outputs[0].token_ids)
+
+    # Parse multi-answer response
+    answer_records = {}
+    answers_text = {}
+    per_question = []
+
+    # Try to extract individual answers from the combined response
+    lines = raw_text.split('\n')
+    for q in questions:
+        # Look for answer pattern like "Q1: answer" or "1. answer"
+        found = False
+        for line in lines:
+            if q.qid in line or f"Q{q.qid.replace('Q', '')}" in line:
+                final_answer, strict_valid = extract_answer(line, dataset)
+                answer_records[q.qid] = (final_answer, strict_valid)
+                answers_text[q.qid] = final_answer
+                found = True
+                break
+        if not found:
+            # Fallback: use empty answer
+            answer_records[q.qid] = ("", False)
+            answers_text[q.qid] = ""
+
+        per_question.append({
+            "question_id": q.qid,
+            "question": q.text,
+            "gold_answers": q.references,
+            "final_answer": answers_text.get(q.qid, ""),
+            "latency": total_latency / len(items),
+        })
+
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+    return StrategyResult(
+        name=strategy_name,
+        answers=answers_text,
+        prompt_tokens=prompt_tokens,
+        generated_tokens=gen_tokens,
+        latency=total_latency,
+        batches=1,
+        metrics=metrics,
+        details={"questions": per_question, "raw_response": raw_text},
+    )
+
+
 def run_vllm_strategies(
     items: List[Dict],
     vllm_model,
@@ -320,6 +414,16 @@ def run_vllm_strategies(
     """Run vLLM-compatible strategies."""
     results = []
     effective_dataset = eval_dataset or args.dataset
+
+    if "all_in_one" in selected_strategies:
+        results.append(run_vllm_all_in_one_strategy(
+            items,
+            vllm_model,
+            tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            strategy_name="all_in_one_vllm",
+            dataset=effective_dataset,
+        ))
 
     if "sequential" in selected_strategies:
         results.append(run_vllm_sequential_strategy(
@@ -506,16 +610,16 @@ def parse_args() -> argparse.Namespace:
     )
     # LoRA checkpoint arguments (explicit paths override auto-discovery)
     parser.add_argument(
-        "--lora-checkpoint",
-        type=str,
-        default=None,
-        help="Path to LoRA-only checkpoint for lora strategy (overrides auto-discovery).",
-    )
-    parser.add_argument(
         "--lora-lmhead-checkpoint",
         type=str,
         default=None,
         help="Path to LoRA+lm_head checkpoint for lora_lmhead strategy (overrides auto-discovery).",
+    )
+    parser.add_argument(
+        "--lora-crossbatch-checkpoint",
+        type=str,
+        default=None,
+        help="Path to LoRA+lm_head+cross-batch checkpoint for lora_crossbatch strategy (overrides auto-discovery).",
     )
     # vLLM inference
     parser.add_argument(
@@ -578,10 +682,10 @@ def resolve_dependency_generators(
     return dep_generator, bert_dep_generator, bert_conf_threshold
 
 
-ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "finetuned", "collab_llm", "collab_bert", "collab_hidden", "lora", "lora_lmhead"]
+ALL_STRATEGIES = ["all_in_one", "sequential", "batch", "finetuned", "collab_llm", "collab_bert", "collab_hidden", "lora_lmhead", "lora_crossbatch"]
 
 # Strategies that can be run with vLLM (no finetuning required)
-VLLM_STRATEGIES = ["sequential", "batch", "collab_llm", "collab_bert"]
+VLLM_STRATEGIES = ["all_in_one", "sequential", "batch", "collab_llm", "collab_bert"]
 
 
 def run_all_strategies(
@@ -719,39 +823,6 @@ def run_all_strategies(
                 checkpoint_path=args.collab_hidden_checkpoint,
                 enable_cross_batch=True,
             ))
-        if "lora" in selected_strategies:
-            import torch
-            if args.lora_checkpoint and hasattr(model, 'lm_head'):
-                try:
-                    from peft import LoraConfig, get_peft_model, TaskType
-                    checkpoint = torch.load(args.lora_checkpoint, map_location=model.device)
-                    lora_config = LoraConfig(
-                        task_type=TaskType.CAUSAL_LM,
-                        r=16,
-                        lora_alpha=32,
-                        lora_dropout=0.05,
-                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                        bias="none",
-                    )
-                    lora_model = get_peft_model(model, lora_config)
-                    if 'lora' in checkpoint:
-                        current_state = lora_model.state_dict()
-                        current_state.update(checkpoint['lora'])
-                        lora_model.load_state_dict(current_state)
-                    results.append(run_batch_multi_strategy(
-                        items,
-                        tokenizer,
-                        lora_model,
-                        max_new_tokens=args.max_new_tokens,
-                        strategy_name="lora",
-                        dataset=effective_dataset,
-                        api_client=api_client,
-                    ))
-                    del lora_model
-                except Exception as e:
-                    logging.warning(f"Skipping lora strategy: {e}")
-            else:
-                logging.warning("Skipping lora strategy: --lora-checkpoint not provided or model has no lm_head")
         if "lora_lmhead" in selected_strategies:
             import torch
             if args.lora_lmhead_checkpoint and hasattr(model, 'lm_head'):
@@ -789,6 +860,53 @@ def run_all_strategies(
                     logging.warning(f"Skipping lora_lmhead strategy: {e}")
             else:
                 logging.warning("Skipping lora_lmhead strategy: --lora-lmhead-checkpoint not provided or model has no lm_head")
+        if "lora_crossbatch" in selected_strategies:
+            import torch
+            if args.lora_crossbatch_checkpoint and hasattr(model, 'lm_head'):
+                try:
+                    from peft import LoraConfig, get_peft_model, TaskType
+                    from src.cross_batch.attention import CrossBatchAttention
+                    checkpoint = torch.load(args.lora_crossbatch_checkpoint, map_location=model.device)
+                    original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
+                    if 'lm_head' in checkpoint:
+                        model.lm_head.load_state_dict(checkpoint['lm_head'])
+                    lora_config = LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        r=16,
+                        lora_alpha=32,
+                        lora_dropout=0.05,
+                        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                        bias="none",
+                    )
+                    lora_model = get_peft_model(model, lora_config)
+                    if 'lora' in checkpoint:
+                        current_state = lora_model.state_dict()
+                        current_state.update(checkpoint['lora'])
+                        lora_model.load_state_dict(current_state)
+                    # Load cross-batch module
+                    cross_batch_module = CrossBatchAttention(hidden_size=model.config.hidden_size)
+                    if 'cross_batch_module' in checkpoint:
+                        cross_batch_module.load_state_dict(checkpoint['cross_batch_module'])
+                    cross_batch_module = cross_batch_module.to(model.device)
+                    results.append(run_cross_batch_multi_strategy(
+                        items,
+                        tokenizer,
+                        lora_model.base_model,
+                        max_new_tokens=args.max_new_tokens,
+                        strategy_name="lora_crossbatch",
+                        dataset=effective_dataset,
+                        mix_method="attention",
+                        mix_layer=-1,
+                        checkpoint_path=None,  # Already loaded
+                        enable_cross_batch=True,
+                        cross_batch_module=cross_batch_module,
+                    ))
+                    del lora_model, cross_batch_module
+                    model.lm_head.load_state_dict(original_lm_head_state)
+                except Exception as e:
+                    logging.warning(f"Skipping lora_crossbatch strategy: {e}")
+            else:
+                logging.warning("Skipping lora_crossbatch strategy: --lora-crossbatch-checkpoint not provided or model has no lm_head")
         return results
 
     if "all_in_one" in selected_strategies:
@@ -888,45 +1006,6 @@ def run_all_strategies(
             checkpoint_path=args.collab_hidden_checkpoint,
             enable_cross_batch=True,
         ))
-    if "lora" in selected_strategies:
-        # Load LoRA checkpoint and run batch strategy
-        import torch
-        if args.lora_checkpoint and hasattr(model, 'lm_head'):
-            try:
-                from peft import LoraConfig, get_peft_model, TaskType
-                # Load checkpoint
-                checkpoint = torch.load(args.lora_checkpoint, map_location=model.device)
-                # Apply LoRA configuration
-                lora_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=16,
-                    lora_alpha=32,
-                    lora_dropout=0.05,
-                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                    bias="none",
-                )
-                lora_model = get_peft_model(model, lora_config)
-                # Load LoRA weights
-                if 'lora' in checkpoint:
-                    current_state = lora_model.state_dict()
-                    current_state.update(checkpoint['lora'])
-                    lora_model.load_state_dict(current_state)
-                results.append(run_full_batch_strategy(
-                    background,
-                    questions,
-                    tokenizer,
-                    lora_model,
-                    max_new_tokens=args.max_new_tokens,
-                    dataset=effective_dataset,
-                    api_client=api_client,
-                    strategy_name="lora",
-                ))
-                # Clean up LoRA model (restore original model state)
-                del lora_model
-            except Exception as e:
-                logging.warning(f"Skipping lora strategy: {e}")
-        else:
-            logging.warning("Skipping lora strategy: --lora-checkpoint not provided or model has no lm_head")
     if "lora_lmhead" in selected_strategies:
         # Load LoRA + lm_head checkpoint and run batch strategy
         import torch
@@ -971,6 +1050,55 @@ def run_all_strategies(
                 logging.warning(f"Skipping lora_lmhead strategy: {e}")
         else:
             logging.warning("Skipping lora_lmhead strategy: --lora-lmhead-checkpoint not provided or model has no lm_head")
+    if "lora_crossbatch" in selected_strategies:
+        # Load LoRA + lm_head + cross-batch checkpoint
+        import torch
+        if args.lora_crossbatch_checkpoint and hasattr(model, 'lm_head'):
+            try:
+                from peft import LoraConfig, get_peft_model, TaskType
+                from src.cross_batch.attention import CrossBatchAttention
+                checkpoint = torch.load(args.lora_crossbatch_checkpoint, map_location=model.device)
+                original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
+                if 'lm_head' in checkpoint:
+                    model.lm_head.load_state_dict(checkpoint['lm_head'])
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=16,
+                    lora_alpha=32,
+                    lora_dropout=0.05,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                    bias="none",
+                )
+                lora_model = get_peft_model(model, lora_config)
+                if 'lora' in checkpoint:
+                    current_state = lora_model.state_dict()
+                    current_state.update(checkpoint['lora'])
+                    lora_model.load_state_dict(current_state)
+                # Load cross-batch module
+                cross_batch_module = CrossBatchAttention(hidden_size=model.config.hidden_size)
+                if 'cross_batch_module' in checkpoint:
+                    cross_batch_module.load_state_dict(checkpoint['cross_batch_module'])
+                cross_batch_module = cross_batch_module.to(model.device)
+                results.append(run_cross_batch_strategy(
+                    background,
+                    questions,
+                    tokenizer,
+                    lora_model.base_model,
+                    max_new_tokens=args.max_new_tokens,
+                    strategy_name="lora_crossbatch",
+                    dataset=effective_dataset,
+                    mix_method="attention",
+                    mix_layer=-1,
+                    checkpoint_path=None,
+                    enable_cross_batch=True,
+                    cross_batch_module=cross_batch_module,
+                ))
+                del lora_model, cross_batch_module
+                model.lm_head.load_state_dict(original_lm_head_state)
+            except Exception as e:
+                logging.warning(f"Skipping lora_crossbatch strategy: {e}")
+        else:
+            logging.warning("Skipping lora_crossbatch strategy: --lora-crossbatch-checkpoint not provided or model has no lm_head")
     return results
 
 
@@ -995,9 +1123,10 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
         "collab_llm",
         "collab_bert",
         "collab_hidden",
-        "lora",
         "lora_lmhead",
+        "lora_crossbatch",
         # vLLM strategies
+        "all_in_one_vllm",
         "sequential_vllm",
         "batch_vllm",
         "collab_llm_vllm",
@@ -1568,25 +1697,25 @@ def main() -> None:
             args.baseline_checkpoint = discovered['baseline']
         if not args.collab_hidden_checkpoint and discovered.get('crossbatch'):
             args.collab_hidden_checkpoint = discovered['crossbatch']
-        if not args.lora_checkpoint and discovered.get('lora'):
-            args.lora_checkpoint = discovered['lora']
         if not args.lora_lmhead_checkpoint and discovered.get('lora_lmhead'):
             args.lora_lmhead_checkpoint = discovered['lora_lmhead']
+        if not args.lora_crossbatch_checkpoint and discovered.get('lora_crossbatch'):
+            args.lora_crossbatch_checkpoint = discovered['lora_crossbatch']
 
     # Skip collab_hidden if no checkpoint provided
     if "collab_hidden" in selected_strategies and not args.collab_hidden_checkpoint:
         logging.warning("Skipping collab_hidden strategy: --collab-hidden-checkpoint not provided")
         selected_strategies.remove("collab_hidden")
 
-    # Skip lora if no checkpoint provided
-    if "lora" in selected_strategies and not args.lora_checkpoint:
-        logging.warning("Skipping lora strategy: --lora-checkpoint not provided")
-        selected_strategies.remove("lora")
-
     # Skip lora_lmhead if no checkpoint provided
     if "lora_lmhead" in selected_strategies and not args.lora_lmhead_checkpoint:
         logging.warning("Skipping lora_lmhead strategy: --lora-lmhead-checkpoint not provided")
         selected_strategies.remove("lora_lmhead")
+
+    # Skip lora_crossbatch if no checkpoint provided
+    if "lora_crossbatch" in selected_strategies and not args.lora_crossbatch_checkpoint:
+        logging.warning("Skipping lora_crossbatch strategy: --lora-crossbatch-checkpoint not provided")
+        selected_strategies.remove("lora_crossbatch")
 
     logging.info("Running strategies: %s", selected_strategies)
 

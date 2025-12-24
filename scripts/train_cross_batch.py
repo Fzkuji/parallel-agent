@@ -771,20 +771,9 @@ def main():
             json.dump(inference_details, f, indent=2, ensure_ascii=False)
         print(f'\n详细推理结果已保存到: {details_file}')
 
-        # 打印总结 - 表1: 训练 Loss
+        # 打印总结
         print('\n' + '=' * 60)
-        print('表1: 训练 Loss')
-        print('=' * 60)
-        print(f'| 方法 | Final Loss |')
-        print(f'|------|------------|')
-        print(f'| Baseline (lm_head) | {history_baseline["train_loss"][-1]:.4f} |')
-        print(f'| lm_head + Cross-Batch | {history_crossbatch["train_loss"][-1]:.4f} |')
-        print(f'| LoRA + lm_head | {history_lora_lmhead["train_loss"][-1]:.4f} |')
-        print(f'| LoRA + lm_head + Cross-Batch | {history_lora_crossbatch["train_loss"][-1]:.4f} |')
-
-        # 打印总结 - 表2: 评估指标
-        print('\n' + '=' * 60)
-        print('表2: 评估指标 (EM / F1)')
+        print('五方对比总结')
         print('=' * 60)
         print(f'| 方法 | EM | F1 |')
         print(f'|------|-----|-----|')
