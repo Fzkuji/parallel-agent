@@ -498,7 +498,7 @@ def run_batch_multi_strategy(
                 "raw_response": raw_texts[idx],
                 "final_answer": final_answer,
                 "strict_valid": strict_valid,
-                "latency": elapsed,
+                "latency": total_latency / len(items),  # Average latency per question
                 "prompt_tokens": int(input_lengths[idx]),
                 "generated_tokens": generated_token_counts[idx],
             }
