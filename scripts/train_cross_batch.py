@@ -190,6 +190,14 @@ def print_rank0(msg, rank):
         print(msg)
 
 
+def format_metrics(metrics: dict, dataset: str) -> str:
+    """根据数据集类型格式化指标字符串"""
+    if dataset in ("cmb_exam_context", "cmb_exam_subdomain", "cmb_exam_random"):
+        return f'Acc: {metrics.get("acc", 0.0):.2f}'
+    else:
+        return f'EM: {metrics.get("exact_match", 0.0):.2f}, F1: {metrics.get("f1", 0.0):.2f}'
+
+
 def load_eval_data(args):
     """根据数据集参数加载评估数据，返回统一格式的 groups"""
     dataset = args.dataset
@@ -577,7 +585,7 @@ def main():
         rank=rank, world_size=world_size
     )
     all_results['original'] = metrics_original
-    print_rank0(f'原始模型 - EM: {metrics_original["exact_match"]:.2f}, F1: {metrics_original["f1"]:.2f}', rank)
+    print_rank0(f'原始模型 - {format_metrics(metrics_original, args.dataset)}', rank)
 
     del model_original, cross_batch_original
     gc.collect()
@@ -644,7 +652,7 @@ def main():
         rank=rank, world_size=world_size
     )
     all_results['baseline'] = metrics_baseline
-    print_rank0(f'Baseline - EM: {metrics_baseline["exact_match"]:.2f}, F1: {metrics_baseline["f1"]:.2f}', rank)
+    print_rank0(f'Baseline - {format_metrics(metrics_baseline, args.dataset)}', rank)
     del cross_batch_baseline
 
     del model_baseline
@@ -717,7 +725,7 @@ def main():
         rank=rank, world_size=world_size
     )
     all_results['crossbatch'] = metrics_crossbatch
-    print_rank0(f'Cross-Batch - EM: {metrics_crossbatch["exact_match"]:.2f}, F1: {metrics_crossbatch["f1"]:.2f}', rank)
+    print_rank0(f'Cross-Batch - {format_metrics(metrics_crossbatch, args.dataset)}', rank)
 
     del model_crossbatch, cross_batch_module
     gc.collect()
@@ -800,7 +808,7 @@ def main():
         rank=rank, world_size=world_size
     )
     all_results['lora_lmhead'] = metrics_lora_lmhead
-    print_rank0(f'LoRA + lm_head - EM: {metrics_lora_lmhead["exact_match"]:.2f}, F1: {metrics_lora_lmhead["f1"]:.2f}', rank)
+    print_rank0(f'LoRA + lm_head - {format_metrics(metrics_lora_lmhead, args.dataset)}', rank)
 
     del model_lora_lmhead, cross_batch_lora_lmhead
     gc.collect()
@@ -886,7 +894,7 @@ def main():
         rank=rank, world_size=world_size
     )
     all_results['lora_crossbatch'] = metrics_lora_crossbatch
-    print_rank0(f'LoRA + lm_head + cross-batch - EM: {metrics_lora_crossbatch["exact_match"]:.2f}, F1: {metrics_lora_crossbatch["f1"]:.2f}', rank)
+    print_rank0(f'LoRA + lm_head + cross-batch - {format_metrics(metrics_lora_crossbatch, args.dataset)}', rank)
 
     del model_lora_crossbatch, cross_batch_lora_cb
     gc.collect()
