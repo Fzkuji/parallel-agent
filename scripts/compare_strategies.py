@@ -1650,24 +1650,31 @@ def main() -> None:
             seed=args.seed,
         )
     elif args.dataset == "cmb_exam_context":
+        # CMB-Exam 默认使用 test split
+        split = "test" if args.split == "train" else args.split
+        split = "val" if split == "validation" else split
         contexts = load_cmb_exam_context_groups(
-            args.split if args.split != "validation" else "val",
+            split,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
             max_contexts=args.context_count,
             seed=args.seed,
         )
     elif args.dataset == "cmb_exam_subdomain":
+        split = "test" if args.split == "train" else args.split
+        split = "val" if split == "validation" else split
         contexts = load_cmb_exam_subdomain_groups(
-            args.split if args.split != "validation" else "val",
+            split,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
             max_contexts=args.context_count,
             seed=args.seed,
         )
     elif args.dataset == "cmb_exam_random":
+        split = "test" if args.split == "train" else args.split
+        split = "val" if split == "validation" else split
         contexts = load_cmb_exam_random_groups(
-            args.split if args.split != "validation" else "val",
+            split,
             questions_per_group=args.max_questions or 5,
             max_contexts=args.context_count,
             seed=args.seed,
