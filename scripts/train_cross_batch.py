@@ -462,8 +462,11 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
         device=device,
     )
 
+    # 检测是否是 CMB-Exam 数据集 (使用 acc 指标)
+    is_cmb_exam = args.dataset in ("cmb_exam_context", "cmb_exam_subdomain", "cmb_exam_random")
+
     # 按 context 评估，每个 context 的问题作为一个 batch
-    local_strict_acc_sum = 0.0
+    local_acc_sum = 0.0  # 用于 CMB-Exam 的 acc 或其他数据集的 strict_acc
     local_f1_sum = 0.0
     local_count = 0
     all_details = []  # 保存详细推理结果
@@ -490,8 +493,12 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
             cross_batch_generator=generator,
             enable_cross_batch=enable_cross_batch,
         )
-        local_strict_acc_sum += result.metrics.get("strict_acc", 0.0) * len(batch_items)
-        local_f1_sum += result.metrics.get("f1", 0.0) * len(batch_items)
+        # 根据数据集类型选择正确的指标
+        if is_cmb_exam:
+            local_acc_sum += result.metrics.get("acc", 0.0) * len(batch_items)
+        else:
+            local_acc_sum += result.metrics.get("strict_acc", 0.0) * len(batch_items)
+            local_f1_sum += result.metrics.get("f1", 0.0) * len(batch_items)
         local_count += len(batch_items)
         # 保存详细结果
         if result.details and "questions" in result.details:
@@ -499,22 +506,29 @@ def evaluate_with_strategy(model, tokenizer, cross_batch_module, device, args,
 
     # 汇总所有 rank 的结果
     if world_size > 1:
-        local_tensor = torch.tensor([local_strict_acc_sum, local_f1_sum, local_count],
+        local_tensor = torch.tensor([local_acc_sum, local_f1_sum, local_count],
                                      dtype=torch.float64, device=device)
         dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
-        total_strict_acc = local_tensor[0].item()
+        total_acc = local_tensor[0].item()
         total_f1 = local_tensor[1].item()
         total_count = local_tensor[2].item()
     else:
-        total_strict_acc = local_strict_acc_sum
+        total_acc = local_acc_sum
         total_f1 = local_f1_sum
         total_count = local_count
 
-    return {
-        "exact_match": total_strict_acc / total_count * 100 if total_count > 0 else 0.0,
-        "f1": total_f1 / total_count * 100 if total_count > 0 else 0.0,
-        "details": all_details,  # 包含每个问题的详细推理结果
-    }
+    # 返回结果 - 根据数据集类型使用不同的键
+    if is_cmb_exam:
+        return {
+            "acc": total_acc / total_count * 100 if total_count > 0 else 0.0,
+            "details": all_details,
+        }
+    else:
+        return {
+            "exact_match": total_acc / total_count * 100 if total_count > 0 else 0.0,
+            "f1": total_f1 / total_count * 100 if total_count > 0 else 0.0,
+            "details": all_details,
+        }
 
 
 def main():
