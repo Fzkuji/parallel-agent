@@ -76,7 +76,7 @@ def get_dataset_metrics(dataset: str) -> Dict[str, MetricFunc]:
     """Get the metric functions for a specific dataset.
 
     Args:
-        dataset: Dataset name (squad, hotpot, cmb)
+        dataset: Dataset name (squad, hotpot, cmb, cmb_clin, cmb_exam_context, etc.)
 
     Returns:
         Dict mapping metric names to their functions
@@ -84,6 +84,12 @@ def get_dataset_metrics(dataset: str) -> Dict[str, MetricFunc]:
     Raises:
         ValueError: If dataset is not recognized
     """
+    # Map CMB variants to their base metric configs
+    if dataset == "cmb_clin":
+        dataset = "cmb"  # CMB-Clin uses BLEU/ROUGE metrics
+    elif dataset in ("cmb_exam_context", "cmb_exam_subdomain", "cmb_exam_random"):
+        dataset = "cmb_exam"  # CMB-Exam variants use accuracy
+
     if dataset not in DATASET_METRICS:
         available = list(DATASET_METRICS.keys())
         raise ValueError(f"Unknown dataset: {dataset}. Available: {available}")
