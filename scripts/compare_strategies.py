@@ -463,6 +463,9 @@ def get_eval_dataset(args: argparse.Namespace) -> str:
         if args.cmb_subset in ("random", "subdomain", "context"):
             return "cmb_exam"
         return "cmb"  # CMB-Clin uses BLEU/ROUGE
+    # Direct cmb_exam_* datasets
+    if args.dataset in ("cmb_exam_context", "cmb_exam_subdomain", "cmb_exam_random"):
+        return "cmb_exam"
     return args.dataset
 
 
@@ -471,7 +474,7 @@ def parse_args() -> argparse.Namespace:
         description="Compare sequential, batch, and dependency-aware QA strategies with optional BERT dependencies.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dataset", choices=["squad", "hotpot", "quac", "cmb", "quality", "drop"], default="squad", help="Dataset to evaluate.")
+    parser.add_argument("--dataset", choices=["squad", "hotpot", "quac", "cmb", "quality", "drop", "cmb_exam_context", "cmb_exam_subdomain", "cmb_exam_random"], default="squad", help="Dataset to evaluate.")
     parser.add_argument("--model-name", default="Qwen/Qwen3-4B", help="Hugging Face model identifier or local path.")
     parser.add_argument("--split", default="train", help="Dataset split to sample.")
     parser.add_argument("--context-count", type=int, default=3, help="Number of contexts to process.")
@@ -1643,6 +1646,29 @@ def main() -> None:
             args.split,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
+    elif args.dataset == "cmb_exam_context":
+        contexts = load_cmb_exam_context_groups(
+            args.split if args.split != "validation" else "val",
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
+    elif args.dataset == "cmb_exam_subdomain":
+        contexts = load_cmb_exam_subdomain_groups(
+            args.split if args.split != "validation" else "val",
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.context_count,
+            seed=args.seed,
+        )
+    elif args.dataset == "cmb_exam_random":
+        contexts = load_cmb_exam_random_groups(
+            args.split if args.split != "validation" else "val",
+            questions_per_group=args.max_questions or 5,
             max_contexts=args.context_count,
             seed=args.seed,
         )
