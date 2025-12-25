@@ -4,7 +4,9 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
 
 参数:
   --model           模型名称 (default: Qwen/Qwen2.5-0.5B-Instruct)
-  --dataset         数据集 (default: squad, 可选: squad, hotpot, quac, drop)
+  --dataset         数据集 (default: squad)
+                    可选: squad, hotpot, quac, drop,
+                          cmb_clin, cmb_exam_context, cmb_exam_subdomain, cmb_exam_random
   --max-samples     训练样本数 (default: None, 使用全部训练集)
   --eval-samples    评估样本数/context数 (default: None, 使用全部验证集)
   --min-questions   每个 context 最少问题数 (default: 3)
@@ -14,6 +16,12 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
   --lr              学习率 (default: 1e-4)
   --save-dir        保存 checkpoint 的目录 (default: outputs/checkpoints)
   --force           强制重新训练，即使 checkpoint 已存在
+
+CMB 数据集说明:
+  - cmb_clin: CMB-Clin 临床病例 (仅有 test split，74 条，不推荐用于训练)
+  - cmb_exam_context: CMB-Exam 按共享背景分组 (推荐，来自 fzkuji/CMB-Exam-Grouped)
+  - cmb_exam_subdomain: CMB-Exam 按医学术语分组
+  - cmb_exam_random: CMB-Exam 随机分组 (baseline)
 
 训练用法:
   # 使用全部数据训练 (默认)
@@ -73,6 +81,10 @@ from src import (
     load_hotpot_groups,
     load_quac_groups,
     load_drop_groups,
+    load_cmb_groups,
+    load_cmb_exam_random_groups,
+    load_cmb_exam_subdomain_groups,
+    load_cmb_exam_context_groups,
 )
 
 
@@ -118,7 +130,8 @@ def parse_args():
 
     # 数据集参数
     parser.add_argument('--dataset', type=str, default='squad',
-                        choices=['squad', 'hotpot', 'quac', 'drop'],
+                        choices=['squad', 'hotpot', 'quac', 'drop',
+                                 'cmb_clin', 'cmb_exam_context', 'cmb_exam_subdomain', 'cmb_exam_random'],
                         help='数据集 (default: squad)')
     parser.add_argument('--split', type=str, default='validation',
                         help='评估用的数据集 split (default: validation)')
@@ -228,6 +241,79 @@ def load_eval_data(args):
             max_contexts=max_contexts,
             seed=seed,
         )
+    elif dataset == "cmb_clin":
+        # CMB-Clin only has "test" split
+        groups = load_cmb_groups(
+            split="test",
+            subset="CMB-Clin",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "cmb_exam_context":
+        # CMB-Exam with shared context grouping (single context format like SQuAD)
+        groups = load_cmb_exam_context_groups(
+            split=split if split != "validation" else "val",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "cmb_exam_subdomain":
+        # CMB-Exam with subdomain grouping (multi-context format)
+        # Convert to single-context format for evaluation
+        raw_groups = load_cmb_exam_subdomain_groups(
+            split=split if split != "validation" else "val",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+        # Convert multi-context format to single-context format
+        groups = []
+        for g in raw_groups:
+            questions = []
+            for item in g["items"]:
+                questions.append({
+                    "qid": item["qid"],
+                    "text": item["question"],
+                    "answer_tokens": item.get("answer_tokens", 4),
+                    "references": item.get("references", []),
+                })
+            # Use first item's context as shared context
+            context = g["items"][0]["context"] if g["items"] else ""
+            groups.append({
+                "context": context,
+                "title": g["title"],
+                "questions": questions,
+            })
+    elif dataset == "cmb_exam_random":
+        # CMB-Exam with random grouping (multi-context format)
+        raw_groups = load_cmb_exam_random_groups(
+            split=split if split != "validation" else "val",
+            questions_per_group=max_questions or 5,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+        # Convert multi-context format to single-context format
+        groups = []
+        for g in raw_groups:
+            questions = []
+            for item in g["items"]:
+                questions.append({
+                    "qid": item["qid"],
+                    "text": item["question"],
+                    "answer_tokens": item.get("answer_tokens", 4),
+                    "references": item.get("references", []),
+                })
+            # Use first item's context as shared context
+            context = g["items"][0]["context"] if g["items"] else ""
+            groups.append({
+                "context": context,
+                "title": g["title"],
+                "questions": questions,
+            })
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
@@ -275,6 +361,77 @@ def load_train_data(args):
             max_contexts=max_contexts,
             seed=seed,
         )
+    elif dataset == "cmb_clin":
+        # CMB-Clin only has "test" split with 74 rows - not ideal for training
+        # but can be used for fine-tuning experiments
+        groups = load_cmb_groups(
+            split="test",
+            subset="CMB-Clin",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "cmb_exam_context":
+        # CMB-Exam with shared context grouping (from fzkuji/CMB-Exam-Grouped)
+        groups = load_cmb_exam_context_groups(
+            split="train",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+    elif dataset == "cmb_exam_subdomain":
+        # CMB-Exam with subdomain grouping
+        raw_groups = load_cmb_exam_subdomain_groups(
+            split="train",
+            min_questions=min_questions,
+            max_questions=max_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+        # Convert multi-context format to single-context format
+        groups = []
+        for g in raw_groups:
+            questions = []
+            for item in g["items"]:
+                questions.append({
+                    "qid": item["qid"],
+                    "text": item["question"],
+                    "answer_tokens": item.get("answer_tokens", 4),
+                    "references": item.get("references", []),
+                })
+            context = g["items"][0]["context"] if g["items"] else ""
+            groups.append({
+                "context": context,
+                "title": g["title"],
+                "questions": questions,
+            })
+    elif dataset == "cmb_exam_random":
+        # CMB-Exam with random grouping
+        raw_groups = load_cmb_exam_random_groups(
+            split="train",
+            questions_per_group=max_questions or 5,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
+        # Convert multi-context format to single-context format
+        groups = []
+        for g in raw_groups:
+            questions = []
+            for item in g["items"]:
+                questions.append({
+                    "qid": item["qid"],
+                    "text": item["question"],
+                    "answer_tokens": item.get("answer_tokens", 4),
+                    "references": item.get("references", []),
+                })
+            context = g["items"][0]["context"] if g["items"] else ""
+            groups.append({
+                "context": context,
+                "title": g["title"],
+                "questions": questions,
+            })
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 

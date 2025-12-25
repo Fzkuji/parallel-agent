@@ -118,10 +118,26 @@ python scripts/compare_strategies.py \
 | `--context-count` | Number of sampled groups |
 | `--min-questions` / `--max-questions` | Questions per group |
 | `--max-new-tokens` | Generation token limit |
-| `--strategies` | Comma-separated list (e.g., `all_in_one,batch,collab_llm`) |
+| `--strategies` | Comma-separated list (see table below) |
 | `--json-out` | Output directory for results |
 | `--use-api` | Use API-based inference |
 | `--api-model` | Model ID for API inference |
+| `--use-vllm` | Also run vLLM inference for comparison |
+| `--auto-checkpoints` | Auto-discover trained checkpoints |
+
+### Available Strategies
+
+| Strategy | HF | vLLM | Requires Checkpoint |
+|----------|:--:|:----:|:-------------------:|
+| `all_in_one` | Yes | Yes | No |
+| `sequential` | Yes | Yes | No |
+| `batch` | Yes | Yes | No |
+| `collab_llm` | Yes | Yes | No |
+| `collab_bert` | Yes | Yes | No |
+| `finetuned` | Yes | No | `--baseline-checkpoint` |
+| `collab_hidden` | Yes | No | `--collab-hidden-checkpoint` |
+| `lora_lmhead` | Yes | No | `--lora-lmhead-checkpoint` |
+| `lora_crossbatch` | Yes | No | `--lora-crossbatch-checkpoint` |
 
 ### Collaborative Strategy Arguments
 
@@ -167,7 +183,7 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --json-out outputs_json/results_hotpot.json
 ```
 
-### CMB (Chinese Medical Benchmark)
+### CMB-Clin (Chinese Medical Clinical Cases)
 
 Uses BLEU-4 and ROUGE metrics. Optionally add `--eval-model` for LLM-based evaluation.
 
@@ -185,6 +201,54 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --max-new-tokens 1024 \
   --json-out outputs_json/results_cmb.json \
   --eval-model openai/gpt-4o  # Optional
+```
+
+### CMB-Exam (Chinese Medical Exam)
+
+Multiple-choice questions with accuracy metric. Three grouping modes:
+
+| Mode | Description |
+|------|-------------|
+| `random` | Random grouping baseline (no shared context) |
+| `subdomain` | Grouped by medical specialty/terms |
+| `context` | Questions with shared background/context |
+
+```bash
+# Random grouping (baseline)
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset cmb \
+  --cmb-subset random \
+  --split test \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --context-count 100 \
+  --min-questions 5 \
+  --max-questions 5 \
+  --max-new-tokens 64 \
+  --json-out outputs_json/results_cmb_exam_random.json
+
+# Subdomain grouping
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset cmb \
+  --cmb-subset subdomain \
+  --split test \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --context-count 100 \
+  --min-questions 3 \
+  --max-questions 8 \
+  --max-new-tokens 64 \
+  --json-out outputs_json/results_cmb_exam_subdomain.json
+
+# Context grouping (shared background)
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+  --dataset cmb \
+  --cmb-subset context \
+  --split test \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --context-count 100 \
+  --min-questions 2 \
+  --max-questions 6 \
+  --max-new-tokens 64 \
+  --json-out outputs_json/results_cmb_exam_context.json
 ```
 
 ### QuAC (Conversational QA)
@@ -236,33 +300,132 @@ torchrun --nproc_per_node=8 scripts/compare_strategies.py \
   --json-out outputs_json/results_drop.json
 ```
 
-## Cross-Batch Module (collab_hidden)
+## Cross-Batch Module Training & Evaluation
 
-The `collab_hidden` strategy uses cross-batch attention mechanisms that enable information sharing between samples during parallel generation. This requires training a cross-batch module first.
+The `collab_hidden` strategy uses cross-batch attention mechanisms that enable information sharing between samples during parallel generation. The training script trains and evaluates multiple fine-tuning approaches:
 
-### Training
+| Method | Description |
+|--------|-------------|
+| `baseline` | Only train lm_head |
+| `crossbatch` | Train lm_head + cross-batch attention module |
+| `lora_lmhead` | LoRA adapters + lm_head |
+| `lora_crossbatch` | LoRA + lm_head + cross-batch attention |
+
+### Training (DDP 8-GPU)
 
 ```bash
+# Full training on SQuAD
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --batch-size 4 \
+    --epochs 1
+
+# Quick test with limited data
 python scripts/train_cross_batch.py \
-  --model-name Qwen/Qwen2.5-7B-Instruct \
-  --mix-method attention \
-  --num-epochs 3 \
-  --batch-size 8 \
-  --learning-rate 1e-4 \
-  --save-dir ./checkpoints
+    --model Qwen/Qwen2.5-0.5B-Instruct \
+    --max-samples 1000 \
+    --eval-samples 100
+
+# Train on other datasets
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset hotpot \
+    --batch-size 4
 ```
 
-### Using with compare_strategies.py
+Checkpoints are saved to `outputs/checkpoints/{dataset}/`:
+- `Qwen_Qwen2.5-7B-Instruct_baseline.pt`
+- `Qwen_Qwen2.5-7B-Instruct_crossbatch.pt`
+- `Qwen_Qwen2.5-7B-Instruct_lora_lmhead.pt`
+- `Qwen_Qwen2.5-7B-Instruct_lora_crossbatch.pt`
+
+### Training Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--model` | Model name (default: `Qwen/Qwen2.5-0.5B-Instruct`) |
+| `--dataset` | Dataset: `squad`, `hotpot`, `quac`, `drop`, `cmb_clin`, `cmb_exam_context`, `cmb_exam_subdomain`, `cmb_exam_random` |
+| `--max-samples` | Training samples (default: all) |
+| `--eval-samples` | Evaluation contexts (default: all) |
+| `--min-questions` / `--max-questions` | Questions per context (default: 3-5) |
+| `--epochs` | Training epochs (default: 1) |
+| `--batch-size` | Per-GPU batch size (default: 8) |
+| `--lr` | Learning rate (default: 1e-4) |
+| `--save-dir` | Checkpoint directory (default: `outputs/checkpoints`) |
+| `--force` | Force re-training even if checkpoint exists |
+
+### CMB Training Examples
+
+The CMB dataset has two subsets with different training use cases:
+
+| Dataset | Description |
+|---------|-------------|
+| `cmb_clin` | CMB-Clin clinical cases (only 74 test samples, not recommended for training) |
+| `cmb_exam_context` | CMB-Exam with shared background grouping (recommended, from fzkuji/CMB-Exam-Grouped) |
+| `cmb_exam_subdomain` | CMB-Exam grouped by medical specialty |
+| `cmb_exam_random` | CMB-Exam random grouping (baseline) |
 
 ```bash
-python scripts/compare_strategies.py \
-  --dataset squad \
-  --model-name Qwen/Qwen2.5-7B-Instruct \
-  --strategies "batch,collab_hidden" \
-  --collab-hidden-checkpoint ./checkpoints/best_model.pt \
-  --context-count 10 \
-  --max-new-tokens 128
+# Train on CMB-Exam with context grouping (recommended)
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset cmb_exam_context \
+    --batch-size 4 \
+    --epochs 1
+
+# Train on CMB-Exam with subdomain grouping
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset cmb_exam_subdomain \
+    --batch-size 4
+
+# Train on CMB-Exam with random grouping (baseline)
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset cmb_exam_random \
+    --batch-size 4
 ```
+
+### Evaluation with Trained Checkpoints
+
+```bash
+# Auto-discover checkpoints and evaluate all strategies
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+    --dataset squad \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --context-count 100 \
+    --min-questions 3 \
+    --max-questions 5 \
+    --auto-checkpoints
+
+# With vLLM comparison (non-finetuned strategies only)
+torchrun --nproc_per_node=8 scripts/compare_strategies.py \
+    --dataset squad \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --context-count 100 \
+    --auto-checkpoints \
+    --use-vllm
+
+# Manual checkpoint paths
+python scripts/compare_strategies.py \
+    --dataset squad \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --strategies "batch,collab_hidden" \
+    --collab-hidden-checkpoint outputs/checkpoints/squad/Qwen_Qwen2.5-7B-Instruct_crossbatch.pt \
+    --context-count 10
+```
+
+### Checkpoint Arguments for compare_strategies.py
+
+| Argument | Description |
+|----------|-------------|
+| `--auto-checkpoints` | Auto-discover checkpoints based on model/dataset |
+| `--checkpoint-dir` | Base directory for checkpoint discovery (default: `outputs/checkpoints`) |
+| `--baseline-checkpoint` | Path to baseline (lm_head only) checkpoint |
+| `--collab-hidden-checkpoint` | Path to cross-batch module checkpoint |
+| `--lora-lmhead-checkpoint` | Path to LoRA + lm_head checkpoint |
+| `--lora-crossbatch-checkpoint` | Path to LoRA + cross-batch checkpoint |
 
 ## Other Scripts
 

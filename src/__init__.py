@@ -60,6 +60,9 @@ from .selection import (
 from .datasets import (
     build_questions_from_group,
     load_cmb_groups,
+    load_cmb_exam_random_groups,
+    load_cmb_exam_subdomain_groups,
+    load_cmb_exam_context_groups,
     load_drop_groups,
     load_hotpot_groups,
     load_quac_groups,
@@ -143,6 +146,9 @@ __all__ = [
     "load_quality_groups",
     "load_drop_groups",
     "load_cmb_groups",
+    "load_cmb_exam_random_groups",
+    "load_cmb_exam_subdomain_groups",
+    "load_cmb_exam_context_groups",
     "build_questions_from_group",
     # Inference utilities
     "DEFAULT_SYSTEM_PROMPT",
