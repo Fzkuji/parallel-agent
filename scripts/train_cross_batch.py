@@ -928,41 +928,67 @@ def main():
             json.dump(inference_details, f, indent=2, ensure_ascii=False)
         print(f'\n详细推理结果已保存到: {details_file}')
 
-        # 打印总结
+        # 打印总结 - 根据数据集选择合适的指标
         print('\n' + '=' * 60)
         print('五方对比总结')
         print('=' * 60)
-        print(f'| 方法 | EM | F1 |')
-        print(f'|------|-----|-----|')
-        print(f'| 原始模型 | {all_results["original"]["exact_match"]:.2f} | {all_results["original"]["f1"]:.2f} |')
-        print(f'| Baseline (lm_head) | {all_results["baseline"]["exact_match"]:.2f} | {all_results["baseline"]["f1"]:.2f} |')
-        print(f'| lm_head + Cross-Batch | {all_results["crossbatch"]["exact_match"]:.2f} | {all_results["crossbatch"]["f1"]:.2f} |')
-        print(f'| LoRA + lm_head | {all_results["lora_lmhead"]["exact_match"]:.2f} | {all_results["lora_lmhead"]["f1"]:.2f} |')
-        print(f'| LoRA + lm_head + Cross-Batch | {all_results["lora_crossbatch"]["exact_match"]:.2f} | {all_results["lora_crossbatch"]["f1"]:.2f} |')
+
+        # 检测使用的指标类型
+        sample_result = all_results['original']
+        if 'acc' in sample_result:
+            # CMB-Exam: 使用 accuracy
+            metric_name = 'Acc'
+            metric_key = 'acc'
+        else:
+            # SQuAD/HotpotQA/etc: 使用 EM 和 F1
+            metric_name = 'EM'
+            metric_key = 'exact_match'
+
+        def get_metric(result, key):
+            return result.get(key, 0.0)
+
+        if 'f1' in sample_result:
+            print(f'| 方法 | {metric_name} | F1 |')
+            print(f'|------|-----|-----|')
+            print(f'| 原始模型 | {get_metric(all_results["original"], metric_key):.2f} | {get_metric(all_results["original"], "f1"):.2f} |')
+            print(f'| Baseline (lm_head) | {get_metric(all_results["baseline"], metric_key):.2f} | {get_metric(all_results["baseline"], "f1"):.2f} |')
+            print(f'| lm_head + Cross-Batch | {get_metric(all_results["crossbatch"], metric_key):.2f} | {get_metric(all_results["crossbatch"], "f1"):.2f} |')
+            print(f'| LoRA + lm_head | {get_metric(all_results["lora_lmhead"], metric_key):.2f} | {get_metric(all_results["lora_lmhead"], "f1"):.2f} |')
+            print(f'| LoRA + lm_head + Cross-Batch | {get_metric(all_results["lora_crossbatch"], metric_key):.2f} | {get_metric(all_results["lora_crossbatch"], "f1"):.2f} |')
+            main_metric = 'f1'
+        else:
+            print(f'| 方法 | {metric_name} |')
+            print(f'|------|-----|')
+            print(f'| 原始模型 | {get_metric(all_results["original"], metric_key):.2f} |')
+            print(f'| Baseline (lm_head) | {get_metric(all_results["baseline"], metric_key):.2f} |')
+            print(f'| lm_head + Cross-Batch | {get_metric(all_results["crossbatch"], metric_key):.2f} |')
+            print(f'| LoRA + lm_head | {get_metric(all_results["lora_lmhead"], metric_key):.2f} |')
+            print(f'| LoRA + lm_head + Cross-Batch | {get_metric(all_results["lora_crossbatch"], metric_key):.2f} |')
+            main_metric = metric_key
 
         print('\n改进分析:')
-        orig_f1 = all_results['original']['f1']
-        base_f1 = all_results['baseline']['f1']
-        cross_f1 = all_results['crossbatch']['f1']
-        lora_lmhead_f1 = all_results['lora_lmhead']['f1']
-        lora_crossbatch_f1 = all_results['lora_crossbatch']['f1']
+        orig_val = get_metric(all_results['original'], main_metric)
+        base_val = get_metric(all_results['baseline'], main_metric)
+        cross_val = get_metric(all_results['crossbatch'], main_metric)
+        lora_lmhead_val = get_metric(all_results['lora_lmhead'], main_metric)
+        lora_crossbatch_val = get_metric(all_results['lora_crossbatch'], main_metric)
 
-        print(f'  Baseline vs 原始: F1 {base_f1 - orig_f1:+.2f}')
-        print(f'  lm_head + Cross-Batch vs 原始: F1 {cross_f1 - orig_f1:+.2f}')
-        print(f'  lm_head + Cross-Batch vs Baseline: F1 {cross_f1 - base_f1:+.2f}')
-        print(f'  LoRA + lm_head vs 原始: F1 {lora_lmhead_f1 - orig_f1:+.2f}')
-        print(f'  LoRA + lm_head + Cross-Batch vs 原始: F1 {lora_crossbatch_f1 - orig_f1:+.2f}')
-        print(f'  LoRA + lm_head + Cross-Batch vs LoRA + lm_head: F1 {lora_crossbatch_f1 - lora_lmhead_f1:+.2f}')
+        print(f'  Baseline vs 原始: {main_metric.upper()} {base_val - orig_val:+.2f}')
+        print(f'  lm_head + Cross-Batch vs 原始: {main_metric.upper()} {cross_val - orig_val:+.2f}')
+        print(f'  lm_head + Cross-Batch vs Baseline: {main_metric.upper()} {cross_val - base_val:+.2f}')
+        print(f'  LoRA + lm_head vs 原始: {main_metric.upper()} {lora_lmhead_val - orig_val:+.2f}')
+        print(f'  LoRA + lm_head + Cross-Batch vs 原始: {main_metric.upper()} {lora_crossbatch_val - orig_val:+.2f}')
+        print(f'  LoRA + lm_head + Cross-Batch vs LoRA + lm_head: {main_metric.upper()} {lora_crossbatch_val - lora_lmhead_val:+.2f}')
 
         # 找出最佳方法
         methods = {
-            'Baseline': base_f1,
-            'lm_head + Cross-Batch': cross_f1,
-            'LoRA + lm_head': lora_lmhead_f1,
-            'LoRA + lm_head + Cross-Batch': lora_crossbatch_f1,
+            'Baseline': base_val,
+            'lm_head + Cross-Batch': cross_val,
+            'LoRA + lm_head': lora_lmhead_val,
+            'LoRA + lm_head + Cross-Batch': lora_crossbatch_val,
         }
         best_method = max(methods, key=methods.get)
-        print(f'\n=> 最佳方法: {best_method} (F1: {methods[best_method]:.2f})')
+        print(f'\n=> 最佳方法: {best_method} ({main_metric.upper()}: {methods[best_method]:.2f})')
 
         print(f'\n结果已保存到: {output_file}')
         print('=' * 60)
