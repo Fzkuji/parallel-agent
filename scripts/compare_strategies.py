@@ -1650,8 +1650,9 @@ def main() -> None:
             seed=args.seed,
         )
     elif args.dataset == "cmb_exam_context":
-        # CMB-Exam: use requested split directly (test split has no answers)
-        split = "val" if args.split == "validation" else args.split
+        # CMB-Exam 默认使用 test split
+        split = "test" if args.split == "train" else args.split
+        split = "val" if split == "validation" else split
         contexts = load_cmb_exam_context_groups(
             split,
             min_questions=args.min_questions,
@@ -1660,8 +1661,8 @@ def main() -> None:
             seed=args.seed,
         )
     elif args.dataset == "cmb_exam_subdomain":
-        # CMB-Exam: use requested split directly (test split has no answers)
-        split = "val" if args.split == "validation" else args.split
+        split = "test" if args.split == "train" else args.split
+        split = "val" if split == "validation" else split
         contexts = load_cmb_exam_subdomain_groups(
             split,
             min_questions=args.min_questions,
@@ -1670,8 +1671,8 @@ def main() -> None:
             seed=args.seed,
         )
     elif args.dataset == "cmb_exam_random":
-        # CMB-Exam: use requested split directly (test split has no answers)
-        split = "val" if args.split == "validation" else args.split
+        split = "test" if args.split == "train" else args.split
+        split = "val" if split == "validation" else split
         contexts = load_cmb_exam_random_groups(
             split,
             questions_per_group=args.max_questions or 5,

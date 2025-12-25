@@ -26,12 +26,24 @@ class CrossBatchAttention(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.0,
         temperature: float = 1.0,
+        self_only: bool = False,
     ):
+        """
+        Args:
+            hidden_size: Hidden dimension size
+            num_heads: Number of attention heads
+            dropout: Dropout probability
+            temperature: Softmax temperature
+            self_only: If True, attention only attends to self (diagonal only).
+                       This disables cross-batch interaction for ablation study.
+                       The module still has the same parameters, but no cross-sample info flows.
+        """
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.temperature = temperature
+        self.self_only = self_only
 
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
 
@@ -87,9 +99,15 @@ class CrossBatchAttention(nn.Module):
         # Attention weights: [num_heads, batch, batch]
         attn_weights = torch.bmm(q, k.transpose(1, 2)) / (self.head_dim ** 0.5 * self.temperature)
 
-        # Mask out self-attention (diagonal)
         eye_mask = torch.eye(batch_size, device=hidden_states.device, dtype=torch.bool)
-        attn_weights = attn_weights.masked_fill(eye_mask.unsqueeze(0), float('-inf'))
+        
+        if self.self_only:
+            # Ablation: only attend to self (diagonal only, no cross-batch interaction)
+            # Mask out everything except diagonal
+            attn_weights = attn_weights.masked_fill(~eye_mask.unsqueeze(0), float('-inf'))
+        else:
+            # Normal: mask out self-attention (diagonal), attend to other samples
+            attn_weights = attn_weights.masked_fill(eye_mask.unsqueeze(0), float('-inf'))
 
         # Apply attention mask if provided
         if attention_mask is not None:

@@ -227,8 +227,7 @@ def run_all_in_one_multi_strategy(
     detail_records: List[Dict[str, Any]] = []
 
     # CMB uses direct answer format without <answer> tags
-    # Multiple-choice datasets also use direct format (extract letter directly)
-    use_direct_format = dataset in DIRECT_ANSWER_DATASETS or dataset in MULTIPLE_CHOICE_DATASETS
+    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
 
     # Only extractive QA datasets allow "unknown" responses
     if dataset in EXTRACTIVE_DATASETS:

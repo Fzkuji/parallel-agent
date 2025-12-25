@@ -159,6 +159,10 @@ def parse_args():
                         help='随机种子 (default: 42)')
     parser.add_argument('--force', action='store_true',
                         help='强制重新训练，即使 checkpoint 已存在')
+    
+    # Cross-batch ablation
+    parser.add_argument('--self-only', action='store_true',
+                        help='Ablation: CrossBatch 模块只关注自己（对角线 attention），禁用跨样本交互')
     return parser.parse_args()
 
 
@@ -577,7 +581,7 @@ def main():
     print_rank0('\n[1/6] 评估原始模型 (未微调)', rank)
     print_rank0('-' * 40, rank)
     model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-    cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size)
+    cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size, self_only=args.self_only)
 
     metrics_original = evaluate_with_strategy(
         model_original, tokenizer, cross_batch_original, device, args,
@@ -645,7 +649,7 @@ def main():
             print(f'\nBaseline checkpoint 已保存到: {baseline_checkpoint_path}')
 
     # 所有卡并行评估
-    cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size)
+    cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size, self_only=args.self_only)
     metrics_baseline = evaluate_with_strategy(
         model_baseline, tokenizer, cross_batch_baseline, device, args,
         enable_cross_batch=False, strategy_name="baseline",
@@ -670,7 +674,7 @@ def main():
     if should_skip_training(crossbatch_checkpoint_path, args.force, rank):
         # 加载已有 checkpoint 进行评估
         model_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size)
+        cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size, self_only=args.self_only)
         checkpoint = torch.load(crossbatch_checkpoint_path, map_location=device)
         cross_batch_module.load_state_dict(checkpoint['cross_batch_module'])
         if 'lm_head' in checkpoint:
@@ -679,7 +683,7 @@ def main():
         print_rank0('已加载 Cross-Batch checkpoint', rank)
     else:
         model_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size)
+        cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size, self_only=args.self_only)
         trainer_crossbatch = CrossBatchTrainer(
             model=model_crossbatch,
             tokenizer=tokenizer,
@@ -801,7 +805,7 @@ def main():
         del trainer_lora_lmhead
 
     # 评估
-    cross_batch_lora_lmhead = CrossBatchAttention(hidden_size=model_lora_lmhead.config.hidden_size)
+    cross_batch_lora_lmhead = CrossBatchAttention(hidden_size=model_lora_lmhead.config.hidden_size, self_only=args.self_only)
     metrics_lora_lmhead = evaluate_with_strategy(
         eval_model_lmhead, tokenizer, cross_batch_lora_lmhead, device, args,
         enable_cross_batch=False, strategy_name="lora_lmhead",
@@ -825,7 +829,7 @@ def main():
     if should_skip_training(lora_crossbatch_checkpoint_path, args.force, rank):
         # 加载已有 checkpoint 进行评估
         model_lora_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size)
+        cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size, self_only=args.self_only)
         checkpoint = torch.load(lora_crossbatch_checkpoint_path, map_location=device)
         if 'lm_head' in checkpoint:
             model_lora_crossbatch.lm_head.load_state_dict(checkpoint['lm_head'])
@@ -847,7 +851,7 @@ def main():
         eval_model_lora_cb = model_lora_crossbatch.base_model
     else:
         model_lora_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size)
+        cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size, self_only=args.self_only)
         trainer_lora_crossbatch = LoRACrossBatchTrainer(
             model=model_lora_crossbatch,
             tokenizer=tokenizer,
