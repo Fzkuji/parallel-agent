@@ -134,7 +134,9 @@ def parse_args():
                                  'cmb_clin', 'cmb_exam_context', 'cmb_exam_subdomain', 'cmb_exam_random'],
                         help='数据集 (default: squad)')
     parser.add_argument('--split', type=str, default='validation',
-                        help='评估用的数据集 split (default: validation)')
+                        help='评估用的数据集 split (default: validation). Supports slice syntax like "train[50:]", "train[:100]".')
+    parser.add_argument('--train-split', type=str, default='train',
+                        help='训练用的数据集 split (default: train). Supports slice syntax like "train[50:]", "train[:100]".')
     parser.add_argument('--min-questions', type=int, default=3,
                         help='每个 context 最少问题数 (default: 3)')
     parser.add_argument('--max-questions', type=int, default=5,
@@ -339,10 +341,11 @@ def load_train_data(args):
     min_questions = args.min_questions
     max_questions = args.max_questions
     seed = args.seed
+    train_split = getattr(args, 'train_split', 'train')  # Support slice syntax
 
     if dataset == "squad":
         groups = load_squad_groups(
-            split="train",
+            split=train_split,
             min_questions=min_questions,
             max_questions=max_questions,
             max_contexts=max_contexts,
@@ -350,7 +353,7 @@ def load_train_data(args):
         )
     elif dataset == "hotpot":
         groups = load_hotpot_groups(
-            split="train",
+            split=train_split,
             subset="fullwiki",
             max_contexts=max_contexts,
             min_questions=min_questions,
@@ -359,7 +362,7 @@ def load_train_data(args):
         )
     elif dataset == "quac":
         groups = load_quac_groups(
-            split="train",
+            split=train_split,
             min_questions=min_questions,
             max_questions=max_questions,
             max_contexts=max_contexts,
@@ -367,7 +370,7 @@ def load_train_data(args):
         )
     elif dataset == "drop":
         groups = load_drop_groups(
-            split="train",
+            split=train_split,
             min_questions=min_questions,
             max_questions=max_questions,
             max_contexts=max_contexts,
@@ -387,7 +390,7 @@ def load_train_data(args):
     elif dataset == "cmb_exam_context":
         # CMB-Exam with shared context grouping (from fzkuji/CMB-Exam-Grouped)
         groups = load_cmb_exam_context_groups(
-            split="train",
+            split=train_split,
             min_questions=min_questions,
             max_questions=max_questions,
             max_contexts=max_contexts,
@@ -396,7 +399,7 @@ def load_train_data(args):
     elif dataset == "cmb_exam_subdomain":
         # CMB-Exam with subdomain grouping
         raw_groups = load_cmb_exam_subdomain_groups(
-            split="train",
+            split=train_split,
             min_questions=min_questions,
             max_questions=max_questions,
             max_contexts=max_contexts,
@@ -422,7 +425,7 @@ def load_train_data(args):
     elif dataset == "cmb_exam_random":
         # CMB-Exam with random grouping
         raw_groups = load_cmb_exam_random_groups(
-            split="train",
+            split=train_split,
             questions_per_group=max_questions or 5,
             max_contexts=max_contexts,
             seed=seed,
