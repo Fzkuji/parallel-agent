@@ -481,13 +481,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-questions", type=int, default=3, help="Minimum questions per context.")
     parser.add_argument("--max-questions", type=int, default=5, help="Maximum questions per context.")
     parser.add_argument("--seed", type=int, default=13, help="Random seed for sampling contexts.")
-    parser.add_argument("--shuffle-questions", action="store_true", default=True,
-                        help="Shuffle question order before inference (default: True). Important for sequential strategy to avoid order bias.")
-    parser.add_argument("--no-shuffle-questions", dest="shuffle_questions", action="store_false",
-                        help="Disable question shuffling (use original order from dataset).")
-    
-    # Set default for shuffle_questions (argparse doesn't support default=True with store_true)
-    parser.set_defaults(shuffle_questions=True)
+    parser.add_argument("--no-shuffle-questions", dest="shuffle_questions", action="store_false", default=True,
+                        help="Disable question shuffling (default: questions are shuffled to avoid order bias, especially important for sequential strategy).")
     parser.add_argument(
         "--squad-random-questions",
         action="store_true",
