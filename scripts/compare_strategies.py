@@ -481,6 +481,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-questions", type=int, default=3, help="Minimum questions per context.")
     parser.add_argument("--max-questions", type=int, default=5, help="Maximum questions per context.")
     parser.add_argument("--seed", type=int, default=13, help="Random seed for sampling contexts.")
+    parser.add_argument("--shuffle-questions", action="store_true", default=True,
+                        help="Shuffle question order before inference (default: True). Important for sequential strategy to avoid order bias.")
+    parser.add_argument("--no-shuffle-questions", dest="shuffle_questions", action="store_false",
+                        help="Disable question shuffling (use original order from dataset).")
+    
+    # Set default for shuffle_questions (argparse doesn't support default=True with store_true)
+    parser.set_defaults(shuffle_questions=True)
     parser.add_argument(
         "--squad-random-questions",
         action="store_true",
@@ -713,9 +720,24 @@ def run_all_strategies(
     # Use eval_dataset if provided, otherwise fall back to args.dataset
     effective_dataset = eval_dataset or args.dataset
 
+    # Shuffle questions if requested (important for sequential strategy)
+    shuffle_questions = getattr(args, 'shuffle_questions', True)
+    if shuffle_questions:
+        import random
+        rng = random.Random(args.seed)
+        if isinstance(questions, list) and questions:
+            if isinstance(questions[0], Question):
+                # Single-context mode: List[Question]
+                questions = questions.copy()
+                rng.shuffle(questions)
+            elif isinstance(questions[0], dict):
+                # Multi-context mode: List[Dict]
+                questions = questions.copy()
+                rng.shuffle(questions)
+
     # Multi-context mode: if questions is None and items provided, use items-based strategies
     if background is None and isinstance(questions, list) and questions and isinstance(questions[0], dict) and "context" in questions[0]:
-        items = questions
+        items = questions  # Already shuffled above if shuffle_questions=True
         if "all_in_one" in selected_strategies:
             results.append(run_all_in_one_multi_strategy(
                 items,
