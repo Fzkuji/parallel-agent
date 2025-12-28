@@ -26,3 +26,4 @@ outputs_json/
 .DS_Store
 *.log
 .claude/settings.local.json
+data/

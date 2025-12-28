@@ -477,7 +477,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=["squad", "hotpot", "quac", "cmb", "quality", "drop", "cmb_exam_context", "cmb_exam_subdomain", "cmb_exam_random"], default="squad", help="Dataset to evaluate.")
     parser.add_argument("--model-name", default="Qwen/Qwen3-4B", help="Hugging Face model identifier or local path.")
     parser.add_argument("--split", default="train", help="Dataset split to sample.")
-    parser.add_argument("--context-count", type=int, default=3, help="Number of contexts to process.")
+    parser.add_argument("--context-count", type=int, default=None, help="Number of contexts to process (default: None, process all samples).")
     parser.add_argument("--min-questions", type=int, default=3, help="Minimum questions per context.")
     parser.add_argument("--max-questions", type=int, default=5, help="Maximum questions per context.")
     parser.add_argument("--seed", type=int, default=13, help="Random seed for sampling contexts.")
@@ -1038,6 +1038,17 @@ def run_all_strategies(
                 # Load lm_head weights
                 if 'lm_head' in checkpoint:
                     model.lm_head.load_state_dict(checkpoint['lm_head'])
+                # Clean up any existing PEFT adapters before applying new one
+                if hasattr(model, 'peft_config') and model.peft_config:
+                    from peft import PeftModel
+                    if isinstance(model, PeftModel):
+                        # Disable and delete existing adapters
+                        for adapter_name in list(model.peft_config.keys()):
+                            model.disable_adapter()
+                            model.delete_adapter(adapter_name)
+                    # Remove peft_config attribute
+                    delattr(model, 'peft_config')
+                
                 # Apply LoRA configuration
                 lora_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
@@ -1081,6 +1092,16 @@ def run_all_strategies(
                 original_lm_head_state = {k: v.clone() for k, v in model.lm_head.state_dict().items()}
                 if 'lm_head' in checkpoint:
                     model.lm_head.load_state_dict(checkpoint['lm_head'])
+                # Clean up any existing PEFT adapters before applying new one
+                if hasattr(model, 'peft_config') and model.peft_config:
+                    from peft import PeftModel
+                    if isinstance(model, PeftModel):
+                        # Disable and delete existing adapters
+                        for adapter_name in list(model.peft_config.keys()):
+                            model.disable_adapter()
+                            model.delete_adapter(adapter_name)
+                    # Remove peft_config attribute
+                    delattr(model, 'peft_config')
                 lora_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
                     r=16,
