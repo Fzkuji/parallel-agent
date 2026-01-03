@@ -1689,11 +1689,8 @@ def main() -> None:
         )
     elif args.dataset == "cmb_exam_context":
         # CMB-Exam: support slice syntax (e.g., "train[50:]", "train[:100]")
-        # Only convert exact matches, preserve slice syntax
         split = args.split
-        if split == "train":  # Exact match only, not "train[50:]"
-            split = "test"  # Legacy: convert train to test
-        elif split == "validation":
+        if split == "validation":
             split = "val"
         contexts = load_cmb_exam_context_groups(
             split,
@@ -1705,9 +1702,7 @@ def main() -> None:
     elif args.dataset == "cmb_exam_subdomain":
         # Support slice syntax
         split = args.split
-        if split == "train":
-            split = "test"
-        elif split == "validation":
+        if split == "validation":
             split = "val"
         contexts = load_cmb_exam_subdomain_groups(
             split,
@@ -1719,9 +1714,7 @@ def main() -> None:
     elif args.dataset == "cmb_exam_random":
         # Support slice syntax
         split = args.split
-        if split == "train":
-            split = "test"
-        elif split == "validation":
+        if split == "validation":
             split = "val"
         contexts = load_cmb_exam_random_groups(
             split,
