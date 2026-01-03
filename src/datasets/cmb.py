@@ -231,9 +231,9 @@ def load_cmb_exam_subdomain_groups(
         medical_term = row.get("medical_term", "unknown")
         raw_questions = row.get("questions", [])
 
-        # Limit questions per group
+        # Shuffle questions and limit per group
+        rng.shuffle(raw_questions)
         if max_questions and len(raw_questions) > max_questions:
-            rng.shuffle(raw_questions)
             raw_questions = raw_questions[:max_questions]
 
         # Build items for multi-context format
@@ -321,9 +321,9 @@ def load_cmb_exam_context_groups(
 
         raw_questions = row.get("questions", [])
 
-        # Limit questions per group
+        # Shuffle questions and limit per group
+        rng.shuffle(raw_questions)
         if max_questions and len(raw_questions) > max_questions:
-            rng.shuffle(raw_questions)
             raw_questions = raw_questions[:max_questions]
 
         questions = []
