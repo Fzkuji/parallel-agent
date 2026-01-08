@@ -1252,7 +1252,7 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
             header = "Strategy | BLEU-4 | R-1 | R-2 | R-L | LLM-Avg | Latency(s) | Batches"
         else:
             header = "Strategy | BLEU-4 | R-1 | R-2 | R-L | PromptTok | GenTok | Latency(s) | Batches"
-    elif dataset == "cmb_exam":
+    elif dataset in ("cmb_exam", "quality"):
         header = "Strategy | Acc | PromptTok | GenTok | Latency(s) | Batches"
     else:
         header = "Strategy | EM | F1 | Lenient | PromptTok | GenTok | Latency(s) | Batches"
@@ -1298,7 +1298,7 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
                     f"{avg_latency:.2f} | "
                     f"{avg_batches:.2f}"
                 )
-        elif dataset == "cmb_exam":
+        elif dataset in ("cmb_exam", "quality"):
             summary_lines.append(
                 f"{name:<13} | "
                 f"{stats.get('acc', 0)/q_count:.3f} | "

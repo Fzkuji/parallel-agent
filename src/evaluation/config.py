@@ -55,9 +55,7 @@ DATASET_METRICS: Dict[str, Dict[str, MetricFunc]] = {
     },
     # QuALITY: Long-context multiple-choice reading comprehension
     "quality": {
-        "strict_acc": compute_em,
-        "f1": compute_f1,
-        "lenient_acc": compute_contains,
+        "acc": compute_choice_accuracy,
     },
     # DROP: Discrete reasoning over paragraphs (arithmetic, counting, sorting)
     "drop": {
