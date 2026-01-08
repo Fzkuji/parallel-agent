@@ -136,12 +136,19 @@ def load_cmb_exam_random_groups(
     if not raw_dataset:
         raise ValueError(f"Empty CMB-Exam-Grouped subdomain split: {split}")
 
+    # Extract all individual questions from all groups
+    all_questions = []
+    for row in raw_dataset:
+        questions_list = row.get("questions", [])
+        for q in questions_list:
+            all_questions.append(q)
+
     rng = random.Random(seed)
-    rng.shuffle(raw_dataset)
+    rng.shuffle(all_questions)
 
     # Calculate how many samples we need
     total_needed = max_contexts * questions_per_group
-    selected = raw_dataset[:total_needed]
+    selected = all_questions[:total_needed]
 
     formatted: List[dict] = []
     for group_idx in range(max_contexts):
@@ -151,15 +158,15 @@ def load_cmb_exam_random_groups(
             break
 
         items = []
-        for i, row in enumerate(selected[start:end]):
-            question_text = row.get("question", "").strip()
-            answer_text = row.get("answer", "").strip()
+        for i, q in enumerate(selected[start:end]):
+            question_text = q.get("question", "").strip()
+            answer_text = q.get("answer", "").strip()
 
             # Build context from question metadata
-            exam_info = f"{row.get('exam_type', '')} - {row.get('exam_subject', '')}"
+            exam_info = f"{q.get('exam_type', '')} - {q.get('exam_subject', '')}"
 
             # Format options if present
-            options = row.get("option", {})
+            options = q.get("option", {})
             if options:
                 option_strs = []
                 for key in ["A", "B", "C", "D", "E", "F"]:
