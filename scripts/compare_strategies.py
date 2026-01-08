@@ -1234,6 +1234,12 @@ def compute_aggregate_metrics(serialized_contexts: List[dict], dataset: str = "s
 
     summary_lines = ["\n=== Aggregate Metrics ==="]
 
+    # Get sample counts from first strategy
+    first_stats = next(iter(strategy_totals.values()), {})
+    ctx_total = first_stats.get("context_count", 0)
+    q_total = first_stats.get("question_count", 0)
+    summary_lines.append(f"Contexts: {ctx_total}, Questions: {q_total}")
+
     # Check if we have LLM metrics
     has_llm_metrics = any(
         strategy_totals.get(n, {}).get("llm_average", 0) > 0
