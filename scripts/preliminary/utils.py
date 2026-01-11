@@ -131,6 +131,7 @@ class LLMClient:
             trust_remote_code=True,
             dtype="half",
             gpu_memory_utilization=0.9,
+            disable_log_stats=True,
         )
         logger.info(f"vLLM model loaded with {tensor_parallel_size} GPU(s)")
 
