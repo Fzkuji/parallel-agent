@@ -744,8 +744,12 @@ def worker_process(
     import os
     import json
 
-    # IMPORTANT: Set CUDA_VISIBLE_DEVICES BEFORE importing vLLM
+    # IMPORTANT: Set environment variables BEFORE importing anything CUDA-related
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Disable vLLM V1 engine which spawns EngineCore processes and uses distributed
+    os.environ["VLLM_USE_V1"] = "0"
+    # Prevent vLLM from trying to use distributed
+    os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
 
     logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(samples)} samples")
 
