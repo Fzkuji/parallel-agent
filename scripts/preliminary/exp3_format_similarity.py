@@ -39,6 +39,10 @@ from utils import (
     LLMClient,
     print_summary,
     save_results,
+    setup_distributed,
+    cleanup_distributed,
+    shard_data,
+    gather_results,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -504,6 +508,54 @@ def run_random_order_only(
     )
 
 
+def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
+    """Merge results from multiple ranks into one."""
+    if not results:
+        raise ValueError("No results to merge")
+    if len(results) == 1:
+        return results[0]
+
+    total_correct = 0
+    total_valid_format = 0
+    total_valid_answer = 0
+    total_questions = 0
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    all_details = []
+
+    for r in results:
+        total_questions += r.n_questions
+        total_correct += int(r.metrics.get("accuracy", 0) * r.n_questions)
+        total_valid_format += int(r.metrics.get("format_consistency", 0) * r.n_questions)
+        total_valid_answer += int(r.metrics.get("answer_validity", 0) * r.n_questions)
+        total_latency += r.latency
+        total_prompt_tokens += r.prompt_tokens
+        total_completion_tokens += r.completion_tokens
+        all_details.extend(r.details)
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    format_consistency = total_valid_format / total_questions if total_questions > 0 else 0
+    answer_validity = total_valid_answer / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition=results[0].condition,
+        dataset=results[0].dataset,
+        n_samples=sum(r.n_samples for r in results),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={
+            "accuracy": accuracy,
+            "format_consistency": format_consistency,
+            "answer_validity": answer_validity,
+        },
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=all_details,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Exp 3: Format Similarity - ARC-Challenge"
@@ -546,6 +598,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # Setup distributed (each GPU loads one model)
+    rank, world_size = setup_distributed()
+
     # Configuration
     config = ExperimentConfig(
         exp_name="exp3_format_similarity",
@@ -556,10 +611,15 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # Load data
-    choice_samples = load_arc_challenge(n_samples=args.n_samples, seed=args.seed)
+    # Load data (all ranks load the same data, then shard)
+    all_choice_samples = load_arc_challenge(n_samples=args.n_samples, seed=args.seed)
+    all_open_samples = None
 
-    # Initialize LLM client
+    # Shard data across GPUs
+    choice_samples = shard_data(all_choice_samples, rank, world_size)
+    logger.info(f"Rank {rank}/{world_size}: processing {len(choice_samples)}/{len(all_choice_samples)} choice samples")
+
+    # Initialize LLM client (will use current GPU)
     client = LLMClient(
         model=args.model,
         use_local=args.use_local,
@@ -567,26 +627,39 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
     )
 
-    # Run conditions
+    # Run conditions on local shard
     conditions = [c.strip() for c in args.conditions.split(",")]
-    results = []
+    local_results = []
 
     if "oracle" in conditions:
-        results.append(run_oracle(choice_samples, client))
+        local_results.append(run_oracle(choice_samples, client))
 
     if "method" in conditions:
-        results.append(run_method(choice_samples, client))
+        local_results.append(run_method(choice_samples, client))
 
     if "random" in conditions:
-        open_samples = load_open_ended_questions(n_samples=args.n_open_samples, seed=args.seed)
-        results.append(run_random(choice_samples, open_samples, client, seed=args.seed))
+        all_open_samples = load_open_ended_questions(n_samples=args.n_open_samples, seed=args.seed)
+        open_samples = shard_data(all_open_samples, rank, world_size)
+        local_results.append(run_random(choice_samples, open_samples, client, seed=args.seed))
 
     if "random_order" in conditions:
-        results.append(run_random_order_only(choice_samples, client, seed=args.seed))
+        local_results.append(run_random_order_only(choice_samples, client, seed=args.seed))
 
-    # Print and save results
-    print_summary(results)
-    save_results(results, config)
+    # Gather results from all GPUs
+    all_results_by_condition = {}
+    for result in local_results:
+        gathered = gather_results([result], world_size)
+        if rank == 0:
+            merged = _merge_results(gathered)
+            all_results_by_condition[result.condition] = merged
+
+    # Print and save results (only rank 0)
+    if rank == 0:
+        results = list(all_results_by_condition.values())
+        print_summary(results)
+        save_results(results, config)
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

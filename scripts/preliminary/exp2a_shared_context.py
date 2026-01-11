@@ -35,6 +35,10 @@ from utils import (
     compute_contains,
     print_summary,
     save_results,
+    setup_distributed,
+    cleanup_distributed,
+    shard_data,
+    gather_results,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -427,6 +431,44 @@ def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
     return answers
 
 
+def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
+    """Merge results from multiple ranks into one."""
+    if not results:
+        raise ValueError("No results to merge")
+    if len(results) == 1:
+        return results[0]
+
+    total_correct = 0
+    total_questions = 0
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    all_details = []
+
+    for r in results:
+        total_questions += r.n_questions
+        total_correct += int(r.accuracy * r.n_questions)
+        total_latency += r.latency
+        total_prompt_tokens += r.prompt_tokens
+        total_completion_tokens += r.completion_tokens
+        all_details.extend(r.details)
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition=results[0].condition,
+        dataset=results[0].dataset,
+        n_samples=sum(r.n_samples for r in results),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={"exact_match": accuracy},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=all_details,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Exp 2a: Shared Context - SQuAD"
@@ -477,6 +519,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # Setup distributed (each GPU loads one model)
+    rank, world_size = setup_distributed()
+
     # Configuration
     config = ExperimentConfig(
         exp_name="exp2a_shared_context",
@@ -487,15 +532,19 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # Load data
-    groups = load_squad_groups(
+    # Load data (all ranks load the same data, then shard)
+    all_groups = load_squad_groups(
         n_groups=args.n_groups,
         min_questions=args.min_questions,
         max_questions=args.max_questions,
         seed=args.seed,
     )
 
-    # Initialize LLM client
+    # Shard data across GPUs
+    groups = shard_data(all_groups, rank, world_size)
+    logger.info(f"Rank {rank}/{world_size}: processing {len(groups)}/{len(all_groups)} groups")
+
+    # Initialize LLM client (will use current GPU)
     client = LLMClient(
         model=args.model,
         use_local=args.use_local,
@@ -503,25 +552,37 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
     )
 
-    # Run conditions
+    # Run conditions on local shard
     conditions = [c.strip() for c in args.conditions.split(",")]
-    results = []
+    local_results = []
 
     if "oracle" in conditions:
-        results.append(run_oracle(groups, client, batch_size=args.batch_size))
+        local_results.append(run_oracle(groups, client, batch_size=args.batch_size))
 
     if "random" in conditions:
-        results.append(run_random(groups, client, batch_size=args.batch_size, seed=args.seed))
+        local_results.append(run_random(groups, client, batch_size=args.batch_size, seed=args.seed))
 
     if "oracle_batch" in conditions:
-        results.append(run_oracle_batch(groups, client))
+        local_results.append(run_oracle_batch(groups, client))
 
     if "random_batch" in conditions:
-        results.append(run_random_batch(groups, client, batch_size=args.batch_size, seed=args.seed))
+        local_results.append(run_random_batch(groups, client, batch_size=args.batch_size, seed=args.seed))
 
-    # Print and save results
-    print_summary(results)
-    save_results(results, config)
+    # Gather results from all GPUs
+    all_results_by_condition = {}
+    for result in local_results:
+        gathered = gather_results([result], world_size)
+        if rank == 0:
+            merged = _merge_results(gathered)
+            all_results_by_condition[result.condition] = merged
+
+    # Print and save results (only rank 0)
+    if rank == 0:
+        results = list(all_results_by_condition.values())
+        print_summary(results)
+        save_results(results, config)
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

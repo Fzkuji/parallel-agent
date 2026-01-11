@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import torch
+import torch.distributed as dist
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -129,7 +132,6 @@ class LLMClient:
     def _init_local_model(self, model: str, device: str):
         """Initialize local model with transformers."""
         try:
-            import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError:
             raise ImportError("Please install transformers: pip install transformers torch")
@@ -140,17 +142,22 @@ class LLMClient:
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
 
-        # Determine device
+        # Determine device - use current CUDA device if set by distributed setup
         if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                # Use current device (set by torch.cuda.set_device in distributed setup)
+                device = f"cuda:{torch.cuda.current_device()}"
+            else:
+                device = "cpu"
 
+        is_cuda = device.startswith("cuda")
         self._model = AutoModelForCausalLM.from_pretrained(
             model,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map=device if device == "cuda" else None,
+            torch_dtype=torch.float16 if is_cuda else torch.float32,
+            device_map={"": device} if is_cuda else None,
             trust_remote_code=True,
         )
-        if device == "cpu":
+        if not is_cuda:
             self._model = self._model.to(device)
 
         logger.info(f"Model loaded on {device}")
@@ -517,3 +524,73 @@ def topological_sort(n: int, edges: List[Tuple[int, int]]) -> List[int]:
         return list(range(n))
 
     return result
+
+
+def setup_distributed() -> Tuple[int, int]:
+    """Setup distributed training environment.
+
+    Returns:
+        Tuple of (rank, world_size)
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if world_size > 1:
+        if torch.cuda.is_available():
+            num_devices = torch.cuda.device_count()
+            device_id = rank % num_devices
+            torch.cuda.set_device(device_id)
+            logger.info(f"Rank {rank} using cuda:{device_id} (visible devices: {num_devices})")
+
+        if not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+            logger.info(f"Initialized distributed backend: {backend} (rank {rank}/{world_size})")
+
+    return rank, world_size
+
+
+def cleanup_distributed():
+    """Cleanup distributed environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def shard_data(data: List[Any], rank: int, world_size: int) -> List[Any]:
+    """Shard data across processes.
+
+    Args:
+        data: List of data items
+        rank: Current process rank
+        world_size: Total number of processes
+
+    Returns:
+        Subset of data for this rank
+    """
+    return data[rank::world_size]
+
+
+def gather_results(local_results: List[Any], world_size: int) -> List[Any]:
+    """Gather results from all processes.
+
+    Args:
+        local_results: Results from this process
+        world_size: Total number of processes
+
+    Returns:
+        Combined results from all processes (on rank 0), or local_results (on other ranks)
+    """
+    if world_size <= 1 or not dist.is_initialized():
+        return local_results
+
+    # Gather from all ranks
+    gather_list = [None for _ in range(world_size)]
+    dist.all_gather_object(gather_list, local_results)
+
+    # Merge results
+    merged = []
+    for results in gather_list:
+        if results:
+            merged.extend(results)
+
+    return merged

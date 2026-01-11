@@ -31,6 +31,10 @@ from utils import (
     compute_contains,
     print_summary,
     save_results,
+    setup_distributed,
+    cleanup_distributed,
+    shard_data,
+    gather_results,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -494,6 +498,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # Setup distributed (each GPU loads one model)
+    rank, world_size = setup_distributed()
+
     # Configuration
     config = ExperimentConfig(
         exp_name="exp1_answer_dependency",
@@ -504,10 +511,14 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # Load data
-    samples = load_morehopqa(n_samples=args.n_samples, seed=args.seed)
+    # Load data (all ranks load the same data, then shard)
+    all_samples = load_morehopqa(n_samples=args.n_samples, seed=args.seed)
 
-    # Initialize LLM client
+    # Shard data across GPUs
+    samples = shard_data(all_samples, rank, world_size)
+    logger.info(f"Rank {rank}/{world_size}: processing {len(samples)}/{len(all_samples)} samples")
+
+    # Initialize LLM client (will use current GPU)
     client = LLMClient(
         model=args.model,
         use_local=args.use_local,
@@ -515,22 +526,74 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
     )
 
-    # Run conditions
+    # Run conditions on local shard
     conditions = [c.strip() for c in args.conditions.split(",")]
-    results = []
+    local_results = []
 
     if "oracle" in conditions:
-        results.append(run_oracle(samples, client))
+        local_results.append(run_oracle(samples, client))
 
     if "independent" in conditions:
-        results.append(run_independent(samples, client))
+        local_results.append(run_independent(samples, client))
 
     if "shuffled" in conditions:
-        results.append(run_shuffled(samples, client, seed=args.seed))
+        local_results.append(run_shuffled(samples, client, seed=args.seed))
 
-    # Print and save results
-    print_summary(results)
-    save_results(results, config)
+    # Gather results from all GPUs
+    all_results_by_condition = {}
+    for result in local_results:
+        gathered = gather_results([result], world_size)
+        if rank == 0:
+            # Merge results from all ranks for this condition
+            merged = _merge_results(gathered)
+            all_results_by_condition[result.condition] = merged
+
+    # Print and save results (only rank 0)
+    if rank == 0:
+        results = list(all_results_by_condition.values())
+        print_summary(results)
+        save_results(results, config)
+
+    cleanup_distributed()
+
+
+def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
+    """Merge results from multiple ranks into one."""
+    if not results:
+        raise ValueError("No results to merge")
+    if len(results) == 1:
+        return results[0]
+
+    # Sum up metrics
+    total_correct = 0
+    total_questions = 0
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    all_details = []
+
+    for r in results:
+        total_questions += r.n_questions
+        total_correct += int(r.accuracy * r.n_questions)
+        total_latency += r.latency
+        total_prompt_tokens += r.prompt_tokens
+        total_completion_tokens += r.completion_tokens
+        all_details.extend(r.details)
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition=results[0].condition,
+        dataset=results[0].dataset,
+        n_samples=sum(r.n_samples for r in results),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={"sub_question_accuracy": accuracy},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=all_details,
+    )
 
 
 if __name__ == "__main__":
