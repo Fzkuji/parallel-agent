@@ -136,12 +136,6 @@ class LLMClient:
         except ImportError:
             raise ImportError("Please install transformers: pip install transformers torch")
 
-        logger.info(f"Loading local model: {model}")
-
-        self._tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-        if self._tokenizer.pad_token is None:
-            self._tokenizer.pad_token = self._tokenizer.eos_token
-
         # Determine device - use current CUDA device if set by distributed setup
         if device == "auto":
             if torch.cuda.is_available():
@@ -150,15 +144,25 @@ class LLMClient:
             else:
                 device = "cpu"
 
+        logger.info(f"Loading local model: {model} -> {device}")
+
+        self._tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+
         is_cuda = device.startswith("cuda")
+
+        # Load model - for multi-GPU, load to CPU first then move to avoid OOM
+        # device_map can cause all processes to allocate on GPU 0 during loading
         self._model = AutoModelForCausalLM.from_pretrained(
             model,
             torch_dtype=torch.float16 if is_cuda else torch.float32,
-            device_map={"": device} if is_cuda else None,
+            device_map=None,  # Don't use device_map to avoid multi-process conflicts
+            low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
-        if not is_cuda:
-            self._model = self._model.to(device)
+        self._model = self._model.to(device)
+        self._model.eval()
 
         logger.info(f"Model loaded on {device}")
 
