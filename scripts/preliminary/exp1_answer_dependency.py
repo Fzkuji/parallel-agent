@@ -9,10 +9,12 @@ improve multi-step reasoning performance?
 Conditions:
 - Oracle (Sequential + Pred Context): Follow decomposition order, pass prior Q&A with predicted answers
 - Oracle-Gold (Sequential + Gold Context): Follow decomposition order, pass prior Q&A with gold answers
+- No-Context (Sequential + Prior Q&A only): Follow decomposition order, pass prior Q&A but NO reference context
 - Independent (No Context): Answer each sub-question independently, no prior info
 - Shuffled (Random Order + Context): Random order but still pass prior Q&A
 
 Expected: Oracle-Gold > Oracle > Shuffled > Independent
+(No-Context tests if model relies on reference context or prior Q&A chain)
 """
 
 from __future__ import annotations
@@ -398,6 +400,113 @@ def run_oracle_gold(
     )
 
 
+def run_no_context(
+    samples: List[Dict[str, Any]],
+    client: LLMClient,
+) -> ExperimentResult:
+    """No-Context condition: Sequential order with prior Q&A but NO reference context.
+
+    - Answer sub-questions in correct order
+    - Pass prior Q&A as context (with predicted answers)
+    - NO supporting paragraphs (to test if model relies on context vs prior Q&A)
+    """
+    logger.info("Running No-Context condition (Sequential + Prior Q&A, No Reference)...")
+
+    total_correct = 0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_prompt_chars = 0
+    total_response_chars = 0
+
+    for sample in tqdm(samples, desc="No-Context"):
+        decomp = sample["decomposition"]
+        # NOTE: No context_str here - that's the key difference
+
+        # Build context with prior Q&A only
+        prior_qa = []
+        sample_correct = 0
+        sample_details = []
+
+        for i, step in enumerate(decomp):
+            sub_q = step["question"]
+            gold_answer = step["answer"]
+
+            # Build prompt with prior Q&A only (NO reference context)
+            prompt_parts = []
+
+            # Add prior Q&A
+            if prior_qa:
+                qa_context = "Previous Q&A:\n" + "\n".join(
+                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
+                )
+                prompt_parts.append(qa_context)
+                prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            else:
+                prompt_parts.append(f"Q: {sub_q}\nA:")
+
+            prompt = "\n\n".join(prompt_parts)
+
+            pred, response = client.generate(prompt, max_tokens=128)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+            total_prompt_chars += len(prompt)
+            total_response_chars += len(pred)
+
+            # Evaluate this sub-question
+            is_correct = _evaluate_answer(pred, gold_answer)
+            if is_correct:
+                total_correct += 1
+                sample_correct += 1
+            total_questions += 1
+
+            sample_details.append({
+                "sub_id": i,
+                "question": sub_q,
+                "gold_answer": gold_answer,
+                "prediction": pred.strip(),
+                "correct": is_correct,
+                "prompt_len": len(prompt),
+                "response_len": len(pred),
+            })
+
+            # Pass predicted answer to next step
+            prior_qa.append((sub_q, pred.strip()))
+
+        details.append({
+            "main_question": sample["question"],
+            "n_hops": sample["n_hops"],
+            "sub_questions": sample_details,
+            "accuracy": sample_correct / len(decomp) if decomp else 0,
+        })
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_prompt_len = total_prompt_chars / total_questions if total_questions > 0 else 0
+    avg_response_len = total_response_chars / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="no_context",
+        dataset="morehopqa",
+        n_samples=len(samples),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={
+            "sub_question_accuracy": accuracy,
+            "avg_prompt_len": avg_prompt_len,
+            "avg_response_len": avg_response_len,
+            "total_prompt_chars": total_prompt_chars,
+            "total_response_chars": total_response_chars,
+        },
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
 def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
@@ -649,8 +758,8 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="oracle,oracle_gold,independent,shuffled",
-        help="Comma-separated list of conditions to run (oracle, oracle_gold, independent, shuffled)"
+        "--conditions", type=str, default="oracle,oracle_gold,no_context,independent,shuffled",
+        help="Comma-separated list of conditions to run (oracle, oracle_gold, no_context, independent, shuffled)"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
@@ -688,19 +797,33 @@ def main():
 
     # Run conditions on local shard
     conditions = [c.strip() for c in args.conditions.split(",")]
+    logger.info(f"Rank {rank}: conditions to run: {conditions}, samples: {len(samples)}")
     local_results = []
 
     if "oracle" in conditions:
+        logger.info(f"Rank {rank}: starting oracle condition...")
         local_results.append(run_oracle(samples, client))
+        logger.info(f"Rank {rank}: oracle done")
 
     if "oracle_gold" in conditions:
+        logger.info(f"Rank {rank}: starting oracle_gold condition...")
         local_results.append(run_oracle_gold(samples, client))
+        logger.info(f"Rank {rank}: oracle_gold done")
+
+    if "no_context" in conditions:
+        logger.info(f"Rank {rank}: starting no_context condition...")
+        local_results.append(run_no_context(samples, client))
+        logger.info(f"Rank {rank}: no_context done")
 
     if "independent" in conditions:
+        logger.info(f"Rank {rank}: starting independent condition...")
         local_results.append(run_independent(samples, client))
+        logger.info(f"Rank {rank}: independent done")
 
     if "shuffled" in conditions:
+        logger.info(f"Rank {rank}: starting shuffled condition...")
         local_results.append(run_shuffled(samples, client, seed=args.seed))
+        logger.info(f"Rank {rank}: shuffled done")
 
     # Gather results from all GPUs
     all_results_by_condition = {}

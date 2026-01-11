@@ -114,26 +114,33 @@ class LLMClient:
 
     def _init_vllm_model(self, model: str, tensor_parallel_size: int):
         """Initialize model with vLLM for fast multi-GPU inference."""
-        try:
-            from vllm import LLM, SamplingParams
-        except ImportError:
-            raise ImportError("Please install vllm: pip install vllm")
-
         import time
 
         # Get local rank for staggered startup
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-        # Staggered startup to avoid NCCL conflicts when multiple processes init vLLM
+        # For data parallelism (each process has its own model on its own GPU),
+        # set CUDA_VISIBLE_DEVICES BEFORE importing vLLM to avoid multi-process conflicts
         if world_size > 1 and tensor_parallel_size == 1:
-            startup_delay = local_rank * 5  # 5 seconds between each process
+            # Each process only sees its own GPU
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+            logger.info(f"Rank {local_rank}: set CUDA_VISIBLE_DEVICES={local_rank}")
+
+            # Staggered startup to avoid conflicts
+            startup_delay = local_rank * 10  # 10 seconds between each process
             logger.info(f"Rank {local_rank}: waiting {startup_delay}s for staggered vLLM startup...")
             time.sleep(startup_delay)
 
+        # Import vLLM AFTER setting CUDA_VISIBLE_DEVICES
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError:
+            raise ImportError("Please install vllm: pip install vllm")
+
         logger.info(f"Loading model with vLLM: {model} (tensor_parallel_size={tensor_parallel_size})")
 
-        # When using data parallelism (each process has its own model), enforce_eager helps with startup
+        # When using data parallelism, enforce_eager helps with startup
         self._vllm_model = LLM(
             model=model,
             tensor_parallel_size=tensor_parallel_size,
