@@ -48,30 +48,74 @@ def load_morehopqa(n_samples: int = 100, seed: int = 42) -> List[Dict[str, Any]]
     Each sample contains:
     - question: The main question
     - answer: The final answer
-    - question_decomposition: List of {question, answer} for sub-questions
+    - decomposition: List of {question, answer} for sub-questions
     """
     logger.info("Loading MoreHopQA dataset...")
 
-    try:
-        # Try loading from HuggingFace
-        dataset = load_dataset("alabnii/morehopqa", split="train", trust_remote_code=True)
-    except Exception as e:
-        logger.warning(f"Failed to load from HuggingFace: {e}")
-        logger.info("Trying alternative loading method...")
-        # Fallback: load from local or use sample data
-        dataset = load_dataset("json", data_files="data/morehopqa.json", split="train")
-
-    # Filter samples with valid decomposition
     valid_samples = []
-    for item in dataset:
-        decomp = item.get("question_decomposition", [])
-        if decomp and len(decomp) >= 2:
-            valid_samples.append({
-                "question": item["question"],
-                "answer": item["answer"],
-                "decomposition": decomp,
-                "n_hops": len(decomp),
-            })
+
+    # Download raw JSON directly from HuggingFace Hub
+    try:
+        from huggingface_hub import hf_hub_download
+        import json as json_module
+
+        logger.info("Downloading MoreHopQA from HuggingFace Hub...")
+        file_path = hf_hub_download(
+            repo_id="alabnii/morehopqa",
+            filename="data/with_human_verification.json",
+            repo_type="dataset",
+        )
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json_module.load(f)
+
+        for item in data:
+            decomp = item.get("question_decomposition", [])
+            if decomp and len(decomp) >= 2:
+                valid_samples.append({
+                    "question": item["question"],
+                    "answer": item["answer"],
+                    "decomposition": decomp,
+                    "n_hops": len(decomp),
+                })
+
+        logger.info(f"Loaded {len(valid_samples)} samples from MoreHopQA")
+
+    except Exception as e:
+        logger.warning(f"Failed to load MoreHopQA: {e}")
+        logger.info("Falling back to HotpotQA...")
+
+        # Fallback to HotpotQA
+        dataset = load_dataset("hotpot_qa", "distractor", split="validation", trust_remote_code=True)
+
+        for item in dataset:
+            # Use supporting facts to create decomposition
+            sf = item.get("supporting_facts", {})
+            titles = sf.get("title", [])
+            sent_ids = sf.get("sent_id", [])
+
+            if len(set(titles)) >= 2:  # At least 2 different sources
+                context_dict = {t: s for t, s in zip(item["context"]["title"], item["context"]["sentences"])}
+                decomp = []
+                seen_titles = set()
+                for title, sid in zip(titles, sent_ids):
+                    if title not in seen_titles and title in context_dict:
+                        sents = context_dict[title]
+                        if sid < len(sents):
+                            decomp.append({
+                                "question": f"What information about {title} is relevant?",
+                                "answer": sents[sid],
+                            })
+                            seen_titles.add(title)
+
+                if len(decomp) >= 2:
+                    valid_samples.append({
+                        "question": item["question"],
+                        "answer": item["answer"],
+                        "decomposition": decomp,
+                        "n_hops": len(decomp),
+                    })
+
+        logger.info(f"Loaded {len(valid_samples)} samples from HotpotQA (fallback)")
 
     # Shuffle and sample
     random.seed(seed)

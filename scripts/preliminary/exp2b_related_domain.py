@@ -64,7 +64,7 @@ def load_math_by_domain(
     """
     logger.info("Loading MATH dataset...")
 
-    dataset = load_dataset("lighteval/MATH", split="test", trust_remote_code=True)
+    dataset = load_dataset("EleutherAI/hendrycks_math", "all", split="test", trust_remote_code=True)
 
     # Group by domain (type field in MATH)
     domain_questions = defaultdict(list)
