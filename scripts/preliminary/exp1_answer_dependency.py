@@ -228,7 +228,7 @@ def run_oracle(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=128)
+            pred, response = client.generate(prompt, max_tokens=2048)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -338,7 +338,7 @@ def run_oracle_gold(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=128)
+            pred, response = client.generate(prompt, max_tokens=2048)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -445,7 +445,7 @@ def run_no_context(
 
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=128)
+            pred, response = client.generate(prompt, max_tokens=2048)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -506,13 +506,15 @@ def run_no_context(
 def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    batch_size: int = 16,
 ) -> ExperimentResult:
     """Independent condition: Each sub-question answered independently.
 
     - No prior Q&A context
     - Still include supporting paragraphs
+    - Uses batch inference for efficiency
     """
-    logger.info("Running Independent condition (No Context)...")
+    logger.info(f"Running Independent condition (No Context, batch_size={batch_size})...")
 
     total_correct = 0
     total_questions = 0
@@ -523,12 +525,13 @@ def run_independent(
     total_prompt_chars = 0
     total_response_chars = 0
 
-    for sample in tqdm(samples, desc="Independent"):
+    # Collect all prompts and metadata for batch processing
+    all_prompts = []
+    all_metadata = []  # (sample_idx, sub_idx, sub_q, gold_answer, context_str)
+
+    for sample_idx, sample in enumerate(samples):
         decomp = sample["decomposition"]
         context_str = _format_context(sample.get("context", []))
-
-        sample_correct = 0
-        sample_details = []
 
         for i, step in enumerate(decomp):
             sub_q = step["question"]
@@ -536,21 +539,45 @@ def run_independent(
 
             # Build prompt with context only (no prior Q&A)
             prompt_parts = []
-
             if context_str:
                 prompt_parts.append(f"Reference Information:\n{context_str}")
-
             prompt_parts.append(f"Answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=128)
+            all_prompts.append(prompt)
+            all_metadata.append((sample_idx, i, sub_q, gold_answer))
+
+    # Process in batches
+    all_results = []
+    for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc="Independent"):
+        batch_prompts = all_prompts[batch_start:batch_start + batch_size]
+        batch_results = client.generate_batch(batch_prompts, max_tokens=2048)
+        all_results.extend(batch_results)
+
+    # Organize results by sample
+    sample_results = {}  # sample_idx -> list of (sub_idx, sub_q, gold_answer, pred, response)
+    for idx, (pred, response) in enumerate(all_results):
+        sample_idx, sub_idx, sub_q, gold_answer = all_metadata[idx]
+        if sample_idx not in sample_results:
+            sample_results[sample_idx] = []
+        sample_results[sample_idx].append((sub_idx, sub_q, gold_answer, pred, response, all_prompts[idx]))
+
+    # Evaluate and build details
+    for sample_idx, sample in enumerate(samples):
+        decomp = sample["decomposition"]
+        sample_correct = 0
+        sample_details = []
+
+        results = sample_results.get(sample_idx, [])
+        results.sort(key=lambda x: x[0])  # Sort by sub_idx
+
+        for sub_idx, sub_q, gold_answer, pred, response, prompt in results:
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
             total_prompt_chars += len(prompt)
             total_response_chars += len(pred)
 
-            # Evaluate this sub-question
             is_correct = _evaluate_answer(pred, gold_answer)
             if is_correct:
                 total_correct += 1
@@ -558,7 +585,7 @@ def run_independent(
             total_questions += 1
 
             sample_details.append({
-                "sub_id": i,
+                "sub_id": sub_idx,
                 "question": sub_q,
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
@@ -658,7 +685,7 @@ def run_shuffled(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=128)
+            pred, response = client.generate(prompt, max_tokens=2048)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
