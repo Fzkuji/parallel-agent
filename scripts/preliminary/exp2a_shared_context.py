@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_squad_groups(
-    n_groups: int = 100,
+    n_groups: int = -1,
     min_questions: int = 3,
     max_questions: int = 6,
     seed: int = 42,
@@ -84,7 +84,10 @@ def load_squad_groups(
     # Shuffle and sample
     random.seed(seed)
     random.shuffle(valid_groups)
-    groups = valid_groups[:n_groups]
+    if n_groups > 0:
+        groups = valid_groups[:n_groups]
+    else:
+        groups = valid_groups  # Use all groups
 
     logger.info(f"Loaded {len(groups)} groups with {min_questions}-{max_questions} questions each")
 
@@ -490,8 +493,8 @@ def main():
         help="Number of GPUs for tensor parallelism (vLLM only)"
     )
     parser.add_argument(
-        "--n-groups", type=int, default=100,
-        help="Number of context groups to evaluate"
+        "--n-groups", type=int, default=-1,
+        help="Number of context groups to evaluate (-1 for all)"
     )
     parser.add_argument(
         "--min-questions", type=int, default=3,

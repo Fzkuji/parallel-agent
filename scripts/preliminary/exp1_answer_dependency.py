@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def load_morehopqa(n_samples: int = 100, seed: int = 42) -> List[Dict[str, Any]]:
+def load_morehopqa(n_samples: int = -1, seed: int = 42) -> List[Dict[str, Any]]:
     """Load MoreHopQA dataset.
 
     Each sample contains:
@@ -126,7 +126,10 @@ def load_morehopqa(n_samples: int = 100, seed: int = 42) -> List[Dict[str, Any]]
     # Shuffle and sample
     random.seed(seed)
     random.shuffle(valid_samples)
-    samples = valid_samples[:n_samples]
+    if n_samples > 0:
+        samples = valid_samples[:n_samples]
+    else:
+        samples = valid_samples  # Use all samples
 
     logger.info(f"Loaded {len(samples)} samples with valid decomposition")
     logger.info(f"Hop distribution: {_count_hops(samples)}")
@@ -481,8 +484,8 @@ def main():
         help="Number of GPUs for tensor parallelism (vLLM only)"
     )
     parser.add_argument(
-        "--n-samples", type=int, default=100,
-        help="Number of samples to evaluate"
+        "--n-samples", type=int, default=-1,
+        help="Number of samples to evaluate (-1 for all)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,

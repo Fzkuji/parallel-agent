@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_arc_challenge(
-    n_samples: int = 200,
+    n_samples: int = -1,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Load ARC-Challenge dataset.
@@ -88,7 +88,9 @@ def load_arc_challenge(
     # Shuffle and sample
     random.seed(seed)
     random.shuffle(samples)
-    samples = samples[:n_samples]
+    if n_samples > 0:
+        samples = samples[:n_samples]
+    # else: use all samples
 
     logger.info(f"Loaded {len(samples)} ARC-Challenge questions")
 
@@ -96,7 +98,7 @@ def load_arc_challenge(
 
 
 def load_open_ended_questions(
-    n_samples: int = 100,
+    n_samples: int = -1,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Load open-ended questions (SQuAD) for mixing with choice questions."""
@@ -116,7 +118,9 @@ def load_open_ended_questions(
     random.seed(seed)
     random.shuffle(samples)
 
-    return samples[:n_samples]
+    if n_samples > 0:
+        return samples[:n_samples]
+    return samples  # Use all samples
 
 
 def _format_choice_prompt(question: str, choices: str) -> str:
@@ -577,12 +581,12 @@ def main():
         help="Number of GPUs for tensor parallelism (vLLM only)"
     )
     parser.add_argument(
-        "--n-samples", type=int, default=200,
-        help="Number of choice samples to evaluate"
+        "--n-samples", type=int, default=-1,
+        help="Number of choice samples to evaluate (-1 for all)"
     )
     parser.add_argument(
-        "--n-open-samples", type=int, default=100,
-        help="Number of open-ended samples for mixing"
+        "--n-open-samples", type=int, default=-1,
+        help="Number of open-ended samples for mixing (-1 for all)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,

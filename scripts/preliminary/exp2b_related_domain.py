@@ -58,7 +58,7 @@ MATH_DOMAINS = [
 
 
 def load_math_by_domain(
-    n_per_domain: int = 50,
+    n_per_domain: int = -1,
     seed: int = 42,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, List[int]]]:
     """Load MATH dataset grouped by domain.
@@ -91,7 +91,7 @@ def load_math_by_domain(
 
     for domain in MATH_DOMAINS:
         questions = domain_questions.get(domain, [])
-        if len(questions) > n_per_domain:
+        if n_per_domain > 0 and len(questions) > n_per_domain:
             questions = random.sample(questions, n_per_domain)
 
         start_idx = len(all_questions)
@@ -450,8 +450,8 @@ def main():
         help="Number of GPUs for tensor parallelism (vLLM only)"
     )
     parser.add_argument(
-        "--n-per-domain", type=int, default=50,
-        help="Number of questions per domain"
+        "--n-per-domain", type=int, default=-1,
+        help="Number of questions per domain (-1 for all)"
     )
     parser.add_argument(
         "--batch-size", type=int, default=4,
