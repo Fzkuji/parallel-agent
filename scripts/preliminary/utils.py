@@ -121,18 +121,22 @@ class LLMClient:
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 
         # For data parallelism (each process has its own model on its own GPU),
-        # set CUDA_VISIBLE_DEVICES BEFORE importing vLLM to avoid multi-process conflicts
+        # configure environment BEFORE importing vLLM
         if world_size > 1 and tensor_parallel_size == 1:
             # Each process only sees its own GPU
             os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
-            logger.info(f"Rank {local_rank}: set CUDA_VISIBLE_DEVICES={local_rank}")
+            # Disable vLLM's multiprocessing to avoid conflicts with torchrun
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            # Use V0 engine which is simpler and doesn't spawn EngineCore processes
+            os.environ["VLLM_USE_V1"] = "0"
+            logger.info(f"Rank {local_rank}: set CUDA_VISIBLE_DEVICES={local_rank}, using V0 engine")
 
             # Staggered startup to avoid conflicts
-            startup_delay = local_rank * 10  # 10 seconds between each process
+            startup_delay = local_rank * 15  # 15 seconds between each process
             logger.info(f"Rank {local_rank}: waiting {startup_delay}s for staggered vLLM startup...")
             time.sleep(startup_delay)
 
-        # Import vLLM AFTER setting CUDA_VISIBLE_DEVICES
+        # Import vLLM AFTER setting environment variables
         try:
             from vllm import LLM, SamplingParams
         except ImportError:
