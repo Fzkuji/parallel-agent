@@ -775,6 +775,8 @@ def worker_process(
     os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
     # Disable vLLM progress bar
     os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
+    # Disable tqdm globally
+    os.environ["TQDM_DISABLE"] = "1"
 
     logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(samples)} samples")
 
