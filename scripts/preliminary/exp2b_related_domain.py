@@ -64,19 +64,21 @@ def load_math_by_domain(
     """
     logger.info("Loading MATH dataset...")
 
-    dataset = load_dataset("EleutherAI/hendrycks_math", "all", split="test", trust_remote_code=True)
-
-    # Group by domain (type field in MATH)
+    # Load each domain separately
     domain_questions = defaultdict(list)
-    for item in dataset:
-        domain = item.get("type", "unknown").lower().replace(" ", "_")
-        if domain in MATH_DOMAINS:
-            domain_questions[domain].append({
-                "problem": item["problem"],
-                "solution": item["solution"],
-                "level": item.get("level", "unknown"),
-                "domain": domain,
-            })
+    for domain in MATH_DOMAINS:
+        try:
+            dataset = load_dataset("EleutherAI/hendrycks_math", domain, split="test", trust_remote_code=True)
+            for item in dataset:
+                domain_questions[domain].append({
+                    "problem": item["problem"],
+                    "solution": item["solution"],
+                    "level": item.get("level", "unknown"),
+                    "domain": domain,
+                })
+            logger.info(f"  Loaded {len(domain_questions[domain])} from {domain}")
+        except Exception as e:
+            logger.warning(f"Failed to load {domain}: {e}")
 
     # Sample from each domain
     random.seed(seed)
