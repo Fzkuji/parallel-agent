@@ -228,7 +228,7 @@ def run_oracle(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=2048)
+            pred, response = client.generate(prompt, max_tokens=256)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -338,7 +338,7 @@ def run_oracle_gold(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=2048)
+            pred, response = client.generate(prompt, max_tokens=256)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -445,7 +445,7 @@ def run_no_context(
 
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=2048)
+            pred, response = client.generate(prompt, max_tokens=256)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -551,7 +551,7 @@ def run_independent(
     all_results = []
     for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc="Independent"):
         batch_prompts = all_prompts[batch_start:batch_start + batch_size]
-        batch_results = client.generate_batch(batch_prompts, max_tokens=2048)
+        batch_results = client.generate_batch(batch_prompts, max_tokens=256)
         all_results.extend(batch_results)
 
     # Organize results by sample
@@ -685,7 +685,7 @@ def run_shuffled(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=2048)
+            pred, response = client.generate(prompt, max_tokens=256)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
