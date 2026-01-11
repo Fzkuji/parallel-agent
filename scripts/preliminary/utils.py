@@ -457,23 +457,48 @@ def save_results(
 
 
 def print_summary(results: List[ExperimentResult]) -> None:
-    """Print summary of experiment results."""
+    """Print summary of experiment results as markdown table."""
     print("\n" + "=" * 60)
     print("EXPERIMENT SUMMARY")
-    print("=" * 60)
+    print("=" * 60 + "\n")
 
+    if not results:
+        print("No results to display.")
+        return
+
+    # Collect all unique metric keys across results
+    all_metric_keys = set()
     for result in results:
-        print(f"\n{result.condition.upper()}:")
-        print(f"  Accuracy: {result.accuracy:.4f}")
-        print(f"  Samples: {result.n_samples}")
-        print(f"  Questions: {result.n_questions}")
-        if result.latency > 0:
-            print(f"  Latency: {result.latency:.2f}s")
-        for metric, value in result.metrics.items():
-            if isinstance(value, int) or (isinstance(value, float) and value > 1000):
-                print(f"  {metric}: {value:.0f}")
+        all_metric_keys.update(result.metrics.keys())
+    metric_keys = sorted(all_metric_keys)
+
+    # Build header
+    headers = ["Condition", "Accuracy", "Samples", "Questions", "Latency (s)"]
+    headers.extend(metric_keys)
+
+    # Print markdown table header
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    # Print each result row
+    for result in results:
+        row = [
+            result.condition.capitalize(),
+            f"{result.accuracy:.4f}",
+            str(result.n_samples),
+            str(result.n_questions),
+            f"{result.latency:.2f}" if result.latency > 0 else "-",
+        ]
+        # Add metric values
+        for key in metric_keys:
+            value = result.metrics.get(key, "-")
+            if value == "-":
+                row.append("-")
+            elif isinstance(value, int) or (isinstance(value, float) and value > 1000):
+                row.append(f"{value:.0f}")
             else:
-                print(f"  {metric}: {value:.4f}")
+                row.append(f"{value:.4f}")
+        print("| " + " | ".join(row) + " |")
 
     print("\n" + "=" * 60)
 
