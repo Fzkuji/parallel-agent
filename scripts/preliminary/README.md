@@ -16,13 +16,14 @@
 
 ### Exp 1: Answer Dependency (语义-强)
 
-- **Dataset**: MoreHopQA (3-5 hop reasoning)
+- **Dataset**: MoreHopQA (3-5 hop reasoning, 含 gold sub-questions/sub-answers 和 context)
 - **RQ**: 按依赖顺序回答并传递前序答案是否提升多步推理性能？
 - **Setup**:
-  - Oracle: 按 question_decomposition 顺序，传递前序 sub-answers
-  - Method: LLM 检测依赖关系，按检测顺序回答
-  - Random: 打乱子问题顺序，不传递前序答案
-- **预期**: Random 性能接近 0（推理链断裂），Method 接近 Oracle
+  - Oracle (Sequential + Context): 按 question_decomposition 顺序回答，传递前序 Q&A，包含支持段落
+  - Independent (No Context): 每个子问题独立回答，不传递前序 Q&A，仅包含支持段落
+  - Shuffled (Random Order + Context): 打乱顺序回答，传递前序 Q&A（错误顺序），包含支持段落
+- **评估**: 所有子问题的准确率（不只是最后一个）
+- **预期**: Oracle > Shuffled > Independent（传递正确上下文最优，错误上下文次之，无上下文最差）
 
 ### Exp 2a: Shared Context (语义-中)
 
@@ -93,7 +94,7 @@ python scripts/preliminary/exp1_answer_dependency.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --use-local \
     --n-samples 50 \
-    --conditions oracle,method,random
+    --conditions oracle,independent,shuffled
 
 # Exp 2a: Shared Context
 python scripts/preliminary/exp2a_shared_context.py \

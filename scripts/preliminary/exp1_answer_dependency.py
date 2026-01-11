@@ -3,15 +3,15 @@
 
 Dataset: MoreHopQA (3-5 hop reasoning with gold sub-questions and sub-answers)
 
-Research Question: Does answering questions in dependency order with prior answers
+Research Question: Does answering questions in correct order with prior context
 improve multi-step reasoning performance?
 
 Conditions:
-- Oracle: Follow question_decomposition order, pass prior sub-answers
-- Method: LLM detects dependencies, answers in detected order
-- Random: Shuffle sub-questions, no prior answer passing
+- Oracle (Sequential + Context): Follow decomposition order, pass prior Q&A with context
+- Independent (No Context): Answer each sub-question independently, no prior info
+- Shuffled (Random Order + Context): Random order but still pass prior Q&A
 
-Expected: Random ≈ 0 (reasoning chain breaks), Method ≈ Oracle
+Expected: Oracle > Shuffled > Independent
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ from utils import (
     compute_contains,
     print_summary,
     save_results,
-    topological_sort,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -48,7 +47,8 @@ def load_morehopqa(n_samples: int = 100, seed: int = 42) -> List[Dict[str, Any]]
     Each sample contains:
     - question: The main question
     - answer: The final answer
-    - decomposition: List of {question, answer} for sub-questions
+    - decomposition: List of {question, answer, paragraph_support_title} for sub-questions
+    - context: List of [title, [sentences...]] for supporting paragraphs
     """
     logger.info("Loading MoreHopQA dataset...")
 
@@ -70,11 +70,13 @@ def load_morehopqa(n_samples: int = 100, seed: int = 42) -> List[Dict[str, Any]]
 
         for item in data:
             decomp = item.get("question_decomposition", [])
+            context = item.get("context", [])
             if decomp and len(decomp) >= 2:
                 valid_samples.append({
                     "question": item["question"],
                     "answer": item["answer"],
                     "decomposition": decomp,
+                    "context": context,
                     "n_hops": len(decomp),
                 })
 
@@ -104,14 +106,18 @@ def load_morehopqa(n_samples: int = 100, seed: int = 42) -> List[Dict[str, Any]]
                             decomp.append({
                                 "question": f"What information about {title} is relevant?",
                                 "answer": sents[sid],
+                                "paragraph_support_title": title,
                             })
                             seen_titles.add(title)
 
                 if len(decomp) >= 2:
+                    # Build context in MoreHopQA format
+                    context = [[t, s] for t, s in zip(item["context"]["title"], item["context"]["sentences"])]
                     valid_samples.append({
                         "question": item["question"],
                         "answer": item["answer"],
                         "decomposition": decomp,
+                        "context": context,
                         "n_hops": len(decomp),
                     })
 
@@ -137,15 +143,51 @@ def _count_hops(samples: List[Dict]) -> Dict[int, int]:
     return dict(sorted(counts.items()))
 
 
+def _format_context(context: List[List]) -> str:
+    """Format context paragraphs into a string."""
+    if not context:
+        return ""
+
+    parts = []
+    for item in context:
+        if len(item) >= 2:
+            title = item[0]
+            sentences = item[1]
+            if isinstance(sentences, list):
+                text = " ".join(sentences)
+            else:
+                text = str(sentences)
+            parts.append(f"[{title}]: {text}")
+
+    return "\n".join(parts)
+
+
+def _evaluate_answer(pred: str, gold: str) -> bool:
+    """Evaluate if prediction matches gold answer."""
+    pred = pred.strip().lower()
+    gold = gold.strip().lower()
+
+    # Exact match
+    if pred == gold or gold in pred:
+        return True
+
+    # Use contains metric
+    return compute_contains(pred, gold) > 0
+
+
 def run_oracle(
     samples: List[Dict[str, Any]],
     client: LLMClient,
 ) -> ExperimentResult:
-    """Oracle condition: Follow gold decomposition order, pass prior answers."""
-    logger.info("Running Oracle condition...")
+    """Oracle condition: Sequential order with prior Q&A context.
 
-    correct = 0
-    total = 0
+    - Answer sub-questions in correct order
+    - Pass prior Q&A as context
+    - Include supporting paragraphs
+    """
+    logger.info("Running Oracle condition (Sequential + Context)...")
+
+    total_correct = 0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -154,59 +196,73 @@ def run_oracle(
 
     for sample in tqdm(samples, desc="Oracle"):
         decomp = sample["decomposition"]
-        gold_answer = sample["answer"]
+        context_str = _format_context(sample.get("context", []))
 
         # Build context with prior Q&A
         prior_qa = []
-        final_pred = None
+        sample_correct = 0
+        sample_details = []
 
         for i, step in enumerate(decomp):
             sub_q = step["question"]
-            sub_a = step["answer"]
+            gold_answer = step["answer"]
 
-            # Build prompt with prior answers
+            # Build prompt with context and prior Q&A
+            prompt_parts = []
+
+            # Add supporting context
+            if context_str:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
+
+            # Add prior Q&A
             if prior_qa:
-                context = "Previous Q&A:\n" + "\n".join(
+                qa_context = "Previous Q&A:\n" + "\n".join(
                     [f"Q: {q}\nA: {a}" for q, a in prior_qa]
                 )
-                prompt = f"{context}\n\nNow answer this question:\nQ: {sub_q}\nA:"
-            else:
-                prompt = f"Answer this question:\nQ: {sub_q}\nA:"
+                prompt_parts.append(qa_context)
 
-            # For Oracle, we use gold sub-answers to pass forward
-            # But still generate to measure the process
+            prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            prompt = "\n\n".join(prompt_parts)
+
             pred, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            # Use gold answer for next step (Oracle condition)
-            prior_qa.append((sub_q, sub_a))
-            final_pred = pred
+            # Evaluate this sub-question
+            is_correct = _evaluate_answer(pred, gold_answer)
+            if is_correct:
+                total_correct += 1
+                sample_correct += 1
             total_questions += 1
 
-        # Evaluate final answer
-        is_correct = compute_contains(final_pred, gold_answer) > 0
-        correct += int(is_correct)
-        total += 1
+            sample_details.append({
+                "sub_id": i,
+                "question": sub_q,
+                "gold_answer": gold_answer,
+                "prediction": pred.strip(),
+                "correct": is_correct,
+            })
+
+            # Pass predicted answer (not gold) to next step
+            prior_qa.append((sub_q, pred.strip()))
 
         details.append({
-            "question": sample["question"],
-            "gold_answer": gold_answer,
-            "prediction": final_pred,
-            "correct": is_correct,
+            "main_question": sample["question"],
             "n_hops": sample["n_hops"],
+            "sub_questions": sample_details,
+            "accuracy": sample_correct / len(decomp) if decomp else 0,
         })
 
-    accuracy = correct / total if total > 0 else 0
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="oracle",
         dataset="morehopqa",
-        n_samples=total,
+        n_samples=len(samples),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"exact_match": accuracy},
+        metrics={"sub_question_accuracy": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -214,84 +270,80 @@ def run_oracle(
     )
 
 
-def run_method(
+def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
 ) -> ExperimentResult:
-    """Method condition: LLM detects dependencies, answers in detected order."""
-    logger.info("Running Method (LLM-based) condition...")
+    """Independent condition: Each sub-question answered independently.
 
-    correct = 0
-    total = 0
+    - No prior Q&A context
+    - Still include supporting paragraphs
+    """
+    logger.info("Running Independent condition (No Context)...")
+
+    total_correct = 0
     total_questions = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for sample in tqdm(samples, desc="Method"):
+    for sample in tqdm(samples, desc="Independent"):
         decomp = sample["decomposition"]
-        gold_answer = sample["answer"]
-        questions = [step["question"] for step in decomp]
+        context_str = _format_context(sample.get("context", []))
 
-        # Step 1: LLM detects dependencies
-        dependencies = client.detect_dependencies(questions)
+        sample_correct = 0
+        sample_details = []
 
-        # Step 2: Topological sort based on detected dependencies
-        order = topological_sort(len(questions), dependencies)
+        for i, step in enumerate(decomp):
+            sub_q = step["question"]
+            gold_answer = step["answer"]
 
-        # Step 3: Answer in detected order, passing predictions
-        prior_qa = []
-        predictions = {}
+            # Build prompt with context only (no prior Q&A)
+            prompt_parts = []
 
-        for idx in order:
-            sub_q = questions[idx]
+            if context_str:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
 
-            # Build prompt with prior answers
-            if prior_qa:
-                context = "Previous Q&A:\n" + "\n".join(
-                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
-                )
-                prompt = f"{context}\n\nNow answer this question:\nQ: {sub_q}\nA:"
-            else:
-                prompt = f"Answer this question:\nQ: {sub_q}\nA:"
+            prompt_parts.append(f"Answer this question:\nQ: {sub_q}\nA:")
+            prompt = "\n\n".join(prompt_parts)
 
             pred, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            predictions[idx] = pred
-            prior_qa.append((sub_q, pred))
+            # Evaluate this sub-question
+            is_correct = _evaluate_answer(pred, gold_answer)
+            if is_correct:
+                total_correct += 1
+                sample_correct += 1
             total_questions += 1
 
-        # Final prediction is the last one in original order
-        final_pred = predictions.get(len(questions) - 1, "")
-
-        # Evaluate final answer
-        is_correct = compute_contains(final_pred, gold_answer) > 0
-        correct += int(is_correct)
-        total += 1
+            sample_details.append({
+                "sub_id": i,
+                "question": sub_q,
+                "gold_answer": gold_answer,
+                "prediction": pred.strip(),
+                "correct": is_correct,
+            })
 
         details.append({
-            "question": sample["question"],
-            "gold_answer": gold_answer,
-            "prediction": final_pred,
-            "correct": is_correct,
+            "main_question": sample["question"],
             "n_hops": sample["n_hops"],
-            "detected_deps": dependencies,
-            "order": order,
+            "sub_questions": sample_details,
+            "accuracy": sample_correct / len(decomp) if decomp else 0,
         })
 
-    accuracy = correct / total if total > 0 else 0
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="method",
+        condition="independent",
         dataset="morehopqa",
-        n_samples=total,
+        n_samples=len(samples),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"exact_match": accuracy},
+        metrics={"sub_question_accuracy": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -299,76 +351,108 @@ def run_method(
     )
 
 
-def run_random(
+def run_shuffled(
     samples: List[Dict[str, Any]],
     client: LLMClient,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Random condition: Shuffle questions, no prior answer passing."""
-    logger.info("Running Random condition...")
+    """Shuffled condition: Random order but with prior Q&A context.
+
+    - Answer sub-questions in random order
+    - Pass prior Q&A as context (but in wrong order)
+    - Include supporting paragraphs
+    """
+    logger.info("Running Shuffled condition (Random Order + Context)...")
 
     random.seed(seed)
 
-    correct = 0
-    total = 0
+    total_correct = 0
     total_questions = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for sample in tqdm(samples, desc="Random"):
+    for sample in tqdm(samples, desc="Shuffled"):
         decomp = sample["decomposition"]
-        gold_answer = sample["answer"]
-        questions = [step["question"] for step in decomp]
+        context_str = _format_context(sample.get("context", []))
 
         # Shuffle order
-        indices = list(range(len(questions)))
+        indices = list(range(len(decomp)))
         random.shuffle(indices)
 
-        # Answer in random order, NO prior answer passing
+        # Build context with prior Q&A (in shuffled order)
+        prior_qa = []
         predictions = {}
+        sample_correct = 0
+        sample_details = []
 
         for idx in indices:
-            sub_q = questions[idx]
+            step = decomp[idx]
+            sub_q = step["question"]
+            gold_answer = step["answer"]
 
-            # No context from prior answers
-            prompt = f"Answer this question:\nQ: {sub_q}\nA:"
+            # Build prompt with context and prior Q&A
+            prompt_parts = []
+
+            if context_str:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
+
+            if prior_qa:
+                qa_context = "Previous Q&A:\n" + "\n".join(
+                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
+                )
+                prompt_parts.append(qa_context)
+
+            prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            prompt = "\n\n".join(prompt_parts)
 
             pred, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            predictions[idx] = pred
+            predictions[idx] = pred.strip()
+
+            # Pass predicted answer to next step
+            prior_qa.append((sub_q, pred.strip()))
+
+        # Evaluate all sub-questions (in original order)
+        for i, step in enumerate(decomp):
+            gold_answer = step["answer"]
+            pred = predictions.get(i, "")
+
+            is_correct = _evaluate_answer(pred, gold_answer)
+            if is_correct:
+                total_correct += 1
+                sample_correct += 1
             total_questions += 1
 
-        # Final prediction is the last one in original order
-        final_pred = predictions.get(len(questions) - 1, "")
-
-        # Evaluate final answer
-        is_correct = compute_contains(final_pred, gold_answer) > 0
-        correct += int(is_correct)
-        total += 1
+            sample_details.append({
+                "sub_id": i,
+                "question": step["question"],
+                "gold_answer": gold_answer,
+                "prediction": pred,
+                "correct": is_correct,
+            })
 
         details.append({
-            "question": sample["question"],
-            "gold_answer": gold_answer,
-            "prediction": final_pred,
-            "correct": is_correct,
+            "main_question": sample["question"],
             "n_hops": sample["n_hops"],
-            "order": indices,
+            "shuffled_order": indices,
+            "sub_questions": sample_details,
+            "accuracy": sample_correct / len(decomp) if decomp else 0,
         })
 
-    accuracy = correct / total if total > 0 else 0
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="random",
+        condition="shuffled",
         dataset="morehopqa",
-        n_samples=total,
+        n_samples=len(samples),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"exact_match": accuracy},
+        metrics={"sub_question_accuracy": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -397,7 +481,7 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="oracle,method,random",
+        "--conditions", type=str, default="oracle,independent,shuffled",
         help="Comma-separated list of conditions to run"
     )
     parser.add_argument(
@@ -429,11 +513,11 @@ def main():
     if "oracle" in conditions:
         results.append(run_oracle(samples, client))
 
-    if "method" in conditions:
-        results.append(run_method(samples, client))
+    if "independent" in conditions:
+        results.append(run_independent(samples, client))
 
-    if "random" in conditions:
-        results.append(run_random(samples, client, seed=args.seed))
+    if "shuffled" in conditions:
+        results.append(run_shuffled(samples, client, seed=args.seed))
 
     # Print and save results
     print_summary(results)
