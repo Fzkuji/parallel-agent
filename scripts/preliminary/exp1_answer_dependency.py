@@ -7,11 +7,12 @@ Research Question: Does answering questions in correct order with prior context
 improve multi-step reasoning performance?
 
 Conditions:
-- Oracle (Sequential + Context): Follow decomposition order, pass prior Q&A with context
+- Oracle (Sequential + Pred Context): Follow decomposition order, pass prior Q&A with predicted answers
+- Oracle-Gold (Sequential + Gold Context): Follow decomposition order, pass prior Q&A with gold answers
 - Independent (No Context): Answer each sub-question independently, no prior info
 - Shuffled (Random Order + Context): Random order but still pass prior Q&A
 
-Expected: Oracle > Shuffled > Independent
+Expected: Oracle-Gold > Oracle > Shuffled > Independent
 """
 
 from __future__ import annotations
@@ -287,6 +288,116 @@ def run_oracle(
     )
 
 
+def run_oracle_gold(
+    samples: List[Dict[str, Any]],
+    client: LLMClient,
+) -> ExperimentResult:
+    """Oracle-Gold condition: Sequential order with gold answers as context.
+
+    - Answer sub-questions in correct order
+    - Pass gold answers (not predicted) as context
+    - Include supporting paragraphs
+    - This establishes upper bound to test error propagation hypothesis
+    """
+    logger.info("Running Oracle-Gold condition (Sequential + Gold Context)...")
+
+    total_correct = 0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_prompt_chars = 0
+    total_response_chars = 0
+
+    for sample in tqdm(samples, desc="Oracle-Gold"):
+        decomp = sample["decomposition"]
+        context_str = _format_context(sample.get("context", []))
+
+        # Build context with prior Q&A (using gold answers)
+        prior_qa = []
+        sample_correct = 0
+        sample_details = []
+
+        for i, step in enumerate(decomp):
+            sub_q = step["question"]
+            gold_answer = step["answer"]
+
+            # Build prompt with context and prior Q&A
+            prompt_parts = []
+
+            # Add supporting context
+            if context_str:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
+
+            # Add prior Q&A (with gold answers)
+            if prior_qa:
+                qa_context = "Previous Q&A:\n" + "\n".join(
+                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
+                )
+                prompt_parts.append(qa_context)
+
+            prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            prompt = "\n\n".join(prompt_parts)
+
+            pred, response = client.generate(prompt, max_tokens=128)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+            total_prompt_chars += len(prompt)
+            total_response_chars += len(pred)
+
+            # Evaluate this sub-question
+            is_correct = _evaluate_answer(pred, gold_answer)
+            if is_correct:
+                total_correct += 1
+                sample_correct += 1
+            total_questions += 1
+
+            sample_details.append({
+                "sub_id": i,
+                "question": sub_q,
+                "gold_answer": gold_answer,
+                "prediction": pred.strip(),
+                "correct": is_correct,
+                "prompt_len": len(prompt),
+                "response_len": len(pred),
+            })
+
+            # Pass gold answer (not predicted) to next step
+            prior_qa.append((sub_q, gold_answer))
+
+        details.append({
+            "main_question": sample["question"],
+            "n_hops": sample["n_hops"],
+            "sub_questions": sample_details,
+            "accuracy": sample_correct / len(decomp) if decomp else 0,
+        })
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_prompt_len = total_prompt_chars / total_questions if total_questions > 0 else 0
+    avg_response_len = total_response_chars / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="oracle_gold",
+        dataset="morehopqa",
+        n_samples=len(samples),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={
+            "sub_question_accuracy": accuracy,
+            "avg_prompt_len": avg_prompt_len,
+            "avg_response_len": avg_response_len,
+            "total_prompt_chars": total_prompt_chars,
+            "total_response_chars": total_response_chars,
+        },
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
 def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
@@ -538,8 +649,8 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="oracle,independent,shuffled",
-        help="Comma-separated list of conditions to run"
+        "--conditions", type=str, default="oracle,oracle_gold,independent,shuffled",
+        help="Comma-separated list of conditions to run (oracle, oracle_gold, independent, shuffled)"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
@@ -581,6 +692,9 @@ def main():
 
     if "oracle" in conditions:
         local_results.append(run_oracle(samples, client))
+
+    if "oracle_gold" in conditions:
+        local_results.append(run_oracle_gold(samples, client))
 
     if "independent" in conditions:
         local_results.append(run_independent(samples, client))
