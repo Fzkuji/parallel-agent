@@ -132,6 +132,7 @@ class LLMClient:
             dtype="half",
             gpu_memory_utilization=0.9,
             disable_log_stats=True,
+            disable_log_requests=True,
         )
         logger.info(f"vLLM model loaded with {tensor_parallel_size} GPU(s)")
 
@@ -243,7 +244,7 @@ class LLMClient:
         )
 
         start_time = time.perf_counter()
-        outputs = self._vllm_model.generate(full_prompts, sampling_params)
+        outputs = self._vllm_model.generate(full_prompts, sampling_params, use_tqdm=False)
         total_latency = time.perf_counter() - start_time
 
         results = []
