@@ -17,11 +17,9 @@ Expected: Oracle > Shuffled > Independent
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import random
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from datasets import load_dataset
 from tqdm import tqdm
@@ -30,8 +28,6 @@ from utils import (
     ExperimentConfig,
     ExperimentResult,
     LLMClient,
-    compute_exact_match,
-    compute_f1,
     compute_contains,
     print_summary,
     save_results,
