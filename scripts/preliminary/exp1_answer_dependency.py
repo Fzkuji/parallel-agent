@@ -729,7 +729,88 @@ def run_shuffled(
     )
 
 
+def worker_process(
+    rank: int,
+    world_size: int,
+    gpu_id: int,
+    model: str,
+    use_vllm: bool,
+    samples: List[Dict[str, Any]],
+    conditions: List[str],
+    seed: int,
+    output_dir: str,
+):
+    """Worker process that runs on a single GPU."""
+    import os
+    import json
+
+    # IMPORTANT: Set CUDA_VISIBLE_DEVICES BEFORE importing vLLM
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(samples)} samples")
+
+    # Initialize LLM client
+    client = LLMClient(
+        model=model,
+        use_local=True,
+        use_vllm=use_vllm,
+        tensor_parallel_size=1,
+    )
+
+    logger.info(f"[Worker {rank}] Model loaded, running conditions: {conditions}")
+
+    # Run conditions
+    results = []
+
+    if "oracle" in conditions:
+        logger.info(f"[Worker {rank}] Running oracle...")
+        results.append(run_oracle(samples, client))
+
+    if "oracle_gold" in conditions:
+        logger.info(f"[Worker {rank}] Running oracle_gold...")
+        results.append(run_oracle_gold(samples, client))
+
+    if "no_context" in conditions:
+        logger.info(f"[Worker {rank}] Running no_context...")
+        results.append(run_no_context(samples, client))
+
+    if "independent" in conditions:
+        logger.info(f"[Worker {rank}] Running independent...")
+        results.append(run_independent(samples, client))
+
+    if "shuffled" in conditions:
+        logger.info(f"[Worker {rank}] Running shuffled...")
+        results.append(run_shuffled(samples, client, seed=seed))
+
+    # Save results to temp file
+    os.makedirs(output_dir, exist_ok=True)
+    temp_file = os.path.join(output_dir, f"temp_rank{rank}.json")
+
+    # Convert results to serializable format
+    results_data = []
+    for r in results:
+        results_data.append({
+            "condition": r.condition,
+            "n_samples": r.n_samples,
+            "n_questions": r.n_questions,
+            "accuracy": r.accuracy,
+            "metrics": r.metrics,
+            "latency": r.latency,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "details": r.details,
+        })
+
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(results_data, f)
+
+    logger.info(f"[Worker {rank}] Done, saved to {temp_file}")
+
+
 def main():
+    import multiprocessing as mp
+    import json
+
     parser = argparse.ArgumentParser(
         description="Exp 1: Answer Dependency - MoreHopQA"
     )
@@ -744,10 +825,6 @@ def main():
     parser.add_argument(
         "--use-vllm", action="store_true",
         help="Use vLLM for faster inference (requires --use-local)"
-    )
-    parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1,
-        help="Number of GPUs for tensor parallelism (vLLM only)"
     )
     parser.add_argument(
         "--n-samples", type=int, default=-1,
@@ -765,82 +842,140 @@ def main():
         "--output-dir", type=str, default="outputs/preliminary",
         help="Output directory for results"
     )
+    # Parallel mode
+    parser.add_argument(
+        "--parallel", action="store_true",
+        help="Enable parallel inference with multiple GPUs"
+    )
+    parser.add_argument(
+        "--gpus", type=str, default="0,1,2,3,4,5,6,7",
+        help="Comma-separated list of GPUs for parallel mode"
+    )
     args = parser.parse_args()
 
-    # Setup distributed (each GPU loads one model)
-    rank, world_size = setup_distributed()
+    conditions = [c.strip() for c in args.conditions.split(",")]
 
-    # Configuration
-    config = ExperimentConfig(
-        exp_name="exp1_answer_dependency",
-        dataset="morehopqa",
-        model=args.model,
-        n_samples=args.n_samples,
-        seed=args.seed,
-        output_dir=args.output_dir,
-    )
-
-    # Load data (all ranks load the same data, then shard)
+    # Load data
     all_samples = load_morehopqa(n_samples=args.n_samples, seed=args.seed)
 
-    # Shard data across GPUs
-    samples = shard_data(all_samples, rank, world_size)
-    logger.info(f"Rank {rank}/{world_size}: processing {len(samples)}/{len(all_samples)} samples")
+    if args.parallel and args.use_local:
+        # Parallel mode with multiprocessing
+        gpus = [int(g.strip()) for g in args.gpus.split(",")]
+        world_size = len(gpus)
 
-    # Initialize LLM client (will use current GPU)
-    client = LLMClient(
-        model=args.model,
-        use_local=args.use_local,
-        use_vllm=args.use_vllm,
-        tensor_parallel_size=args.tensor_parallel_size,
-    )
+        logger.info(f"Parallel mode with {world_size} GPUs: {gpus}")
 
-    # Run conditions on local shard
-    conditions = [c.strip() for c in args.conditions.split(",")]
-    logger.info(f"Rank {rank}: conditions to run: {conditions}, samples: {len(samples)}")
-    local_results = []
+        # Set spawn method (required for CUDA)
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
 
-    if "oracle" in conditions:
-        logger.info(f"Rank {rank}: starting oracle condition...")
-        local_results.append(run_oracle(samples, client))
-        logger.info(f"Rank {rank}: oracle done")
+        # Clean up old temp files
+        import os
+        for rank in range(world_size):
+            temp_file = os.path.join(args.output_dir, f"temp_rank{rank}.json")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
 
-    if "oracle_gold" in conditions:
-        logger.info(f"Rank {rank}: starting oracle_gold condition...")
-        local_results.append(run_oracle_gold(samples, client))
-        logger.info(f"Rank {rank}: oracle_gold done")
+        # Shard data
+        shards = [[] for _ in range(world_size)]
+        for i, sample in enumerate(all_samples):
+            shards[i % world_size].append(sample)
 
-    if "no_context" in conditions:
-        logger.info(f"Rank {rank}: starting no_context condition...")
-        local_results.append(run_no_context(samples, client))
-        logger.info(f"Rank {rank}: no_context done")
+        # Start all workers
+        processes = []
+        for rank, gpu_id in enumerate(gpus):
+            p = mp.Process(
+                target=worker_process,
+                args=(rank, world_size, gpu_id, args.model, args.use_vllm,
+                      shards[rank], conditions, args.seed, args.output_dir)
+            )
+            p.start()
+            processes.append(p)
+            logger.info(f"Started worker {rank} on GPU {gpu_id} (PID: {p.pid})")
 
-    if "independent" in conditions:
-        logger.info(f"Rank {rank}: starting independent condition...")
-        local_results.append(run_independent(samples, client))
-        logger.info(f"Rank {rank}: independent done")
+        # Wait for all workers
+        for p in processes:
+            p.join()
 
-    if "shuffled" in conditions:
-        logger.info(f"Rank {rank}: starting shuffled condition...")
-        local_results.append(run_shuffled(samples, client, seed=args.seed))
-        logger.info(f"Rank {rank}: shuffled done")
+        logger.info("All workers finished, merging results...")
 
-    # Gather results from all GPUs
-    all_results_by_condition = {}
-    for result in local_results:
-        gathered = gather_results([result], world_size)
-        if rank == 0:
-            # Merge results from all ranks for this condition
-            merged = _merge_results(gathered)
-            all_results_by_condition[result.condition] = merged
+        # Merge results from all workers
+        all_results_by_condition = {}
+        for rank in range(world_size):
+            temp_file = os.path.join(args.output_dir, f"temp_rank{rank}.json")
+            if os.path.exists(temp_file):
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    results_data = json.load(f)
+                for r in results_data:
+                    cond = r["condition"]
+                    if cond not in all_results_by_condition:
+                        all_results_by_condition[cond] = []
+                    all_results_by_condition[cond].append(ExperimentResult(
+                        condition=r["condition"],
+                        dataset="morehopqa",
+                        n_samples=r["n_samples"],
+                        n_questions=r["n_questions"],
+                        accuracy=r["accuracy"],
+                        metrics=r["metrics"],
+                        latency=r["latency"],
+                        prompt_tokens=r["prompt_tokens"],
+                        completion_tokens=r["completion_tokens"],
+                        details=r["details"],
+                    ))
+                os.remove(temp_file)
 
-    # Print and save results (only rank 0)
-    if rank == 0:
-        results = list(all_results_by_condition.values())
+        # Merge and print results
+        final_results = []
+        for cond, results_list in all_results_by_condition.items():
+            merged = _merge_results(results_list)
+            final_results.append(merged)
+
+        config = ExperimentConfig(
+            exp_name="exp1_answer_dependency",
+            dataset="morehopqa",
+            model=args.model,
+            n_samples=args.n_samples,
+            seed=args.seed,
+            output_dir=args.output_dir,
+        )
+        print_summary(final_results)
+        save_results(final_results, config)
+
+    else:
+        # Single process mode (API or single GPU)
+        config = ExperimentConfig(
+            exp_name="exp1_answer_dependency",
+            dataset="morehopqa",
+            model=args.model,
+            n_samples=args.n_samples,
+            seed=args.seed,
+            output_dir=args.output_dir,
+        )
+
+        client = LLMClient(
+            model=args.model,
+            use_local=args.use_local,
+            use_vllm=args.use_vllm,
+            tensor_parallel_size=1,
+        )
+
+        results = []
+
+        if "oracle" in conditions:
+            results.append(run_oracle(all_samples, client))
+        if "oracle_gold" in conditions:
+            results.append(run_oracle_gold(all_samples, client))
+        if "no_context" in conditions:
+            results.append(run_no_context(all_samples, client))
+        if "independent" in conditions:
+            results.append(run_independent(all_samples, client))
+        if "shuffled" in conditions:
+            results.append(run_shuffled(all_samples, client, seed=args.seed))
+
         print_summary(results)
         save_results(results, config)
-
-    cleanup_distributed()
 
 
 def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:

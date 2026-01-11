@@ -113,30 +113,11 @@ class LLMClient:
         logger.info(f"Initialized API client with model: {model}")
 
     def _init_vllm_model(self, model: str, tensor_parallel_size: int):
-        """Initialize model with vLLM for fast multi-GPU inference."""
-        import time
+        """Initialize model with vLLM for fast inference.
 
-        # Get local rank for staggered startup
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-        # For data parallelism (each process has its own model on its own GPU),
-        # configure environment BEFORE importing vLLM
-        if world_size > 1 and tensor_parallel_size == 1:
-            # Each process only sees its own GPU
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
-            # Disable vLLM's multiprocessing to avoid conflicts with torchrun
-            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-            # Use V0 engine which is simpler and doesn't spawn EngineCore processes
-            os.environ["VLLM_USE_V1"] = "0"
-            logger.info(f"Rank {local_rank}: set CUDA_VISIBLE_DEVICES={local_rank}, using V0 engine")
-
-            # Staggered startup to avoid conflicts
-            startup_delay = local_rank * 15  # 15 seconds between each process
-            logger.info(f"Rank {local_rank}: waiting {startup_delay}s for staggered vLLM startup...")
-            time.sleep(startup_delay)
-
-        # Import vLLM AFTER setting environment variables
+        NOTE: For multi-GPU data parallelism, CUDA_VISIBLE_DEVICES should be set
+        by the caller (e.g., in worker_process) BEFORE calling this function.
+        """
         try:
             from vllm import LLM, SamplingParams
         except ImportError:
@@ -144,14 +125,12 @@ class LLMClient:
 
         logger.info(f"Loading model with vLLM: {model} (tensor_parallel_size={tensor_parallel_size})")
 
-        # When using data parallelism, enforce_eager helps with startup
         self._vllm_model = LLM(
             model=model,
             tensor_parallel_size=tensor_parallel_size,
             trust_remote_code=True,
             dtype="half",
-            enforce_eager=(world_size > 1 and tensor_parallel_size == 1),  # Skip CUDA graph for DP
-            gpu_memory_utilization=0.85,  # Leave some room
+            gpu_memory_utilization=0.9,
         )
         logger.info(f"vLLM model loaded with {tensor_parallel_size} GPU(s)")
 
