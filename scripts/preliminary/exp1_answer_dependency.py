@@ -196,6 +196,8 @@ def run_oracle(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    total_prompt_chars = 0
+    total_response_chars = 0
 
     for sample in tqdm(samples, desc="Oracle"):
         decomp = sample["decomposition"]
@@ -231,6 +233,8 @@ def run_oracle(
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            total_prompt_chars += len(prompt)
+            total_response_chars += len(pred)
 
             # Evaluate this sub-question
             is_correct = _evaluate_answer(pred, gold_answer)
@@ -245,6 +249,8 @@ def run_oracle(
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
                 "correct": is_correct,
+                "prompt_len": len(prompt),
+                "response_len": len(pred),
             })
 
             # Pass predicted answer (not gold) to next step
@@ -258,6 +264,8 @@ def run_oracle(
         })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_prompt_len = total_prompt_chars / total_questions if total_questions > 0 else 0
+    avg_response_len = total_response_chars / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="oracle",
@@ -265,7 +273,13 @@ def run_oracle(
         n_samples=len(samples),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"sub_question_accuracy": accuracy},
+        metrics={
+            "sub_question_accuracy": accuracy,
+            "avg_prompt_len": avg_prompt_len,
+            "avg_response_len": avg_response_len,
+            "total_prompt_chars": total_prompt_chars,
+            "total_response_chars": total_response_chars,
+        },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -290,6 +304,8 @@ def run_independent(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    total_prompt_chars = 0
+    total_response_chars = 0
 
     for sample in tqdm(samples, desc="Independent"):
         decomp = sample["decomposition"]
@@ -315,6 +331,8 @@ def run_independent(
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            total_prompt_chars += len(prompt)
+            total_response_chars += len(pred)
 
             # Evaluate this sub-question
             is_correct = _evaluate_answer(pred, gold_answer)
@@ -329,6 +347,8 @@ def run_independent(
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
                 "correct": is_correct,
+                "prompt_len": len(prompt),
+                "response_len": len(pred),
             })
 
         details.append({
@@ -339,6 +359,8 @@ def run_independent(
         })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_prompt_len = total_prompt_chars / total_questions if total_questions > 0 else 0
+    avg_response_len = total_response_chars / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="independent",
@@ -346,7 +368,13 @@ def run_independent(
         n_samples=len(samples),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"sub_question_accuracy": accuracy},
+        metrics={
+            "sub_question_accuracy": accuracy,
+            "avg_prompt_len": avg_prompt_len,
+            "avg_response_len": avg_response_len,
+            "total_prompt_chars": total_prompt_chars,
+            "total_response_chars": total_response_chars,
+        },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -375,6 +403,8 @@ def run_shuffled(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    total_prompt_chars = 0
+    total_response_chars = 0
 
     for sample in tqdm(samples, desc="Shuffled"):
         decomp = sample["decomposition"]
@@ -387,6 +417,8 @@ def run_shuffled(
         # Build context with prior Q&A (in shuffled order)
         prior_qa = []
         predictions = {}
+        prompt_lens = {}
+        response_lens = {}
         sample_correct = 0
         sample_details = []
 
@@ -414,8 +446,12 @@ def run_shuffled(
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            total_prompt_chars += len(prompt)
+            total_response_chars += len(pred)
 
             predictions[idx] = pred.strip()
+            prompt_lens[idx] = len(prompt)
+            response_lens[idx] = len(pred)
 
             # Pass predicted answer to next step
             prior_qa.append((sub_q, pred.strip()))
@@ -437,6 +473,8 @@ def run_shuffled(
                 "gold_answer": gold_answer,
                 "prediction": pred,
                 "correct": is_correct,
+                "prompt_len": prompt_lens.get(i, 0),
+                "response_len": response_lens.get(i, 0),
             })
 
         details.append({
@@ -448,6 +486,8 @@ def run_shuffled(
         })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_prompt_len = total_prompt_chars / total_questions if total_questions > 0 else 0
+    avg_response_len = total_response_chars / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="shuffled",
@@ -455,7 +495,13 @@ def run_shuffled(
         n_samples=len(samples),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"sub_question_accuracy": accuracy},
+        metrics={
+            "sub_question_accuracy": accuracy,
+            "avg_prompt_len": avg_prompt_len,
+            "avg_response_len": avg_response_len,
+            "total_prompt_chars": total_prompt_chars,
+            "total_response_chars": total_response_chars,
+        },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -573,6 +619,8 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    total_prompt_chars = 0
+    total_response_chars = 0
     all_details = []
 
     for r in results:
@@ -581,9 +629,13 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         total_latency += r.latency
         total_prompt_tokens += r.prompt_tokens
         total_completion_tokens += r.completion_tokens
+        total_prompt_chars += r.metrics.get("total_prompt_chars", 0)
+        total_response_chars += r.metrics.get("total_response_chars", 0)
         all_details.extend(r.details)
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_prompt_len = total_prompt_chars / total_questions if total_questions > 0 else 0
+    avg_response_len = total_response_chars / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition=results[0].condition,
@@ -591,7 +643,13 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         n_samples=sum(r.n_samples for r in results),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"sub_question_accuracy": accuracy},
+        metrics={
+            "sub_question_accuracy": accuracy,
+            "avg_prompt_len": avg_prompt_len,
+            "avg_response_len": avg_response_len,
+            "total_prompt_chars": total_prompt_chars,
+            "total_response_chars": total_response_chars,
+        },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,

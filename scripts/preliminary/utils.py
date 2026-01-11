@@ -470,7 +470,10 @@ def print_summary(results: List[ExperimentResult]) -> None:
         if result.latency > 0:
             print(f"  Latency: {result.latency:.2f}s")
         for metric, value in result.metrics.items():
-            print(f"  {metric}: {value:.4f}")
+            if isinstance(value, int) or (isinstance(value, float) and value > 1000):
+                print(f"  {metric}: {value:.0f}")
+            else:
+                print(f"  {metric}: {value:.4f}")
 
     print("\n" + "=" * 60)
 
