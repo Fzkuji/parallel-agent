@@ -517,6 +517,14 @@ def main():
         help="Use local model instead of API"
     )
     parser.add_argument(
+        "--use-vllm", action="store_true",
+        help="Use vLLM for faster inference (requires --use-local)"
+    )
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=1,
+        help="Number of GPUs for tensor parallelism (vLLM only)"
+    )
+    parser.add_argument(
         "--n-samples", type=int, default=200,
         help="Number of choice samples to evaluate"
     )
@@ -552,7 +560,12 @@ def main():
     choice_samples = load_arc_challenge(n_samples=args.n_samples, seed=args.seed)
 
     # Initialize LLM client
-    client = LLMClient(model=args.model, use_local=args.use_local)
+    client = LLMClient(
+        model=args.model,
+        use_local=args.use_local,
+        use_vllm=args.use_vllm,
+        tensor_parallel_size=args.tensor_parallel_size,
+    )
 
     # Run conditions
     conditions = [c.strip() for c in args.conditions.split(",")]

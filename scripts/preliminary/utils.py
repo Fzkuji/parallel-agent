@@ -80,15 +80,22 @@ class LLMClient:
         max_retries: int = 3,
         use_local: bool = False,
         device: str = "auto",
+        use_vllm: bool = False,
+        tensor_parallel_size: int = 1,
     ):
         self.model = model
         self.temperature = temperature
         self.use_local = use_local
+        self.use_vllm = use_vllm
         self._tokenizer = None
         self._model = None
+        self._vllm_model = None
 
         if use_local:
-            self._init_local_model(model, device)
+            if use_vllm:
+                self._init_vllm_model(model, tensor_parallel_size)
+            else:
+                self._init_local_model(model, device)
         else:
             self._init_api_client(model, temperature, max_retries)
 
@@ -101,6 +108,23 @@ class LLMClient:
             max_retries=max_retries,
         )
         logger.info(f"Initialized API client with model: {model}")
+
+    def _init_vllm_model(self, model: str, tensor_parallel_size: int):
+        """Initialize model with vLLM for fast multi-GPU inference."""
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError:
+            raise ImportError("Please install vllm: pip install vllm")
+
+        logger.info(f"Loading model with vLLM: {model} (tensor_parallel_size={tensor_parallel_size})")
+
+        self._vllm_model = LLM(
+            model=model,
+            tensor_parallel_size=tensor_parallel_size,
+            trust_remote_code=True,
+            dtype="half",
+        )
+        logger.info(f"vLLM model loaded with {tensor_parallel_size} GPU(s)")
 
     def _init_local_model(self, model: str, device: str):
         """Initialize local model with transformers."""
@@ -143,9 +167,83 @@ class LLMClient:
             Tuple of (response_text, response_object)
         """
         if self.use_local:
-            return self._generate_local(prompt, max_tokens, system_prompt)
+            if self.use_vllm:
+                return self._generate_vllm(prompt, max_tokens, system_prompt)
+            else:
+                return self._generate_local(prompt, max_tokens, system_prompt)
         else:
             return self._generate_api(prompt, max_tokens, system_prompt)
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_tokens: int = 1024,
+        system_prompt: Optional[str] = None,
+    ) -> List[Tuple[str, SimpleResponse]]:
+        """Generate responses for multiple prompts in batch (vLLM only).
+
+        Returns:
+            List of (response_text, response_object) tuples
+        """
+        if self.use_vllm and self._vllm_model is not None:
+            return self._generate_vllm_batch(prompts, max_tokens, system_prompt)
+        else:
+            # Fallback to sequential generation
+            return [self.generate(p, max_tokens, system_prompt) for p in prompts]
+
+    def _generate_vllm(
+        self,
+        prompt: str,
+        max_tokens: int,
+        system_prompt: Optional[str],
+    ) -> Tuple[str, SimpleResponse]:
+        """Generate using vLLM."""
+        results = self._generate_vllm_batch([prompt], max_tokens, system_prompt)
+        return results[0]
+
+    def _generate_vllm_batch(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        system_prompt: Optional[str],
+    ) -> List[Tuple[str, SimpleResponse]]:
+        """Generate batch responses using vLLM."""
+        from vllm import SamplingParams
+        import time
+
+        # Build full prompts with system prompt if provided
+        full_prompts = []
+        for prompt in prompts:
+            if system_prompt:
+                full_prompt = f"{system_prompt}\n\n{prompt}"
+            else:
+                full_prompt = prompt
+            full_prompts.append(full_prompt)
+
+        sampling_params = SamplingParams(
+            temperature=self.temperature if self.temperature > 0 else 0,
+            max_tokens=max_tokens,
+        )
+
+        start_time = time.perf_counter()
+        outputs = self._vllm_model.generate(full_prompts, sampling_params)
+        total_latency = time.perf_counter() - start_time
+
+        results = []
+        for output in outputs:
+            text = output.outputs[0].text
+            prompt_tokens = len(output.prompt_token_ids)
+            completion_tokens = len(output.outputs[0].token_ids)
+
+            response = SimpleResponse(
+                text=text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency=total_latency / len(prompts),  # Average latency per sample
+            )
+            results.append((text, response))
+
+        return results
 
     def _generate_api(
         self,
