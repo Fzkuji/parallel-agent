@@ -430,28 +430,32 @@ def save_results(
 ) -> str:
     """Save experiment results to JSON file.
 
+    Filename is based on config settings (exp_name, model, n_samples).
+    Same settings will overwrite previous results.
+
     Returns:
         Path to saved file
     """
     output_dir = output_dir or config.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{config.exp_name}_{timestamp}.json"
+    # Create filename based on config (sanitize model name)
+    model_name = config.model.replace("/", "_").replace("\\", "_")
+    n_samples_str = "all" if config.n_samples == -1 else str(config.n_samples)
+    filename = f"{config.exp_name}_{model_name}_n{n_samples_str}.json"
     filepath = os.path.join(output_dir, filename)
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     data = {
         "config": config.to_dict(),
         "timestamp": timestamp,
         "results": [asdict(r) for r in results],
         "summary": {
-            condition: {
-                "accuracy": next(
-                    (r.accuracy for r in results if r.condition == condition),
-                    None
-                )
+            r.condition: {
+                "em": r.metrics.get("em", r.accuracy),
+                "f1": r.metrics.get("f1", 0),
             }
-            for condition in ["oracle", "method", "random"]
+            for r in results
         }
     }
 
