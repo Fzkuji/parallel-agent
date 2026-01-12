@@ -464,23 +464,16 @@ def save_results(
 
 def print_summary(results: List[ExperimentResult]) -> None:
     """Print summary of experiment results as markdown table."""
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 100)
     print("EXPERIMENT SUMMARY")
-    print("=" * 60 + "\n")
+    print("=" * 100 + "\n")
 
     if not results:
         print("No results to display.")
         return
 
-    # Collect all unique metric keys across results
-    all_metric_keys = set()
-    for result in results:
-        all_metric_keys.update(result.metrics.keys())
-    metric_keys = sorted(all_metric_keys)
-
     # Build header
-    headers = ["Condition", "Accuracy", "Samples", "Questions", "Latency (s)"]
-    headers.extend(metric_keys)
+    headers = ["Condition", "EM", "F1", "Samples", "Questions", "Prompt Tok", "Compl Tok", "Latency (s)"]
 
     # Print markdown table header
     print("| " + " | ".join(headers) + " |")
@@ -488,25 +481,21 @@ def print_summary(results: List[ExperimentResult]) -> None:
 
     # Print each result row
     for result in results:
+        em = result.metrics.get("em", 0)
+        f1 = result.metrics.get("f1", 0)
         row = [
-            result.condition.capitalize(),
-            f"{result.accuracy:.4f}",
+            result.condition,
+            f"{em:.4f}",
+            f"{f1:.4f}",
             str(result.n_samples),
             str(result.n_questions),
+            str(result.prompt_tokens),
+            str(result.completion_tokens),
             f"{result.latency:.2f}" if result.latency > 0 else "-",
         ]
-        # Add metric values
-        for key in metric_keys:
-            value = result.metrics.get(key, "-")
-            if value == "-":
-                row.append("-")
-            elif isinstance(value, int) or (isinstance(value, float) and value > 1000):
-                row.append(f"{value:.0f}")
-            else:
-                row.append(f"{value:.4f}")
         print("| " + " | ".join(row) + " |")
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 100)
 
     # Print comparison
     oracle = next((r for r in results if r.condition == "oracle"), None)

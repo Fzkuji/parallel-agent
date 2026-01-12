@@ -31,7 +31,9 @@ from utils import (
     ExperimentConfig,
     ExperimentResult,
     LLMClient,
-    compute_contains,
+    compute_exact_match,
+    compute_f1,
+    normalize_answer,
     print_summary,
     save_results,
 )
@@ -164,17 +166,31 @@ def _format_context(context: List[List]) -> str:
     return "\n".join(parts)
 
 
-def _evaluate_answer(pred: str, gold: str) -> bool:
-    """Evaluate if prediction matches gold answer."""
-    pred = pred.strip().lower()
-    gold = gold.strip().lower()
+def _extract_boxed_answer(text: str) -> str:
+    """Extract answer from \\boxed{} format."""
+    import re
+    # Match \boxed{...} with nested braces support
+    pattern = r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}'
+    matches = re.findall(pattern, text)
+    if matches:
+        return matches[-1].strip()  # Return last match
+    # Fallback: return original text
+    return text.strip()
 
-    # Exact match
-    if pred == gold or gold in pred:
-        return True
 
-    # Use contains metric
-    return compute_contains(pred, gold) > 0
+def _evaluate_answer(pred: str, gold: str) -> Tuple[float, float]:
+    """Evaluate prediction against gold answer.
+
+    Returns:
+        Tuple of (exact_match, f1_score)
+    """
+    # Extract answer from \boxed{} if present
+    pred = _extract_boxed_answer(pred)
+
+    em = compute_exact_match(pred, gold)
+    f1 = compute_f1(pred, gold)
+
+    return em, f1
 
 
 def run_oracle(
@@ -190,7 +206,8 @@ def run_oracle(
     """
     logger.info("Running Oracle condition (Sequential + Context)...")
 
-    total_correct = 0
+    total_em = 0.0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -203,7 +220,8 @@ def run_oracle(
 
         # Build context with prior Q&A
         prior_qa = []
-        sample_correct = 0
+        sample_em = 0.0
+        sample_f1 = 0.0
         sample_details = []
 
         for i, step in enumerate(decomp):
@@ -224,7 +242,7 @@ def run_oracle(
                 )
                 prompt_parts.append(qa_context)
 
-            prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
             prompt = "\n\n".join(prompt_parts)
 
             pred, response = client.generate(prompt, max_tokens=max_tokens)
@@ -233,10 +251,11 @@ def run_oracle(
             total_completion_tokens += response.completion_tokens
 
             # Evaluate this sub-question
-            is_correct = _evaluate_answer(pred, gold_answer)
-            if is_correct:
-                total_correct += 1
-                sample_correct += 1
+            em, f1 = _evaluate_answer(pred, gold_answer)
+            total_em += em
+            total_f1 += f1
+            sample_em += em
+            sample_f1 += f1
             total_questions += 1
 
             sample_details.append({
@@ -244,22 +263,27 @@ def run_oracle(
                 "question": sub_q,
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
-                "correct": is_correct,
+                "extracted_answer": _extract_boxed_answer(pred),
+                "em": em,
+                "f1": f1,
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
             })
 
             # Pass predicted answer (not gold) to next step
-            prior_qa.append((sub_q, pred.strip()))
+            prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
+        n_sub = len(decomp) if decomp else 1
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "accuracy": sample_correct / len(decomp) if decomp else 0,
+            "em": sample_em / n_sub,
+            "f1": sample_f1 / n_sub,
         })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_questions if total_questions > 0 else 0
+    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
     avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
     avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
@@ -268,9 +292,10 @@ def run_oracle(
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_questions,
-        accuracy=accuracy,
+        accuracy=avg_em,  # Use EM as primary accuracy metric
         metrics={
-            "sub_question_accuracy": accuracy,
+            "em": avg_em,
+            "f1": avg_f1,
             "avg_prompt_tokens": avg_prompt_tokens,
             "avg_completion_tokens": avg_completion_tokens,
         },
@@ -295,7 +320,8 @@ def run_oracle_gold(
     """
     logger.info("Running Oracle-Gold condition (Sequential + Gold Context)...")
 
-    total_correct = 0
+    total_em = 0.0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -308,7 +334,8 @@ def run_oracle_gold(
 
         # Build context with prior Q&A (using gold answers)
         prior_qa = []
-        sample_correct = 0
+        sample_em = 0.0
+        sample_f1 = 0.0
         sample_details = []
 
         for i, step in enumerate(decomp):
@@ -329,7 +356,7 @@ def run_oracle_gold(
                 )
                 prompt_parts.append(qa_context)
 
-            prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
             prompt = "\n\n".join(prompt_parts)
 
             pred, response = client.generate(prompt, max_tokens=max_tokens)
@@ -338,10 +365,11 @@ def run_oracle_gold(
             total_completion_tokens += response.completion_tokens
 
             # Evaluate this sub-question
-            is_correct = _evaluate_answer(pred, gold_answer)
-            if is_correct:
-                total_correct += 1
-                sample_correct += 1
+            em, f1 = _evaluate_answer(pred, gold_answer)
+            total_em += em
+            total_f1 += f1
+            sample_em += em
+            sample_f1 += f1
             total_questions += 1
 
             sample_details.append({
@@ -349,7 +377,9 @@ def run_oracle_gold(
                 "question": sub_q,
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
-                "correct": is_correct,
+                "extracted_answer": _extract_boxed_answer(pred),
+                "em": em,
+                "f1": f1,
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
             })
@@ -357,14 +387,17 @@ def run_oracle_gold(
             # Pass gold answer (not predicted) to next step
             prior_qa.append((sub_q, gold_answer))
 
+        n_sub = len(decomp) if decomp else 1
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "accuracy": sample_correct / len(decomp) if decomp else 0,
+            "em": sample_em / n_sub,
+            "f1": sample_f1 / n_sub,
         })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_questions if total_questions > 0 else 0
+    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
     avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
     avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
@@ -373,9 +406,10 @@ def run_oracle_gold(
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_questions,
-        accuracy=accuracy,
+        accuracy=avg_em,
         metrics={
-            "sub_question_accuracy": accuracy,
+            "em": avg_em,
+            "f1": avg_f1,
             "avg_prompt_tokens": avg_prompt_tokens,
             "avg_completion_tokens": avg_completion_tokens,
         },
@@ -399,7 +433,8 @@ def run_no_context(
     """
     logger.info("Running No-Context condition (Sequential + Prior Q&A, No Reference)...")
 
-    total_correct = 0
+    total_em = 0.0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -412,7 +447,8 @@ def run_no_context(
 
         # Build context with prior Q&A only
         prior_qa = []
-        sample_correct = 0
+        sample_em = 0.0
+        sample_f1 = 0.0
         sample_details = []
 
         for i, step in enumerate(decomp):
@@ -428,9 +464,7 @@ def run_no_context(
                     [f"Q: {q}\nA: {a}" for q, a in prior_qa]
                 )
                 prompt_parts.append(qa_context)
-                prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
-            else:
-                prompt_parts.append(f"Q: {sub_q}\nA:")
+            prompt_parts.append(f"Answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
 
             prompt = "\n\n".join(prompt_parts)
 
@@ -440,10 +474,11 @@ def run_no_context(
             total_completion_tokens += response.completion_tokens
 
             # Evaluate this sub-question
-            is_correct = _evaluate_answer(pred, gold_answer)
-            if is_correct:
-                total_correct += 1
-                sample_correct += 1
+            em, f1 = _evaluate_answer(pred, gold_answer)
+            total_em += em
+            total_f1 += f1
+            sample_em += em
+            sample_f1 += f1
             total_questions += 1
 
             sample_details.append({
@@ -451,22 +486,27 @@ def run_no_context(
                 "question": sub_q,
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
-                "correct": is_correct,
+                "extracted_answer": _extract_boxed_answer(pred),
+                "em": em,
+                "f1": f1,
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
             })
 
             # Pass predicted answer to next step
-            prior_qa.append((sub_q, pred.strip()))
+            prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
+        n_sub = len(decomp) if decomp else 1
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "accuracy": sample_correct / len(decomp) if decomp else 0,
+            "em": sample_em / n_sub,
+            "f1": sample_f1 / n_sub,
         })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_questions if total_questions > 0 else 0
+    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
     avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
     avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
@@ -475,9 +515,10 @@ def run_no_context(
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_questions,
-        accuracy=accuracy,
+        accuracy=avg_em,
         metrics={
-            "sub_question_accuracy": accuracy,
+            "em": avg_em,
+            "f1": avg_f1,
             "avg_prompt_tokens": avg_prompt_tokens,
             "avg_completion_tokens": avg_completion_tokens,
         },
@@ -502,7 +543,8 @@ def run_independent(
     """
     logger.info(f"Running Independent condition (No Context, batch_size={batch_size})...")
 
-    total_correct = 0
+    total_em = 0.0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -525,7 +567,7 @@ def run_independent(
             prompt_parts = []
             if context_str:
                 prompt_parts.append(f"Reference Information:\n{context_str}")
-            prompt_parts.append(f"Answer this question:\nQ: {sub_q}\nA:")
+            prompt_parts.append(f"Answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
             prompt = "\n\n".join(prompt_parts)
 
             all_prompts.append(prompt)
@@ -549,7 +591,8 @@ def run_independent(
     # Evaluate and build details
     for sample_idx, sample in enumerate(samples):
         decomp = sample["decomposition"]
-        sample_correct = 0
+        sample_em = 0.0
+        sample_f1 = 0.0
         sample_details = []
 
         results = sample_results.get(sample_idx, [])
@@ -560,10 +603,11 @@ def run_independent(
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            is_correct = _evaluate_answer(pred, gold_answer)
-            if is_correct:
-                total_correct += 1
-                sample_correct += 1
+            em, f1 = _evaluate_answer(pred, gold_answer)
+            total_em += em
+            total_f1 += f1
+            sample_em += em
+            sample_f1 += f1
             total_questions += 1
 
             sample_details.append({
@@ -571,19 +615,24 @@ def run_independent(
                 "question": sub_q,
                 "gold_answer": gold_answer,
                 "prediction": pred.strip(),
-                "correct": is_correct,
+                "extracted_answer": _extract_boxed_answer(pred),
+                "em": em,
+                "f1": f1,
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
             })
 
+        n_sub = len(decomp) if decomp else 1
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "accuracy": sample_correct / len(decomp) if decomp else 0,
+            "em": sample_em / n_sub,
+            "f1": sample_f1 / n_sub,
         })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_questions if total_questions > 0 else 0
+    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
     avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
     avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
@@ -592,9 +641,10 @@ def run_independent(
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_questions,
-        accuracy=accuracy,
+        accuracy=avg_em,
         metrics={
-            "sub_question_accuracy": accuracy,
+            "em": avg_em,
+            "f1": avg_f1,
             "avg_prompt_tokens": avg_prompt_tokens,
             "avg_completion_tokens": avg_completion_tokens,
         },
@@ -621,7 +671,8 @@ def run_shuffled(
 
     random.seed(seed)
 
-    total_correct = 0
+    total_em = 0.0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -641,7 +692,8 @@ def run_shuffled(
         predictions = {}
         prompt_tokens_map = {}
         completion_tokens_map = {}
-        sample_correct = 0
+        sample_em = 0.0
+        sample_f1 = 0.0
         sample_details = []
 
         for idx in indices:
@@ -661,7 +713,7 @@ def run_shuffled(
                 )
                 prompt_parts.append(qa_context)
 
-            prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
+            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
             prompt = "\n\n".join(prompt_parts)
 
             pred, response = client.generate(prompt, max_tokens=max_tokens)
@@ -674,17 +726,18 @@ def run_shuffled(
             completion_tokens_map[idx] = response.completion_tokens
 
             # Pass predicted answer to next step
-            prior_qa.append((sub_q, pred.strip()))
+            prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
         # Evaluate all sub-questions (in original order)
         for i, step in enumerate(decomp):
             gold_answer = step["answer"]
             pred = predictions.get(i, "")
 
-            is_correct = _evaluate_answer(pred, gold_answer)
-            if is_correct:
-                total_correct += 1
-                sample_correct += 1
+            em, f1 = _evaluate_answer(pred, gold_answer)
+            total_em += em
+            total_f1 += f1
+            sample_em += em
+            sample_f1 += f1
             total_questions += 1
 
             sample_details.append({
@@ -692,20 +745,25 @@ def run_shuffled(
                 "question": step["question"],
                 "gold_answer": gold_answer,
                 "prediction": pred,
-                "correct": is_correct,
+                "extracted_answer": _extract_boxed_answer(pred),
+                "em": em,
+                "f1": f1,
                 "prompt_tokens": prompt_tokens_map.get(i, 0),
                 "completion_tokens": completion_tokens_map.get(i, 0),
             })
 
+        n_sub = len(decomp) if decomp else 1
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "shuffled_order": indices,
             "sub_questions": sample_details,
-            "accuracy": sample_correct / len(decomp) if decomp else 0,
+            "em": sample_em / n_sub,
+            "f1": sample_f1 / n_sub,
         })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_questions if total_questions > 0 else 0
+    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
     avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
     avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
@@ -714,9 +772,10 @@ def run_shuffled(
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_questions,
-        accuracy=accuracy,
+        accuracy=avg_em,
         metrics={
-            "sub_question_accuracy": accuracy,
+            "em": avg_em,
+            "f1": avg_f1,
             "avg_prompt_tokens": avg_prompt_tokens,
             "avg_completion_tokens": avg_completion_tokens,
         },
@@ -849,15 +908,6 @@ def main():
         "--output-dir", type=str, default="outputs/preliminary",
         help="Output directory for results"
     )
-    # Parallel mode
-    parser.add_argument(
-        "--parallel", action="store_true",
-        help="Enable parallel inference with multiple GPUs"
-    )
-    parser.add_argument(
-        "--gpus", type=str, default="0,1,2,3,4,5,6,7",
-        help="Comma-separated list of GPUs for parallel mode"
-    )
     parser.add_argument(
         "--max-tokens", type=int, default=256,
         help="Maximum number of tokens to generate"
@@ -869,10 +919,20 @@ def main():
     # Load data
     all_samples = load_morehopqa(n_samples=args.n_samples, seed=args.seed)
 
-    if args.parallel and args.use_local:
-        # Parallel mode with multiprocessing
-        gpus = [int(g.strip()) for g in args.gpus.split(",")]
-        world_size = len(gpus)
+    # Auto-detect available GPUs
+    num_gpus = 0
+    if args.use_local:
+        try:
+            import torch
+            num_gpus = torch.cuda.device_count()
+            logger.info(f"Detected {num_gpus} available GPU(s)")
+        except ImportError:
+            logger.warning("PyTorch not available, using single process mode")
+
+    if args.use_local and num_gpus > 1:
+        # Multi-GPU parallel mode with multiprocessing
+        gpus = list(range(num_gpus))
+        world_size = num_gpus
 
         logger.info(f"Parallel mode with {world_size} GPUs: {gpus}")
 
@@ -956,6 +1016,9 @@ def main():
 
     else:
         # Single process mode (API or single GPU)
+        if args.use_local and num_gpus == 1:
+            logger.info("Single GPU mode: using GPU 0")
+
         config = ExperimentConfig(
             exp_name="exp1_answer_dependency",
             dataset="morehopqa",
@@ -997,7 +1060,8 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         return results[0]
 
     # Sum up metrics
-    total_correct = 0
+    total_em = 0.0
+    total_f1 = 0.0
     total_questions = 0
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -1006,13 +1070,16 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
 
     for r in results:
         total_questions += r.n_questions
-        total_correct += int(r.accuracy * r.n_questions)
+        # EM is stored in accuracy field and metrics["em"]
+        total_em += r.metrics.get("em", r.accuracy) * r.n_questions
+        total_f1 += r.metrics.get("f1", 0) * r.n_questions
         total_latency += r.latency
         total_prompt_tokens += r.prompt_tokens
         total_completion_tokens += r.completion_tokens
         all_details.extend(r.details)
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_questions if total_questions > 0 else 0
+    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
     avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
     avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
@@ -1021,9 +1088,10 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         dataset=results[0].dataset,
         n_samples=sum(r.n_samples for r in results),
         n_questions=total_questions,
-        accuracy=accuracy,
+        accuracy=avg_em,
         metrics={
-            "sub_question_accuracy": accuracy,
+            "em": avg_em,
+            "f1": avg_f1,
             "avg_prompt_tokens": avg_prompt_tokens,
             "avg_completion_tokens": avg_completion_tokens,
         },
