@@ -271,6 +271,7 @@ def run_sequential(
                 "sub_id": i,
                 "question": sub_q,
                 "gold_answer": gold_answer,
+                "prompt": prompt,
                 "prediction": pred.strip(),
                 "extracted_answer": _extract_boxed_answer(pred),
                 "em": em,
@@ -294,6 +295,8 @@ def run_sequential(
 
         details.append({
             "main_question": sample["question"],
+            "gold_answer": sample["answer"],
+            "context": sample.get("context", []),
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
             "final_em": sample_details[-1]["em"] if sample_details else 0,
@@ -398,7 +401,7 @@ def run_shuffled(
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            predictions[idx] = pred.strip()
+            predictions[idx] = (pred.strip(), prompt)  # Store both prediction and prompt
             prompt_tokens_map[idx] = response.prompt_tokens
             completion_tokens_map[idx] = response.completion_tokens
 
@@ -411,7 +414,7 @@ def run_shuffled(
         # Evaluate all sub-questions (in original order)
         for i, step in enumerate(decomp):
             gold_answer = step["answer"]
-            pred = predictions.get(i, "")
+            pred, prompt_used = predictions.get(i, ("", ""))
 
             em, f1 = _evaluate_answer(pred, gold_answer)
 
@@ -419,6 +422,7 @@ def run_shuffled(
                 "sub_id": i,
                 "question": step["question"],
                 "gold_answer": gold_answer,
+                "prompt": prompt_used,
                 "prediction": pred,
                 "extracted_answer": _extract_boxed_answer(pred),
                 "em": em,
@@ -436,6 +440,8 @@ def run_shuffled(
 
         details.append({
             "main_question": sample["question"],
+            "gold_answer": sample["answer"],
+            "context": sample.get("context", []),
             "n_hops": sample["n_hops"],
             "shuffled_order": indices,
             "sub_questions": sample_details,
@@ -496,7 +502,7 @@ def run_independent(
 
     # Collect all prompts and metadata for batch processing
     all_prompts = []
-    all_metadata = []  # (sample_idx, sub_idx, sub_q, gold_answer)
+    all_metadata = []  # (sample_idx, sub_idx, sub_q, gold_answer, prompt)
 
     for sample_idx, sample in enumerate(samples):
         decomp = sample["decomposition"]
@@ -514,7 +520,7 @@ def run_independent(
             prompt = "\n\n".join(prompt_parts)
 
             all_prompts.append(prompt)
-            all_metadata.append((sample_idx, i, sub_q, gold_answer))
+            all_metadata.append((sample_idx, i, sub_q, gold_answer, prompt))
 
     # Process in batches
     all_results = []
@@ -524,12 +530,12 @@ def run_independent(
         all_results.extend(batch_results)
 
     # Organize results by sample
-    sample_results = {}  # sample_idx -> list of (sub_idx, sub_q, gold_answer, pred, response)
+    sample_results = {}  # sample_idx -> list of (sub_idx, sub_q, gold_answer, prompt, pred, response)
     for idx, (pred, response) in enumerate(all_results):
-        sample_idx, sub_idx, sub_q, gold_answer = all_metadata[idx]
+        sample_idx, sub_idx, sub_q, gold_answer, prompt_used = all_metadata[idx]
         if sample_idx not in sample_results:
             sample_results[sample_idx] = []
-        sample_results[sample_idx].append((sub_idx, sub_q, gold_answer, pred, response))
+        sample_results[sample_idx].append((sub_idx, sub_q, gold_answer, prompt_used, pred, response))
 
     # Evaluate and build details
     for sample_idx, sample in enumerate(samples):
@@ -539,7 +545,7 @@ def run_independent(
         results = sample_results.get(sample_idx, [])
         results.sort(key=lambda x: x[0])  # Sort by sub_idx
 
-        for sub_idx, sub_q, gold_answer, pred, response in results:
+        for sub_idx, sub_q, gold_answer, prompt_used, pred, response in results:
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -550,6 +556,7 @@ def run_independent(
                 "sub_id": sub_idx,
                 "question": sub_q,
                 "gold_answer": gold_answer,
+                "prompt": prompt_used,
                 "prediction": pred.strip(),
                 "extracted_answer": _extract_boxed_answer(pred),
                 "em": em,
@@ -567,6 +574,8 @@ def run_independent(
 
         details.append({
             "main_question": sample["question"],
+            "gold_answer": sample["answer"],
+            "context": sample.get("context", []),
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
             "final_em": sample_details[-1]["em"] if sample_details else 0,
