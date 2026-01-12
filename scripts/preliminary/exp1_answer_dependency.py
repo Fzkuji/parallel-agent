@@ -180,6 +180,7 @@ def _evaluate_answer(pred: str, gold: str) -> bool:
 def run_oracle(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    max_tokens: int = 256,
 ) -> ExperimentResult:
     """Oracle condition: Sequential order with prior Q&A context.
 
@@ -226,7 +227,7 @@ def run_oracle(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=256)
+            pred, response = client.generate(prompt, max_tokens=max_tokens)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -283,6 +284,7 @@ def run_oracle(
 def run_oracle_gold(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    max_tokens: int = 256,
 ) -> ExperimentResult:
     """Oracle-Gold condition: Sequential order with gold answers as context.
 
@@ -330,7 +332,7 @@ def run_oracle_gold(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=256)
+            pred, response = client.generate(prompt, max_tokens=max_tokens)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -387,6 +389,7 @@ def run_oracle_gold(
 def run_no_context(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    max_tokens: int = 256,
 ) -> ExperimentResult:
     """No-Context condition: Sequential order with prior Q&A but NO reference context.
 
@@ -431,7 +434,7 @@ def run_no_context(
 
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=256)
+            pred, response = client.generate(prompt, max_tokens=max_tokens)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -488,6 +491,7 @@ def run_no_context(
 def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    max_tokens: int = 256,
     batch_size: int = 16,
 ) -> ExperimentResult:
     """Independent condition: Each sub-question answered independently.
@@ -531,7 +535,7 @@ def run_independent(
     all_results = []
     for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc="Independent"):
         batch_prompts = all_prompts[batch_start:batch_start + batch_size]
-        batch_results = client.generate_batch(batch_prompts, max_tokens=256)
+        batch_results = client.generate_batch(batch_prompts, max_tokens=max_tokens)
         all_results.extend(batch_results)
 
     # Organize results by sample
@@ -604,6 +608,7 @@ def run_independent(
 def run_shuffled(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    max_tokens: int = 256,
     seed: int = 42,
 ) -> ExperimentResult:
     """Shuffled condition: Random order but with prior Q&A context.
@@ -659,7 +664,7 @@ def run_shuffled(
             prompt_parts.append(f"Now answer this question:\nQ: {sub_q}\nA:")
             prompt = "\n\n".join(prompt_parts)
 
-            pred, response = client.generate(prompt, max_tokens=256)
+            pred, response = client.generate(prompt, max_tokens=max_tokens)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -732,6 +737,7 @@ def worker_process(
     conditions: List[str],
     seed: int,
     output_dir: str,
+    max_tokens: int = 256,
 ):
     """Worker process that runs on a single GPU."""
     import os
@@ -765,23 +771,23 @@ def worker_process(
 
     if "oracle" in conditions:
         logger.info(f"[Worker {rank}] Running oracle...")
-        results.append(run_oracle(samples, client))
+        results.append(run_oracle(samples, client, max_tokens=max_tokens))
 
     if "oracle_gold" in conditions:
         logger.info(f"[Worker {rank}] Running oracle_gold...")
-        results.append(run_oracle_gold(samples, client))
+        results.append(run_oracle_gold(samples, client, max_tokens=max_tokens))
 
     if "no_context" in conditions:
         logger.info(f"[Worker {rank}] Running no_context...")
-        results.append(run_no_context(samples, client))
+        results.append(run_no_context(samples, client, max_tokens=max_tokens))
 
     if "independent" in conditions:
         logger.info(f"[Worker {rank}] Running independent...")
-        results.append(run_independent(samples, client))
+        results.append(run_independent(samples, client, max_tokens=max_tokens))
 
     if "shuffled" in conditions:
         logger.info(f"[Worker {rank}] Running shuffled...")
-        results.append(run_shuffled(samples, client, seed=seed))
+        results.append(run_shuffled(samples, client, max_tokens=max_tokens, seed=seed))
 
     # Save results to temp file
     os.makedirs(output_dir, exist_ok=True)
@@ -852,6 +858,10 @@ def main():
         "--gpus", type=str, default="0,1,2,3,4,5,6,7",
         help="Comma-separated list of GPUs for parallel mode"
     )
+    parser.add_argument(
+        "--max-tokens", type=int, default=256,
+        help="Maximum number of tokens to generate"
+    )
     args = parser.parse_args()
 
     conditions = [c.strip() for c in args.conditions.split(",")]
@@ -890,7 +900,7 @@ def main():
             p = mp.Process(
                 target=worker_process,
                 args=(rank, world_size, gpu_id, args.model, args.use_vllm,
-                      shards[rank], conditions, args.seed, args.output_dir)
+                      shards[rank], conditions, args.seed, args.output_dir, args.max_tokens)
             )
             p.start()
             processes.append(p)
@@ -965,15 +975,15 @@ def main():
         results = []
 
         if "oracle" in conditions:
-            results.append(run_oracle(all_samples, client))
+            results.append(run_oracle(all_samples, client, max_tokens=args.max_tokens))
         if "oracle_gold" in conditions:
-            results.append(run_oracle_gold(all_samples, client))
+            results.append(run_oracle_gold(all_samples, client, max_tokens=args.max_tokens))
         if "no_context" in conditions:
-            results.append(run_no_context(all_samples, client))
+            results.append(run_no_context(all_samples, client, max_tokens=args.max_tokens))
         if "independent" in conditions:
-            results.append(run_independent(all_samples, client))
+            results.append(run_independent(all_samples, client, max_tokens=args.max_tokens))
         if "shuffled" in conditions:
-            results.append(run_shuffled(all_samples, client, seed=args.seed))
+            results.append(run_shuffled(all_samples, client, max_tokens=args.max_tokens, seed=args.seed))
 
         print_summary(results)
         save_results(results, config)
