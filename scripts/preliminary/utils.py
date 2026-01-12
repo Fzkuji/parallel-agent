@@ -472,8 +472,8 @@ def print_summary(results: List[ExperimentResult]) -> None:
         print("No results to display.")
         return
 
-    # Build header
-    headers = ["Condition", "EM", "F1", "Samples", "Questions", "Prompt Tok", "Compl Tok", "Latency (s)"]
+    # Build header (show per-sample averages for tokens and latency)
+    headers = ["Condition", "EM", "F1", "Samples", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
 
     # Print markdown table header
     print("| " + " | ".join(headers) + " |")
@@ -483,15 +483,18 @@ def print_summary(results: List[ExperimentResult]) -> None:
     for result in results:
         em = result.metrics.get("em", 0)
         f1 = result.metrics.get("f1", 0)
+        n = result.n_samples if result.n_samples > 0 else 1
+        avg_prompt = result.prompt_tokens / n
+        avg_compl = result.completion_tokens / n
+        avg_latency = result.latency / n
         row = [
             result.condition,
             f"{em:.4f}",
             f"{f1:.4f}",
             str(result.n_samples),
-            str(result.n_questions),
-            str(result.prompt_tokens),
-            str(result.completion_tokens),
-            f"{result.latency:.2f}" if result.latency > 0 else "-",
+            f"{avg_prompt:.1f}",
+            f"{avg_compl:.1f}",
+            f"{avg_latency:.2f}" if result.latency > 0 else "-",
         ]
         print("| " + " | ".join(row) + " |")
 

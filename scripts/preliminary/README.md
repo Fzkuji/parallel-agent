@@ -18,12 +18,21 @@
 
 - **Dataset**: MoreHopQA (3-5 hop reasoning, 含 gold sub-questions/sub-answers 和 context)
 - **RQ**: 按依赖顺序回答并传递前序答案是否提升多步推理性能？
-- **Setup**:
-  - Oracle (Sequential + Context): 按 question_decomposition 顺序回答，传递前序 Q&A，包含支持段落
-  - Independent (No Context): 每个子问题独立回答，不传递前序 Q&A，仅包含支持段落
-  - Shuffled (Random Order + Context): 打乱顺序回答，传递前序 Q&A（错误顺序），包含支持段落
-- **评估**: 所有子问题的准确率（不只是最后一个）
-- **预期**: Oracle > Shuffled > Independent（传递正确上下文最优，错误上下文次之，无上下文最差）
+- **Setup** (8个条件 = 3种策略 × context变体):
+
+  | 条件 | 顺序 | Prior Q&A | Context |
+  |------|------|-----------|---------|
+  | oracle_gold | 顺序 | Gold答案 | ✅ |
+  | oracle_gold_no_context | 顺序 | Gold答案 | ❌ |
+  | oracle | 顺序 | 预测答案 | ✅ |
+  | shuffled_gold | 乱序 | Gold答案 | ✅ |
+  | shuffled_gold_no_context | 乱序 | Gold答案 | ❌ |
+  | shuffled | 乱序 | 预测答案 | ✅ |
+  | independent | 无 | ❌ | ✅ |
+  | independent_no_context | 无 | ❌ | ❌ |
+
+- **评估**: 最后一个子问题的 EM/F1（最终答案）
+- **预期**: oracle_gold > oracle > shuffled > independent
 
 ### Exp 2a: Shared Context (语义-中)
 
@@ -93,8 +102,9 @@ python scripts/preliminary/run_all.py --model gpt-4o --full
 python scripts/preliminary/exp1_answer_dependency.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --use-local \
+    --use-vllm \
     --n-samples 50 \
-    --conditions oracle,independent,shuffled
+    --conditions oracle_gold,oracle,shuffled,independent
 
 # Exp 2a: Shared Context
 python scripts/preliminary/exp2a_shared_context.py \

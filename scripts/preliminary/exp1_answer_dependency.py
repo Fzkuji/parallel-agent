@@ -6,15 +6,21 @@ Dataset: MoreHopQA (3-5 hop reasoning with gold sub-questions and sub-answers)
 Research Question: Does answering questions in correct order with prior context
 improve multi-step reasoning performance?
 
-Conditions:
-- Oracle (Sequential + Pred Context): Follow decomposition order, pass prior Q&A with predicted answers
-- Oracle-Gold (Sequential + Gold Context): Follow decomposition order, pass prior Q&A with gold answers
-- No-Context (Sequential + Prior Q&A only): Follow decomposition order, pass prior Q&A but NO reference context
-- Independent (No Context): Answer each sub-question independently, no prior info
-- Shuffled (Random Order + Context): Random order but still pass prior Q&A
+8 Conditions (3 strategies × context variations):
 
-Expected: Oracle-Gold > Oracle > Shuffled > Independent
-(No-Context tests if model relies on reference context or prior Q&A chain)
+Sequential (oracle) family:
+- oracle_gold: Sequential order + gold prior Q&A + context
+- oracle_gold_no_context: Sequential order + gold prior Q&A + NO context
+- oracle: Sequential order + predicted prior Q&A + context
+
+Shuffled family:
+- shuffled_gold: Shuffled order + gold prior Q&A + context
+- shuffled_gold_no_context: Shuffled order + gold prior Q&A + NO context
+- shuffled: Shuffled order + predicted prior Q&A + context
+
+Independent family:
+- independent: No prior Q&A + context
+- independent_no_context: No prior Q&A + NO context
 """
 
 from __future__ import annotations
@@ -193,19 +199,32 @@ def _evaluate_answer(pred: str, gold: str) -> Tuple[float, float]:
     return em, f1
 
 
-def run_oracle(
+def run_sequential(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    use_gold: bool = False,
+    use_context: bool = True,
     max_tokens: int = 2048,
 ) -> ExperimentResult:
-    """Oracle condition: Sequential order with prior Q&A context.
+    """Sequential (oracle) condition: Answer sub-questions in order.
 
-    - Answer sub-questions in correct order
-    - Pass prior Q&A as context
-    - Include supporting paragraphs
-    - Only evaluate the LAST step (final answer)
+    Args:
+        samples: List of samples
+        client: LLM client
+        use_gold: If True, use gold answers for prior Q&A; otherwise use predicted
+        use_context: If True, include reference context paragraphs
+        max_tokens: Max tokens to generate
+
+    Returns:
+        ExperimentResult with condition name based on parameters
     """
-    logger.info("Running Oracle condition (Sequential + Context)...")
+    # Determine condition name
+    if use_gold:
+        condition = "oracle_gold" if use_context else "oracle_gold_no_context"
+    else:
+        condition = "oracle" if use_context else "oracle_no_context"
+
+    logger.info(f"Running {condition} condition...")
 
     total_em = 0.0
     total_f1 = 0.0
@@ -215,11 +234,10 @@ def run_oracle(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for sample in tqdm(samples, desc="Oracle"):
+    for sample in tqdm(samples, desc=condition):
         decomp = sample["decomposition"]
-        context_str = _format_context(sample.get("context", []))
+        context_str = _format_context(sample.get("context", [])) if use_context else ""
 
-        # Build context with prior Q&A
         prior_qa = []
         sample_details = []
 
@@ -227,14 +245,12 @@ def run_oracle(
             sub_q = step["question"]
             gold_answer = step["answer"]
 
-            # Build prompt with context and prior Q&A
+            # Build prompt
             prompt_parts = []
 
-            # Add supporting context
             if context_str:
                 prompt_parts.append(f"Reference Information:\n{context_str}")
 
-            # Add prior Q&A
             if prior_qa:
                 qa_context = "Previous Q&A:\n" + "\n".join(
                     [f"Q: {q}\nA: {a}" for q, a in prior_qa]
@@ -249,7 +265,6 @@ def run_oracle(
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            # Evaluate this sub-question
             em, f1 = _evaluate_answer(pred, gold_answer)
 
             sample_details.append({
@@ -264,8 +279,11 @@ def run_oracle(
                 "completion_tokens": response.completion_tokens,
             })
 
-            # Pass predicted answer (not gold) to next step
-            prior_qa.append((sub_q, _extract_boxed_answer(pred)))
+            # Update prior Q&A for next step
+            if use_gold:
+                prior_qa.append((sub_q, gold_answer))
+            else:
+                prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
         # Only count the LAST step for metrics
         if sample_details:
@@ -286,117 +304,7 @@ def run_oracle(
     avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
-        condition="oracle",
-        dataset="morehopqa",
-        n_samples=len(samples),
-        n_questions=total_samples,  # Now represents number of final answers evaluated
-        accuracy=avg_em,
-        metrics={
-            "em": avg_em,
-            "f1": avg_f1,
-        },
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        details=details,
-    )
-
-
-def run_oracle_gold(
-    samples: List[Dict[str, Any]],
-    client: LLMClient,
-    max_tokens: int = 2048,
-) -> ExperimentResult:
-    """Oracle-Gold condition: Sequential order with gold answers as context.
-
-    - Answer sub-questions in correct order
-    - Pass gold answers (not predicted) as context
-    - Include supporting paragraphs
-    - This establishes upper bound to test error propagation hypothesis
-    - Only evaluate the LAST step (final answer)
-    """
-    logger.info("Running Oracle-Gold condition (Sequential + Gold Context)...")
-
-    total_em = 0.0
-    total_f1 = 0.0
-    total_samples = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for sample in tqdm(samples, desc="Oracle-Gold"):
-        decomp = sample["decomposition"]
-        context_str = _format_context(sample.get("context", []))
-
-        # Build context with prior Q&A (using gold answers)
-        prior_qa = []
-        sample_details = []
-
-        for i, step in enumerate(decomp):
-            sub_q = step["question"]
-            gold_answer = step["answer"]
-
-            # Build prompt with context and prior Q&A
-            prompt_parts = []
-
-            # Add supporting context
-            if context_str:
-                prompt_parts.append(f"Reference Information:\n{context_str}")
-
-            # Add prior Q&A (with gold answers)
-            if prior_qa:
-                qa_context = "Previous Q&A:\n" + "\n".join(
-                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
-                )
-                prompt_parts.append(qa_context)
-
-            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
-            prompt = "\n\n".join(prompt_parts)
-
-            pred, response = client.generate(prompt, max_tokens=max_tokens)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            # Evaluate this sub-question
-            em, f1 = _evaluate_answer(pred, gold_answer)
-
-            sample_details.append({
-                "sub_id": i,
-                "question": sub_q,
-                "gold_answer": gold_answer,
-                "prediction": pred.strip(),
-                "extracted_answer": _extract_boxed_answer(pred),
-                "em": em,
-                "f1": f1,
-                "prompt_tokens": response.prompt_tokens,
-                "completion_tokens": response.completion_tokens,
-            })
-
-            # Pass gold answer (not predicted) to next step
-            prior_qa.append((sub_q, gold_answer))
-
-        # Only count the LAST step for metrics
-        if sample_details:
-            last_step = sample_details[-1]
-            total_em += last_step["em"]
-            total_f1 += last_step["f1"]
-            total_samples += 1
-
-        details.append({
-            "main_question": sample["question"],
-            "n_hops": sample["n_hops"],
-            "sub_questions": sample_details,
-            "final_em": sample_details[-1]["em"] if sample_details else 0,
-            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
-        })
-
-    avg_em = total_em / total_samples if total_samples > 0 else 0
-    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
-
-    return ExperimentResult(
-        condition="oracle_gold",
+        condition=condition,
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_samples,
@@ -412,19 +320,36 @@ def run_oracle_gold(
     )
 
 
-def run_no_context(
+def run_shuffled(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    use_gold: bool = False,
+    use_context: bool = True,
     max_tokens: int = 2048,
+    seed: int = 42,
 ) -> ExperimentResult:
-    """No-Context condition: Sequential order with prior Q&A but NO reference context.
+    """Shuffled condition: Answer sub-questions in random order.
 
-    - Answer sub-questions in correct order
-    - Pass prior Q&A as context (with predicted answers)
-    - NO supporting paragraphs (to test if model relies on context vs prior Q&A)
-    - Only evaluate the LAST step (final answer)
+    Args:
+        samples: List of samples
+        client: LLM client
+        use_gold: If True, use gold answers for prior Q&A; otherwise use predicted
+        use_context: If True, include reference context paragraphs
+        max_tokens: Max tokens to generate
+        seed: Random seed for shuffling
+
+    Returns:
+        ExperimentResult with condition name based on parameters
     """
-    logger.info("Running No-Context condition (Sequential + Prior Q&A, No Reference)...")
+    # Determine condition name
+    if use_gold:
+        condition = "shuffled_gold" if use_context else "shuffled_gold_no_context"
+    else:
+        condition = "shuffled" if use_context else "shuffled_no_context"
+
+    logger.info(f"Running {condition} condition...")
+
+    random.seed(seed)
 
     total_em = 0.0
     total_f1 = 0.0
@@ -434,29 +359,38 @@ def run_no_context(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for sample in tqdm(samples, desc="No-Context"):
+    for sample in tqdm(samples, desc=condition):
         decomp = sample["decomposition"]
-        # NOTE: No context_str here - that's the key difference
+        context_str = _format_context(sample.get("context", [])) if use_context else ""
 
-        # Build context with prior Q&A only
+        # Shuffle order
+        indices = list(range(len(decomp)))
+        random.shuffle(indices)
+
         prior_qa = []
+        predictions = {}
+        prompt_tokens_map = {}
+        completion_tokens_map = {}
         sample_details = []
 
-        for i, step in enumerate(decomp):
+        for idx in indices:
+            step = decomp[idx]
             sub_q = step["question"]
             gold_answer = step["answer"]
 
-            # Build prompt with prior Q&A only (NO reference context)
+            # Build prompt
             prompt_parts = []
 
-            # Add prior Q&A
+            if context_str:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
+
             if prior_qa:
                 qa_context = "Previous Q&A:\n" + "\n".join(
                     [f"Q: {q}\nA: {a}" for q, a in prior_qa]
                 )
                 prompt_parts.append(qa_context)
-            prompt_parts.append(f"Answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
 
+            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
             prompt = "\n\n".join(prompt_parts)
 
             pred, response = client.generate(prompt, max_tokens=max_tokens)
@@ -464,23 +398,34 @@ def run_no_context(
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            # Evaluate this sub-question
+            predictions[idx] = pred.strip()
+            prompt_tokens_map[idx] = response.prompt_tokens
+            completion_tokens_map[idx] = response.completion_tokens
+
+            # Update prior Q&A for next step
+            if use_gold:
+                prior_qa.append((sub_q, gold_answer))
+            else:
+                prior_qa.append((sub_q, _extract_boxed_answer(pred)))
+
+        # Evaluate all sub-questions (in original order)
+        for i, step in enumerate(decomp):
+            gold_answer = step["answer"]
+            pred = predictions.get(i, "")
+
             em, f1 = _evaluate_answer(pred, gold_answer)
 
             sample_details.append({
                 "sub_id": i,
-                "question": sub_q,
+                "question": step["question"],
                 "gold_answer": gold_answer,
-                "prediction": pred.strip(),
+                "prediction": pred,
                 "extracted_answer": _extract_boxed_answer(pred),
                 "em": em,
                 "f1": f1,
-                "prompt_tokens": response.prompt_tokens,
-                "completion_tokens": response.completion_tokens,
+                "prompt_tokens": prompt_tokens_map.get(i, 0),
+                "completion_tokens": completion_tokens_map.get(i, 0),
             })
-
-            # Pass predicted answer to next step
-            prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
         # Only count the LAST step for metrics
         if sample_details:
@@ -492,6 +437,7 @@ def run_no_context(
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
+            "shuffled_order": indices,
             "sub_questions": sample_details,
             "final_em": sample_details[-1]["em"] if sample_details else 0,
             "final_f1": sample_details[-1]["f1"] if sample_details else 0,
@@ -501,7 +447,7 @@ def run_no_context(
     avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
-        condition="no_context",
+        condition=condition,
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_samples,
@@ -520,17 +466,25 @@ def run_no_context(
 def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
+    use_context: bool = True,
     max_tokens: int = 2048,
     batch_size: int = 16,
 ) -> ExperimentResult:
     """Independent condition: Each sub-question answered independently.
 
-    - No prior Q&A context
-    - Still include supporting paragraphs
-    - Uses batch inference for efficiency
-    - Only evaluate the LAST step (final answer)
+    Args:
+        samples: List of samples
+        client: LLM client
+        use_context: If True, include reference context paragraphs
+        max_tokens: Max tokens to generate
+        batch_size: Batch size for inference
+
+    Returns:
+        ExperimentResult with condition name based on parameters
     """
-    logger.info(f"Running Independent condition (No Context, batch_size={batch_size})...")
+    condition = "independent" if use_context else "independent_no_context"
+
+    logger.info(f"Running {condition} condition (batch_size={batch_size})...")
 
     total_em = 0.0
     total_f1 = 0.0
@@ -546,13 +500,13 @@ def run_independent(
 
     for sample_idx, sample in enumerate(samples):
         decomp = sample["decomposition"]
-        context_str = _format_context(sample.get("context", []))
+        context_str = _format_context(sample.get("context", [])) if use_context else ""
 
         for i, step in enumerate(decomp):
             sub_q = step["question"]
             gold_answer = step["answer"]
 
-            # Build prompt with context only (no prior Q&A)
+            # Build prompt (no prior Q&A)
             prompt_parts = []
             if context_str:
                 prompt_parts.append(f"Reference Information:\n{context_str}")
@@ -564,7 +518,7 @@ def run_independent(
 
     # Process in batches
     all_results = []
-    for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc="Independent"):
+    for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc=condition):
         batch_prompts = all_prompts[batch_start:batch_start + batch_size]
         batch_results = client.generate_batch(batch_prompts, max_tokens=max_tokens)
         all_results.extend(batch_results)
@@ -623,134 +577,7 @@ def run_independent(
     avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
-        condition="independent",
-        dataset="morehopqa",
-        n_samples=len(samples),
-        n_questions=total_samples,
-        accuracy=avg_em,
-        metrics={
-            "em": avg_em,
-            "f1": avg_f1,
-        },
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        details=details,
-    )
-
-
-def run_shuffled(
-    samples: List[Dict[str, Any]],
-    client: LLMClient,
-    max_tokens: int = 2048,
-    seed: int = 42,
-) -> ExperimentResult:
-    """Shuffled condition: Random order but with prior Q&A context.
-
-    - Answer sub-questions in random order
-    - Pass prior Q&A as context (but in wrong order)
-    - Include supporting paragraphs
-    - Only evaluate the LAST step (final answer)
-    """
-    logger.info("Running Shuffled condition (Random Order + Context)...")
-
-    random.seed(seed)
-
-    total_em = 0.0
-    total_f1 = 0.0
-    total_samples = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for sample in tqdm(samples, desc="Shuffled"):
-        decomp = sample["decomposition"]
-        context_str = _format_context(sample.get("context", []))
-
-        # Shuffle order
-        indices = list(range(len(decomp)))
-        random.shuffle(indices)
-
-        # Build context with prior Q&A (in shuffled order)
-        prior_qa = []
-        predictions = {}
-        prompt_tokens_map = {}
-        completion_tokens_map = {}
-        sample_details = []
-
-        for idx in indices:
-            step = decomp[idx]
-            sub_q = step["question"]
-            gold_answer = step["answer"]
-
-            # Build prompt with context and prior Q&A
-            prompt_parts = []
-
-            if context_str:
-                prompt_parts.append(f"Reference Information:\n{context_str}")
-
-            if prior_qa:
-                qa_context = "Previous Q&A:\n" + "\n".join(
-                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
-                )
-                prompt_parts.append(qa_context)
-
-            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
-            prompt = "\n\n".join(prompt_parts)
-
-            pred, response = client.generate(prompt, max_tokens=max_tokens)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            predictions[idx] = pred.strip()
-            prompt_tokens_map[idx] = response.prompt_tokens
-            completion_tokens_map[idx] = response.completion_tokens
-
-            # Pass predicted answer to next step
-            prior_qa.append((sub_q, _extract_boxed_answer(pred)))
-
-        # Evaluate all sub-questions (in original order)
-        for i, step in enumerate(decomp):
-            gold_answer = step["answer"]
-            pred = predictions.get(i, "")
-
-            em, f1 = _evaluate_answer(pred, gold_answer)
-
-            sample_details.append({
-                "sub_id": i,
-                "question": step["question"],
-                "gold_answer": gold_answer,
-                "prediction": pred,
-                "extracted_answer": _extract_boxed_answer(pred),
-                "em": em,
-                "f1": f1,
-                "prompt_tokens": prompt_tokens_map.get(i, 0),
-                "completion_tokens": completion_tokens_map.get(i, 0),
-            })
-
-        # Only count the LAST step for metrics
-        if sample_details:
-            last_step = sample_details[-1]
-            total_em += last_step["em"]
-            total_f1 += last_step["f1"]
-            total_samples += 1
-
-        details.append({
-            "main_question": sample["question"],
-            "n_hops": sample["n_hops"],
-            "shuffled_order": indices,
-            "sub_questions": sample_details,
-            "final_em": sample_details[-1]["em"] if sample_details else 0,
-            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
-        })
-
-    avg_em = total_em / total_samples if total_samples > 0 else 0
-    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
-
-    return ExperimentResult(
-        condition="shuffled",
+        condition=condition,
         dataset="morehopqa",
         n_samples=len(samples),
         n_questions=total_samples,
@@ -808,25 +635,25 @@ def worker_process(
     # Run conditions
     results = []
 
-    if "oracle" in conditions:
-        logger.info(f"[Worker {rank}] Running oracle...")
-        results.append(run_oracle(samples, client, max_tokens=max_tokens))
+    for cond in conditions:
+        logger.info(f"[Worker {rank}] Running {cond}...")
 
-    if "oracle_gold" in conditions:
-        logger.info(f"[Worker {rank}] Running oracle_gold...")
-        results.append(run_oracle_gold(samples, client, max_tokens=max_tokens))
-
-    if "no_context" in conditions:
-        logger.info(f"[Worker {rank}] Running no_context...")
-        results.append(run_no_context(samples, client, max_tokens=max_tokens))
-
-    if "independent" in conditions:
-        logger.info(f"[Worker {rank}] Running independent...")
-        results.append(run_independent(samples, client, max_tokens=max_tokens))
-
-    if "shuffled" in conditions:
-        logger.info(f"[Worker {rank}] Running shuffled...")
-        results.append(run_shuffled(samples, client, max_tokens=max_tokens, seed=seed))
+        if cond == "oracle_gold":
+            results.append(run_sequential(samples, client, use_gold=True, use_context=True, max_tokens=max_tokens))
+        elif cond == "oracle_gold_no_context":
+            results.append(run_sequential(samples, client, use_gold=True, use_context=False, max_tokens=max_tokens))
+        elif cond == "oracle":
+            results.append(run_sequential(samples, client, use_gold=False, use_context=True, max_tokens=max_tokens))
+        elif cond == "shuffled_gold":
+            results.append(run_shuffled(samples, client, use_gold=True, use_context=True, max_tokens=max_tokens, seed=seed))
+        elif cond == "shuffled_gold_no_context":
+            results.append(run_shuffled(samples, client, use_gold=True, use_context=False, max_tokens=max_tokens, seed=seed))
+        elif cond == "shuffled":
+            results.append(run_shuffled(samples, client, use_gold=False, use_context=True, max_tokens=max_tokens, seed=seed))
+        elif cond == "independent":
+            results.append(run_independent(samples, client, use_context=True, max_tokens=max_tokens))
+        elif cond == "independent_no_context":
+            results.append(run_independent(samples, client, use_context=False, max_tokens=max_tokens))
 
     # Save results to temp file
     os.makedirs(output_dir, exist_ok=True)
@@ -881,8 +708,9 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="oracle,oracle_gold,no_context,independent,shuffled",
-        help="Comma-separated list of conditions to run (oracle, oracle_gold, no_context, independent, shuffled)"
+        "--conditions", type=str,
+        default="oracle_gold,oracle_gold_no_context,oracle,shuffled_gold,shuffled_gold_no_context,shuffled,independent,independent_no_context",
+        help="Comma-separated list of conditions to run"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
@@ -1017,16 +845,23 @@ def main():
 
         results = []
 
-        if "oracle" in conditions:
-            results.append(run_oracle(all_samples, client, max_tokens=args.max_tokens))
-        if "oracle_gold" in conditions:
-            results.append(run_oracle_gold(all_samples, client, max_tokens=args.max_tokens))
-        if "no_context" in conditions:
-            results.append(run_no_context(all_samples, client, max_tokens=args.max_tokens))
-        if "independent" in conditions:
-            results.append(run_independent(all_samples, client, max_tokens=args.max_tokens))
-        if "shuffled" in conditions:
-            results.append(run_shuffled(all_samples, client, max_tokens=args.max_tokens, seed=args.seed))
+        for cond in conditions:
+            if cond == "oracle_gold":
+                results.append(run_sequential(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "oracle_gold_no_context":
+                results.append(run_sequential(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens))
+            elif cond == "oracle":
+                results.append(run_sequential(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "shuffled_gold":
+                results.append(run_shuffled(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
+            elif cond == "shuffled_gold_no_context":
+                results.append(run_shuffled(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens, seed=args.seed))
+            elif cond == "shuffled":
+                results.append(run_shuffled(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
+            elif cond == "independent":
+                results.append(run_independent(all_samples, client, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "independent_no_context":
+                results.append(run_independent(all_samples, client, use_context=False, max_tokens=args.max_tokens))
 
         print_summary(results)
         save_results(results, config)
@@ -1060,8 +895,6 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
 
     avg_em = total_em / total_questions if total_questions > 0 else 0
     avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
-    avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
-    avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition=results[0].condition,
@@ -1072,8 +905,6 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         metrics={
             "em": avg_em,
             "f1": avg_f1,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_completion_tokens": avg_completion_tokens,
         },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
