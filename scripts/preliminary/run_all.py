@@ -44,10 +44,6 @@ def main():
         help="Use vLLM for faster inference (requires --use-local)"
     )
     parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1,
-        help="Number of GPUs for tensor parallelism (vLLM only)"
-    )
-    parser.add_argument(
         "--quick", action="store_true",
         help="Run quick version with fewer samples"
     )
@@ -84,14 +80,14 @@ def main():
         n_groups = 50
 
     base_args = [
-        "--model", args.model,
+        "--models", args.model,
         "--seed", str(args.seed),
         "--output-dir", args.output_dir,
     ]
     if args.use_local:
         base_args.append("--use-local")
     if args.use_vllm:
-        base_args.extend(["--use-vllm", "--tensor-parallel-size", str(args.tensor_parallel_size)])
+        base_args.append("--use-vllm")
 
     experiments = {
         "exp1": {

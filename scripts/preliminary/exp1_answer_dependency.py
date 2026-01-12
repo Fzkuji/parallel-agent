@@ -680,62 +680,21 @@ def worker_process(
     logger.info(f"[Worker {rank}] Done, saved to {temp_file}")
 
 
-def main():
+def run_experiment_for_model(
+    model: str,
+    all_samples: List[Dict[str, Any]],
+    conditions: List[str],
+    args,
+    num_gpus: int,
+):
+    """Run experiment for a single model."""
     import multiprocessing as mp
     import json
+    import os
 
-    parser = argparse.ArgumentParser(
-        description="Exp 1: Answer Dependency - MoreHopQA"
-    )
-    parser.add_argument(
-        "--model", type=str, default="gpt-4o-mini",
-        help="Model to use for inference (e.g., gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct)"
-    )
-    parser.add_argument(
-        "--use-local", action="store_true",
-        help="Use local model instead of API"
-    )
-    parser.add_argument(
-        "--use-vllm", action="store_true",
-        help="Use vLLM for faster inference (requires --use-local)"
-    )
-    parser.add_argument(
-        "--n-samples", type=int, default=-1,
-        help="Number of samples to evaluate (-1 for all)"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed"
-    )
-    parser.add_argument(
-        "--conditions", type=str,
-        default="oracle_gold,oracle_gold_no_context,oracle,shuffled_gold,shuffled_gold_no_context,shuffled,independent,independent_no_context",
-        help="Comma-separated list of conditions to run"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="outputs/preliminary",
-        help="Output directory for results"
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=2048,
-        help="Maximum number of tokens to generate"
-    )
-    args = parser.parse_args()
-
-    conditions = [c.strip() for c in args.conditions.split(",")]
-
-    # Load data
-    all_samples = load_morehopqa(n_samples=args.n_samples, seed=args.seed)
-
-    # Auto-detect available GPUs
-    num_gpus = 0
-    if args.use_local:
-        try:
-            import torch
-            num_gpus = torch.cuda.device_count()
-            logger.info(f"Detected {num_gpus} available GPU(s)")
-        except ImportError:
-            logger.warning("PyTorch not available, using single process mode")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Running experiment for model: {model}")
+    logger.info(f"{'='*60}\n")
 
     if args.use_local and num_gpus > 1:
         # Multi-GPU parallel mode with multiprocessing
@@ -751,7 +710,6 @@ def main():
             pass
 
         # Clean up old temp files
-        import os
         for rank in range(world_size):
             temp_file = os.path.join(args.output_dir, f"temp_rank{rank}.json")
             if os.path.exists(temp_file):
@@ -767,7 +725,7 @@ def main():
         for rank, gpu_id in enumerate(gpus):
             p = mp.Process(
                 target=worker_process,
-                args=(rank, world_size, gpu_id, args.model, args.use_vllm,
+                args=(rank, world_size, gpu_id, model, args.use_vllm,
                       shards[rank], conditions, args.seed, args.output_dir, args.max_tokens)
             )
             p.start()
@@ -805,66 +763,135 @@ def main():
                     ))
                 os.remove(temp_file)
 
-        # Merge and print results
+        # Merge results
         final_results = []
         for cond, results_list in all_results_by_condition.items():
             merged = _merge_results(results_list)
             final_results.append(merged)
-
-        config = ExperimentConfig(
-            exp_name="exp1_answer_dependency",
-            dataset="morehopqa",
-            model=args.model,
-            n_samples=args.n_samples,
-            seed=args.seed,
-            output_dir=args.output_dir,
-        )
-        print_summary(final_results)
-        save_results(final_results, config)
 
     else:
         # Single process mode (API or single GPU)
         if args.use_local and num_gpus == 1:
             logger.info("Single GPU mode: using GPU 0")
 
-        config = ExperimentConfig(
-            exp_name="exp1_answer_dependency",
-            dataset="morehopqa",
-            model=args.model,
-            n_samples=args.n_samples,
-            seed=args.seed,
-            output_dir=args.output_dir,
-        )
-
         client = LLMClient(
-            model=args.model,
+            model=model,
             use_local=args.use_local,
             use_vllm=args.use_vllm,
             tensor_parallel_size=1,
         )
 
-        results = []
+        final_results = []
 
         for cond in conditions:
             if cond == "oracle_gold":
-                results.append(run_sequential(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens))
+                final_results.append(run_sequential(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens))
             elif cond == "oracle_gold_no_context":
-                results.append(run_sequential(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens))
+                final_results.append(run_sequential(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens))
             elif cond == "oracle":
-                results.append(run_sequential(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens))
+                final_results.append(run_sequential(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens))
             elif cond == "shuffled_gold":
-                results.append(run_shuffled(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
+                final_results.append(run_shuffled(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
             elif cond == "shuffled_gold_no_context":
-                results.append(run_shuffled(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens, seed=args.seed))
+                final_results.append(run_shuffled(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens, seed=args.seed))
             elif cond == "shuffled":
-                results.append(run_shuffled(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
+                final_results.append(run_shuffled(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
             elif cond == "independent":
-                results.append(run_independent(all_samples, client, use_context=True, max_tokens=args.max_tokens))
+                final_results.append(run_independent(all_samples, client, use_context=True, max_tokens=args.max_tokens))
             elif cond == "independent_no_context":
-                results.append(run_independent(all_samples, client, use_context=False, max_tokens=args.max_tokens))
+                final_results.append(run_independent(all_samples, client, use_context=False, max_tokens=args.max_tokens))
 
-        print_summary(results)
-        save_results(results, config)
+    # Print and save results for this model
+    config = ExperimentConfig(
+        exp_name="exp1_answer_dependency",
+        dataset="morehopqa",
+        model=model,
+        n_samples=args.n_samples,
+        seed=args.seed,
+        output_dir=args.output_dir,
+    )
+
+    print(f"\n{'='*60}")
+    print(f"Results for: {model}")
+    print(f"{'='*60}")
+    print_summary(final_results)
+    save_results(final_results, config)
+
+    return final_results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Exp 1: Answer Dependency - MoreHopQA"
+    )
+    parser.add_argument(
+        "--models", type=str, default="gpt-4o-mini",
+        help="Comma-separated list of models (e.g., 'Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-14B-Instruct')"
+    )
+    parser.add_argument(
+        "--use-local", action="store_true",
+        help="Use local model instead of API"
+    )
+    parser.add_argument(
+        "--use-vllm", action="store_true",
+        help="Use vLLM for faster inference (requires --use-local)"
+    )
+    parser.add_argument(
+        "--n-samples", type=int, default=-1,
+        help="Number of samples to evaluate (-1 for all)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--conditions", type=str,
+        default="oracle_gold,oracle_gold_no_context,oracle,shuffled_gold,shuffled_gold_no_context,shuffled,independent,independent_no_context",
+        help="Comma-separated list of conditions to run"
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="outputs/preliminary",
+        help="Output directory for results"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=2048,
+        help="Maximum number of tokens to generate"
+    )
+    args = parser.parse_args()
+
+    models = [m.strip() for m in args.models.split(",")]
+    conditions = [c.strip() for c in args.conditions.split(",")]
+
+    logger.info(f"Models to evaluate: {models}")
+    logger.info(f"Conditions: {conditions}")
+
+    # Load data once (shared across all models)
+    all_samples = load_morehopqa(n_samples=args.n_samples, seed=args.seed)
+
+    # Auto-detect available GPUs
+    num_gpus = 0
+    if args.use_local:
+        try:
+            import torch
+            num_gpus = torch.cuda.device_count()
+            logger.info(f"Detected {num_gpus} available GPU(s)")
+        except ImportError:
+            logger.warning("PyTorch not available, using single process mode")
+
+    # Run experiment for each model
+    all_model_results = {}
+    for model in models:
+        results = run_experiment_for_model(model, all_samples, conditions, args, num_gpus)
+        all_model_results[model] = results
+
+    # Print final summary if multiple models
+    if len(models) > 1:
+        print(f"\n{'='*80}")
+        print("FINAL SUMMARY - ALL MODELS")
+        print(f"{'='*80}\n")
+        for model, results in all_model_results.items():
+            print(f"\n## {model}")
+            print_summary(results)
 
 
 def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
