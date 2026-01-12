@@ -196,19 +196,20 @@ def _evaluate_answer(pred: str, gold: str) -> Tuple[float, float]:
 def run_oracle(
     samples: List[Dict[str, Any]],
     client: LLMClient,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
 ) -> ExperimentResult:
     """Oracle condition: Sequential order with prior Q&A context.
 
     - Answer sub-questions in correct order
     - Pass prior Q&A as context
     - Include supporting paragraphs
+    - Only evaluate the LAST step (final answer)
     """
     logger.info("Running Oracle condition (Sequential + Context)...")
 
     total_em = 0.0
     total_f1 = 0.0
-    total_questions = 0
+    total_samples = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -220,8 +221,6 @@ def run_oracle(
 
         # Build context with prior Q&A
         prior_qa = []
-        sample_em = 0.0
-        sample_f1 = 0.0
         sample_details = []
 
         for i, step in enumerate(decomp):
@@ -252,11 +251,6 @@ def run_oracle(
 
             # Evaluate this sub-question
             em, f1 = _evaluate_answer(pred, gold_answer)
-            total_em += em
-            total_f1 += f1
-            sample_em += em
-            sample_f1 += f1
-            total_questions += 1
 
             sample_details.append({
                 "sub_id": i,
@@ -273,31 +267,33 @@ def run_oracle(
             # Pass predicted answer (not gold) to next step
             prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
-        n_sub = len(decomp) if decomp else 1
+        # Only count the LAST step for metrics
+        if sample_details:
+            last_step = sample_details[-1]
+            total_em += last_step["em"]
+            total_f1 += last_step["f1"]
+            total_samples += 1
+
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "em": sample_em / n_sub,
-            "f1": sample_f1 / n_sub,
+            "final_em": sample_details[-1]["em"] if sample_details else 0,
+            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
         })
 
-    avg_em = total_em / total_questions if total_questions > 0 else 0
-    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
-    avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
-    avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
         condition="oracle",
         dataset="morehopqa",
         n_samples=len(samples),
-        n_questions=total_questions,
-        accuracy=avg_em,  # Use EM as primary accuracy metric
+        n_questions=total_samples,  # Now represents number of final answers evaluated
+        accuracy=avg_em,
         metrics={
             "em": avg_em,
             "f1": avg_f1,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_completion_tokens": avg_completion_tokens,
         },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
@@ -309,7 +305,7 @@ def run_oracle(
 def run_oracle_gold(
     samples: List[Dict[str, Any]],
     client: LLMClient,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
 ) -> ExperimentResult:
     """Oracle-Gold condition: Sequential order with gold answers as context.
 
@@ -317,12 +313,13 @@ def run_oracle_gold(
     - Pass gold answers (not predicted) as context
     - Include supporting paragraphs
     - This establishes upper bound to test error propagation hypothesis
+    - Only evaluate the LAST step (final answer)
     """
     logger.info("Running Oracle-Gold condition (Sequential + Gold Context)...")
 
     total_em = 0.0
     total_f1 = 0.0
-    total_questions = 0
+    total_samples = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -334,8 +331,6 @@ def run_oracle_gold(
 
         # Build context with prior Q&A (using gold answers)
         prior_qa = []
-        sample_em = 0.0
-        sample_f1 = 0.0
         sample_details = []
 
         for i, step in enumerate(decomp):
@@ -366,11 +361,6 @@ def run_oracle_gold(
 
             # Evaluate this sub-question
             em, f1 = _evaluate_answer(pred, gold_answer)
-            total_em += em
-            total_f1 += f1
-            sample_em += em
-            sample_f1 += f1
-            total_questions += 1
 
             sample_details.append({
                 "sub_id": i,
@@ -387,31 +377,33 @@ def run_oracle_gold(
             # Pass gold answer (not predicted) to next step
             prior_qa.append((sub_q, gold_answer))
 
-        n_sub = len(decomp) if decomp else 1
+        # Only count the LAST step for metrics
+        if sample_details:
+            last_step = sample_details[-1]
+            total_em += last_step["em"]
+            total_f1 += last_step["f1"]
+            total_samples += 1
+
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "em": sample_em / n_sub,
-            "f1": sample_f1 / n_sub,
+            "final_em": sample_details[-1]["em"] if sample_details else 0,
+            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
         })
 
-    avg_em = total_em / total_questions if total_questions > 0 else 0
-    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
-    avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
-    avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
         condition="oracle_gold",
         dataset="morehopqa",
         n_samples=len(samples),
-        n_questions=total_questions,
+        n_questions=total_samples,
         accuracy=avg_em,
         metrics={
             "em": avg_em,
             "f1": avg_f1,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_completion_tokens": avg_completion_tokens,
         },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
@@ -423,19 +415,20 @@ def run_oracle_gold(
 def run_no_context(
     samples: List[Dict[str, Any]],
     client: LLMClient,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
 ) -> ExperimentResult:
     """No-Context condition: Sequential order with prior Q&A but NO reference context.
 
     - Answer sub-questions in correct order
     - Pass prior Q&A as context (with predicted answers)
     - NO supporting paragraphs (to test if model relies on context vs prior Q&A)
+    - Only evaluate the LAST step (final answer)
     """
     logger.info("Running No-Context condition (Sequential + Prior Q&A, No Reference)...")
 
     total_em = 0.0
     total_f1 = 0.0
-    total_questions = 0
+    total_samples = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -447,8 +440,6 @@ def run_no_context(
 
         # Build context with prior Q&A only
         prior_qa = []
-        sample_em = 0.0
-        sample_f1 = 0.0
         sample_details = []
 
         for i, step in enumerate(decomp):
@@ -475,11 +466,6 @@ def run_no_context(
 
             # Evaluate this sub-question
             em, f1 = _evaluate_answer(pred, gold_answer)
-            total_em += em
-            total_f1 += f1
-            sample_em += em
-            sample_f1 += f1
-            total_questions += 1
 
             sample_details.append({
                 "sub_id": i,
@@ -496,31 +482,33 @@ def run_no_context(
             # Pass predicted answer to next step
             prior_qa.append((sub_q, _extract_boxed_answer(pred)))
 
-        n_sub = len(decomp) if decomp else 1
+        # Only count the LAST step for metrics
+        if sample_details:
+            last_step = sample_details[-1]
+            total_em += last_step["em"]
+            total_f1 += last_step["f1"]
+            total_samples += 1
+
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "em": sample_em / n_sub,
-            "f1": sample_f1 / n_sub,
+            "final_em": sample_details[-1]["em"] if sample_details else 0,
+            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
         })
 
-    avg_em = total_em / total_questions if total_questions > 0 else 0
-    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
-    avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
-    avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
         condition="no_context",
         dataset="morehopqa",
         n_samples=len(samples),
-        n_questions=total_questions,
+        n_questions=total_samples,
         accuracy=avg_em,
         metrics={
             "em": avg_em,
             "f1": avg_f1,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_completion_tokens": avg_completion_tokens,
         },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
@@ -532,7 +520,7 @@ def run_no_context(
 def run_independent(
     samples: List[Dict[str, Any]],
     client: LLMClient,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
     batch_size: int = 16,
 ) -> ExperimentResult:
     """Independent condition: Each sub-question answered independently.
@@ -540,12 +528,13 @@ def run_independent(
     - No prior Q&A context
     - Still include supporting paragraphs
     - Uses batch inference for efficiency
+    - Only evaluate the LAST step (final answer)
     """
     logger.info(f"Running Independent condition (No Context, batch_size={batch_size})...")
 
     total_em = 0.0
     total_f1 = 0.0
-    total_questions = 0
+    total_samples = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -591,8 +580,6 @@ def run_independent(
     # Evaluate and build details
     for sample_idx, sample in enumerate(samples):
         decomp = sample["decomposition"]
-        sample_em = 0.0
-        sample_f1 = 0.0
         sample_details = []
 
         results = sample_results.get(sample_idx, [])
@@ -604,11 +591,6 @@ def run_independent(
             total_completion_tokens += response.completion_tokens
 
             em, f1 = _evaluate_answer(pred, gold_answer)
-            total_em += em
-            total_f1 += f1
-            sample_em += em
-            sample_f1 += f1
-            total_questions += 1
 
             sample_details.append({
                 "sub_id": sub_idx,
@@ -622,31 +604,33 @@ def run_independent(
                 "completion_tokens": response.completion_tokens,
             })
 
-        n_sub = len(decomp) if decomp else 1
+        # Only count the LAST step for metrics
+        if sample_details:
+            last_step = sample_details[-1]
+            total_em += last_step["em"]
+            total_f1 += last_step["f1"]
+            total_samples += 1
+
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
-            "em": sample_em / n_sub,
-            "f1": sample_f1 / n_sub,
+            "final_em": sample_details[-1]["em"] if sample_details else 0,
+            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
         })
 
-    avg_em = total_em / total_questions if total_questions > 0 else 0
-    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
-    avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
-    avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
         condition="independent",
         dataset="morehopqa",
         n_samples=len(samples),
-        n_questions=total_questions,
+        n_questions=total_samples,
         accuracy=avg_em,
         metrics={
             "em": avg_em,
             "f1": avg_f1,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_completion_tokens": avg_completion_tokens,
         },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
@@ -658,7 +642,7 @@ def run_independent(
 def run_shuffled(
     samples: List[Dict[str, Any]],
     client: LLMClient,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
     seed: int = 42,
 ) -> ExperimentResult:
     """Shuffled condition: Random order but with prior Q&A context.
@@ -666,6 +650,7 @@ def run_shuffled(
     - Answer sub-questions in random order
     - Pass prior Q&A as context (but in wrong order)
     - Include supporting paragraphs
+    - Only evaluate the LAST step (final answer)
     """
     logger.info("Running Shuffled condition (Random Order + Context)...")
 
@@ -673,7 +658,7 @@ def run_shuffled(
 
     total_em = 0.0
     total_f1 = 0.0
-    total_questions = 0
+    total_samples = 0
     details = []
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -692,8 +677,6 @@ def run_shuffled(
         predictions = {}
         prompt_tokens_map = {}
         completion_tokens_map = {}
-        sample_em = 0.0
-        sample_f1 = 0.0
         sample_details = []
 
         for idx in indices:
@@ -734,11 +717,6 @@ def run_shuffled(
             pred = predictions.get(i, "")
 
             em, f1 = _evaluate_answer(pred, gold_answer)
-            total_em += em
-            total_f1 += f1
-            sample_em += em
-            sample_f1 += f1
-            total_questions += 1
 
             sample_details.append({
                 "sub_id": i,
@@ -752,32 +730,34 @@ def run_shuffled(
                 "completion_tokens": completion_tokens_map.get(i, 0),
             })
 
-        n_sub = len(decomp) if decomp else 1
+        # Only count the LAST step for metrics
+        if sample_details:
+            last_step = sample_details[-1]
+            total_em += last_step["em"]
+            total_f1 += last_step["f1"]
+            total_samples += 1
+
         details.append({
             "main_question": sample["question"],
             "n_hops": sample["n_hops"],
             "shuffled_order": indices,
             "sub_questions": sample_details,
-            "em": sample_em / n_sub,
-            "f1": sample_f1 / n_sub,
+            "final_em": sample_details[-1]["em"] if sample_details else 0,
+            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
         })
 
-    avg_em = total_em / total_questions if total_questions > 0 else 0
-    avg_f1 = total_f1 / total_questions if total_questions > 0 else 0
-    avg_prompt_tokens = total_prompt_tokens / total_questions if total_questions > 0 else 0
-    avg_completion_tokens = total_completion_tokens / total_questions if total_questions > 0 else 0
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
 
     return ExperimentResult(
         condition="shuffled",
         dataset="morehopqa",
         n_samples=len(samples),
-        n_questions=total_questions,
+        n_questions=total_samples,
         accuracy=avg_em,
         metrics={
             "em": avg_em,
             "f1": avg_f1,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "avg_completion_tokens": avg_completion_tokens,
         },
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
@@ -796,7 +776,7 @@ def worker_process(
     conditions: List[str],
     seed: int,
     output_dir: str,
-    max_tokens: int = 256,
+    max_tokens: int = 2048,
 ):
     """Worker process that runs on a single GPU."""
     import os
@@ -909,7 +889,7 @@ def main():
         help="Output directory for results"
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=256,
+        "--max-tokens", type=int, default=2048,
         help="Maximum number of tokens to generate"
     )
     args = parser.parse_args()
