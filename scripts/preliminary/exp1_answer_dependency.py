@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 # Suppress vLLM verbose logging (must be set before importing vLLM)
-os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 os.environ.setdefault("VLLM_NO_PROGRESS_BAR", "1")
 
@@ -723,7 +723,7 @@ def worker_process(
     # Disable tqdm globally
     os.environ["TQDM_DISABLE"] = "1"
     # Suppress vLLM verbose logging
-    os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
     os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
 
     logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(samples)} samples")
