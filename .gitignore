@@ -27,3 +27,4 @@ outputs_json/
 *.log
 .claude/settings.local.json
 data/
+outputs/

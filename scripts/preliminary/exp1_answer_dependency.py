@@ -757,6 +757,7 @@ def run_experiment_for_model(
     print(f"Results for: {model}")
     print(f"{'='*60}")
     print_summary(final_results)
+    print_per_step_accuracy(final_results)
     save_results(final_results, config)
 
     return final_results
@@ -834,6 +835,52 @@ def main():
         for model, results in all_model_results.items():
             print(f"\n## {model}")
             print_summary(results)
+            print_per_step_accuracy(results)
+
+
+def print_per_step_accuracy(results: List[ExperimentResult]):
+    """Print per-step accuracy for sequential condition.
+
+    Only applicable to the 'sequential' condition which has sub_questions in details.
+    """
+    # Find sequential result
+    sequential_result = None
+    for r in results:
+        if r.condition == "sequential":
+            sequential_result = r
+            break
+
+    if sequential_result is None:
+        return
+
+    # Collect per-step metrics
+    step_metrics = {}  # step_id -> {"em": [], "f1": []}
+
+    for detail in sequential_result.details:
+        sub_questions = detail.get("sub_questions", [])
+        for sq in sub_questions:
+            step_id = sq.get("sub_id", 0)
+            if step_id not in step_metrics:
+                step_metrics[step_id] = {"em": [], "f1": []}
+            step_metrics[step_id]["em"].append(sq.get("em", 0))
+            step_metrics[step_id]["f1"].append(sq.get("f1", 0))
+
+    if not step_metrics:
+        return
+
+    # Print table
+    print("\n**PER-STEP ACCURACY (Sequential Condition)**\n")
+    print("| Step | Samples | EM | F1 |")
+    print("| --- | --- | --- | --- |")
+
+    for step_id in sorted(step_metrics.keys()):
+        metrics = step_metrics[step_id]
+        n_samples = len(metrics["em"])
+        avg_em = sum(metrics["em"]) / n_samples if n_samples > 0 else 0
+        avg_f1 = sum(metrics["f1"]) / n_samples if n_samples > 0 else 0
+        print(f"| {step_id + 1} | {n_samples} | {avg_em:.4f} | {avg_f1:.4f} |")
+
+    print()
 
 
 def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:

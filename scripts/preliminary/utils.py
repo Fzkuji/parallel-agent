@@ -468,9 +468,7 @@ def save_results(
 
 def print_summary(results: List[ExperimentResult]) -> None:
     """Print summary of experiment results as markdown table."""
-    print("\n" + "=" * 100)
-    print("EXPERIMENT SUMMARY")
-    print("=" * 100 + "\n")
+    print("\n**EXPERIMENT SUMMARY**\n")
 
     if not results:
         print("No results to display.")
@@ -501,8 +499,6 @@ def print_summary(results: List[ExperimentResult]) -> None:
             f"{avg_latency:.2f}" if result.latency > 0 else "-",
         ]
         print("| " + " | ".join(row) + " |")
-
-    print("\n" + "=" * 100)
 
     # Print comparison
     oracle = next((r for r in results if r.condition == "oracle"), None)
