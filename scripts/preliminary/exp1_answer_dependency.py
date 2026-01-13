@@ -5,10 +5,12 @@ Dataset: MoreHopQA (3-5 hop reasoning with gold sub-questions and sub-answers)
 
 Research Question: Does decomposing questions and passing prior answers help?
 
-3 Conditions:
-- gold: Only ask the last sub-question (with gold answers pre-embedded in question text)
-- sequential: Answer sub-questions in order, replacing embedded gold answers with predictions
-- main_question: Ask the main question directly (no decomposition)
+5 Conditions:
+- gold_context: Last sub-question + context (gold answers pre-embedded in question text)
+- gold_direct: Last sub-question only, NO context (tests if context is noise)
+- sequential: All sub-questions in order + context + Q&A history (replaces embedded gold with predictions)
+- chain_only: Like sequential, but final step uses ONLY Q&A history (no context)
+- main_question: Main question + context (no decomposition)
 
 Key insight: MoreHopQA sub-questions have gold answers pre-embedded in question text.
 E.g., Q1: "When was X born?" -> A1: "June 23, 1992"
@@ -218,6 +220,7 @@ def run_gold(
     use_context: bool = True,
     max_tokens: int = 2048,
     batch_size: int = 16,
+    condition_name: str = None,
 ) -> ExperimentResult:
     """Gold condition: Only ask the last sub-question (with gold answers pre-embedded).
 
@@ -229,11 +232,12 @@ def run_gold(
         use_context: If True, include reference context paragraphs
         max_tokens: Max tokens to generate
         batch_size: Batch size for inference
+        condition_name: Override condition name (e.g., "gold_direct" for no context)
 
     Returns:
         ExperimentResult
     """
-    condition = "gold"
+    condition = condition_name or ("gold_context" if use_context else "gold_direct")
     logger.info(f"Running {condition} condition...")
 
     total_em = 0.0
@@ -450,6 +454,137 @@ def run_sequential(
     )
 
 
+def run_chain_only(
+    samples: List[Dict[str, Any]],
+    client: LLMClient,
+    max_tokens: int = 2048,
+) -> ExperimentResult:
+    """Chain-only condition: Sequential answering, but final step uses only Q&A history (no context).
+
+    This tests whether the Q&A chain is sufficient without raw context at the final step.
+    - Steps 1 to N-1: use context + Q&A history (same as sequential)
+    - Step N (final): use ONLY Q&A history (no context)
+
+    Args:
+        samples: List of samples
+        client: LLM client
+        max_tokens: Max tokens to generate
+
+    Returns:
+        ExperimentResult
+    """
+    condition = "chain_only"
+    logger.info(f"Running {condition} condition...")
+
+    total_em = 0.0
+    total_f1 = 0.0
+    total_samples = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    for sample in tqdm(samples, desc=condition):
+        decomp = sample["decomposition"]
+        context_str = _format_context(sample.get("context", []))
+        n_steps = len(decomp)
+
+        prior_qa = []
+        sample_details = []
+
+        # Track gold -> pred answer mappings for replacement
+        answer_replacements = {}  # gold_answer -> pred_answer
+
+        for i, step in enumerate(decomp):
+            original_q = step["question"]
+            gold_answer = step["answer"]
+            is_final_step = (i == n_steps - 1)
+
+            # Replace any embedded gold answers with predicted answers
+            current_q = original_q
+            for gold_ans, pred_ans in answer_replacements.items():
+                current_q = _replace_embedded_answer(current_q, gold_ans, pred_ans)
+
+            # Build prompt
+            prompt_parts = []
+
+            # Include context for all steps EXCEPT the final step
+            if context_str and not is_final_step:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
+
+            if prior_qa:
+                qa_context = "Previous Q&A:\n" + "\n".join(
+                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
+                )
+                prompt_parts.append(qa_context)
+
+            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {current_q}")
+            prompt = "\n\n".join(prompt_parts)
+
+            pred, response = client.generate(prompt, max_tokens=max_tokens)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            pred_answer = _extract_boxed_answer(pred)
+            em, f1 = _evaluate_answer(pred, gold_answer)
+
+            sample_details.append({
+                "sub_id": i,
+                "original_question": original_q,
+                "modified_question": current_q,
+                "gold_answer": gold_answer,
+                "prompt": prompt,
+                "prediction": pred.strip(),
+                "extracted_answer": pred_answer,
+                "em": em,
+                "f1": f1,
+                "is_final_step": is_final_step,
+                "has_context": not is_final_step,
+                "prompt_tokens": response.prompt_tokens,
+                "completion_tokens": response.completion_tokens,
+            })
+
+            # Update mappings for next iteration
+            prior_qa.append((current_q, pred_answer))
+            answer_replacements[gold_answer] = pred_answer
+
+        # Only count the LAST step for metrics
+        if sample_details:
+            last_step = sample_details[-1]
+            total_em += last_step["em"]
+            total_f1 += last_step["f1"]
+            total_samples += 1
+
+        details.append({
+            "main_question": sample["question"],
+            "gold_answer": sample["answer"],
+            "n_hops": sample["n_hops"],
+            "sub_questions": sample_details,
+            "final_em": sample_details[-1]["em"] if sample_details else 0,
+            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
+        })
+
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
+
+    return ExperimentResult(
+        condition=condition,
+        dataset="morehopqa",
+        n_samples=len(samples),
+        n_questions=total_samples,
+        accuracy=avg_em,
+        metrics={
+            "em": avg_em,
+            "f1": avg_f1,
+        },
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
 def run_main_question(
     samples: List[Dict[str, Any]],
     client: LLMClient,
@@ -600,10 +735,14 @@ def worker_process(
     for cond in conditions:
         logger.info(f"[Worker {rank}] Running {cond}...")
 
-        if cond == "gold":
+        if cond == "gold_context":
             results.append(run_gold(samples, client, use_context=True, max_tokens=max_tokens))
+        elif cond == "gold_direct":
+            results.append(run_gold(samples, client, use_context=False, max_tokens=max_tokens))
         elif cond == "sequential":
             results.append(run_sequential(samples, client, use_context=True, max_tokens=max_tokens))
+        elif cond == "chain_only":
+            results.append(run_chain_only(samples, client, max_tokens=max_tokens))
         elif cond == "main_question":
             results.append(run_main_question(samples, client, use_context=True, max_tokens=max_tokens))
 
@@ -736,10 +875,14 @@ def run_experiment_for_model(
         final_results = []
 
         for cond in conditions:
-            if cond == "gold":
+            if cond == "gold_context":
                 final_results.append(run_gold(all_samples, client, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "gold_direct":
+                final_results.append(run_gold(all_samples, client, use_context=False, max_tokens=args.max_tokens))
             elif cond == "sequential":
                 final_results.append(run_sequential(all_samples, client, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "chain_only":
+                final_results.append(run_chain_only(all_samples, client, max_tokens=args.max_tokens))
             elif cond == "main_question":
                 final_results.append(run_main_question(all_samples, client, use_context=True, max_tokens=args.max_tokens))
 
@@ -789,8 +932,8 @@ def main():
     )
     parser.add_argument(
         "--conditions", type=str,
-        default="gold,sequential,main_question",
-        help="Comma-separated list of conditions to run"
+        default="gold_context,sequential,main_question",
+        help="Comma-separated list of conditions to run. Available: gold_context, gold_direct, sequential, chain_only, main_question"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
