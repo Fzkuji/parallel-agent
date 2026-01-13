@@ -3,24 +3,16 @@
 
 Dataset: MoreHopQA (3-5 hop reasoning with gold sub-questions and sub-answers)
 
-Research Question: Does answering questions in correct order with prior context
-improve multi-step reasoning performance?
+Research Question: Does decomposing questions and passing prior answers help?
 
-8 Conditions (3 strategies × context variations):
+3 Conditions:
+- gold: Only ask the last sub-question (with gold answers pre-embedded in question text)
+- sequential: Answer sub-questions in order, replacing embedded gold answers with predictions
+- main_question: Ask the main question directly (no decomposition)
 
-Sequential (oracle) family:
-- oracle_gold: Sequential order + gold prior Q&A + context
-- oracle_gold_no_context: Sequential order + gold prior Q&A + NO context
-- oracle: Sequential order + predicted prior Q&A + context
-
-Shuffled family:
-- shuffled_gold: Shuffled order + gold prior Q&A + context
-- shuffled_gold_no_context: Shuffled order + gold prior Q&A + NO context
-- shuffled: Shuffled order + predicted prior Q&A + context
-
-Independent family:
-- independent: No prior Q&A + context
-- independent_no_context: No prior Q&A + NO context
+Key insight: MoreHopQA sub-questions have gold answers pre-embedded in question text.
+E.g., Q1: "When was X born?" -> A1: "June 23, 1992"
+      Q2: "What is the sum of digits in June 23, 1992?" <- A1 is already embedded
 """
 
 from __future__ import annotations
@@ -28,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import re
 from typing import Any, Dict, List, Tuple
 
 from datasets import load_dataset
@@ -174,7 +167,6 @@ def _format_context(context: List[List]) -> str:
 
 def _extract_boxed_answer(text: str) -> str:
     """Extract answer from \\boxed{} format."""
-    import re
     # Match \boxed{...} with nested braces support
     pattern = r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}'
     matches = re.findall(pattern, text)
@@ -199,284 +191,37 @@ def _evaluate_answer(pred: str, gold: str) -> Tuple[float, float]:
     return em, f1
 
 
-def run_sequential(
-    samples: List[Dict[str, Any]],
-    client: LLMClient,
-    use_gold: bool = False,
-    use_context: bool = True,
-    max_tokens: int = 2048,
-) -> ExperimentResult:
-    """Sequential (oracle) condition: Answer sub-questions in order.
+def _replace_embedded_answer(question: str, gold_answer: str, pred_answer: str) -> str:
+    """Replace embedded gold answer in question text with predicted answer.
 
     Args:
-        samples: List of samples
-        client: LLM client
-        use_gold: If True, use gold answers for prior Q&A; otherwise use predicted
-        use_context: If True, include reference context paragraphs
-        max_tokens: Max tokens to generate
+        question: The question text (may contain gold_answer embedded)
+        gold_answer: The gold answer to replace
+        pred_answer: The predicted answer to substitute
 
     Returns:
-        ExperimentResult with condition name based on parameters
+        Question text with gold_answer replaced by pred_answer
     """
-    # Determine condition name
-    if use_gold:
-        condition = "oracle_gold" if use_context else "oracle_gold_no_context"
-    else:
-        condition = "oracle" if use_context else "oracle_no_context"
+    if not gold_answer or not pred_answer:
+        return question
 
-    logger.info(f"Running {condition} condition...")
+    # Try case-insensitive replacement
+    pattern = re.compile(re.escape(gold_answer), re.IGNORECASE)
+    new_question = pattern.sub(pred_answer, question)
 
-    total_em = 0.0
-    total_f1 = 0.0
-    total_samples = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for sample in tqdm(samples, desc=condition):
-        decomp = sample["decomposition"]
-        context_str = _format_context(sample.get("context", [])) if use_context else ""
-
-        prior_qa = []
-        sample_details = []
-
-        for i, step in enumerate(decomp):
-            sub_q = step["question"]
-            gold_answer = step["answer"]
-
-            # Build prompt
-            prompt_parts = []
-
-            if context_str:
-                prompt_parts.append(f"Reference Information:\n{context_str}")
-
-            if prior_qa:
-                qa_context = "Previous Q&A:\n" + "\n".join(
-                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
-                )
-                prompt_parts.append(qa_context)
-
-            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
-            prompt = "\n\n".join(prompt_parts)
-
-            pred, response = client.generate(prompt, max_tokens=max_tokens)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            em, f1 = _evaluate_answer(pred, gold_answer)
-
-            sample_details.append({
-                "sub_id": i,
-                "question": sub_q,
-                "gold_answer": gold_answer,
-                "prompt": prompt,
-                "prediction": pred.strip(),
-                "extracted_answer": _extract_boxed_answer(pred),
-                "em": em,
-                "f1": f1,
-                "prompt_tokens": response.prompt_tokens,
-                "completion_tokens": response.completion_tokens,
-            })
-
-            # Update prior Q&A for next step
-            if use_gold:
-                prior_qa.append((sub_q, gold_answer))
-            else:
-                prior_qa.append((sub_q, _extract_boxed_answer(pred)))
-
-        # Only count the LAST step for metrics
-        if sample_details:
-            last_step = sample_details[-1]
-            total_em += last_step["em"]
-            total_f1 += last_step["f1"]
-            total_samples += 1
-
-        details.append({
-            "main_question": sample["question"],
-            "gold_answer": sample["answer"],
-            "context": sample.get("context", []),
-            "n_hops": sample["n_hops"],
-            "sub_questions": sample_details,
-            "final_em": sample_details[-1]["em"] if sample_details else 0,
-            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
-        })
-
-    avg_em = total_em / total_samples if total_samples > 0 else 0
-    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
-
-    return ExperimentResult(
-        condition=condition,
-        dataset="morehopqa",
-        n_samples=len(samples),
-        n_questions=total_samples,
-        accuracy=avg_em,
-        metrics={
-            "em": avg_em,
-            "f1": avg_f1,
-        },
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        details=details,
-    )
+    return new_question
 
 
-def run_shuffled(
-    samples: List[Dict[str, Any]],
-    client: LLMClient,
-    use_gold: bool = False,
-    use_context: bool = True,
-    max_tokens: int = 2048,
-    seed: int = 42,
-) -> ExperimentResult:
-    """Shuffled condition: Answer sub-questions in random order.
-
-    Args:
-        samples: List of samples
-        client: LLM client
-        use_gold: If True, use gold answers for prior Q&A; otherwise use predicted
-        use_context: If True, include reference context paragraphs
-        max_tokens: Max tokens to generate
-        seed: Random seed for shuffling
-
-    Returns:
-        ExperimentResult with condition name based on parameters
-    """
-    # Determine condition name
-    if use_gold:
-        condition = "shuffled_gold" if use_context else "shuffled_gold_no_context"
-    else:
-        condition = "shuffled" if use_context else "shuffled_no_context"
-
-    logger.info(f"Running {condition} condition...")
-
-    random.seed(seed)
-
-    total_em = 0.0
-    total_f1 = 0.0
-    total_samples = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for sample in tqdm(samples, desc=condition):
-        decomp = sample["decomposition"]
-        context_str = _format_context(sample.get("context", [])) if use_context else ""
-
-        # Shuffle order
-        indices = list(range(len(decomp)))
-        random.shuffle(indices)
-
-        prior_qa = []
-        predictions = {}
-        prompt_tokens_map = {}
-        completion_tokens_map = {}
-        sample_details = []
-
-        for idx in indices:
-            step = decomp[idx]
-            sub_q = step["question"]
-            gold_answer = step["answer"]
-
-            # Build prompt
-            prompt_parts = []
-
-            if context_str:
-                prompt_parts.append(f"Reference Information:\n{context_str}")
-
-            if prior_qa:
-                qa_context = "Previous Q&A:\n" + "\n".join(
-                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
-                )
-                prompt_parts.append(qa_context)
-
-            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
-            prompt = "\n\n".join(prompt_parts)
-
-            pred, response = client.generate(prompt, max_tokens=max_tokens)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            predictions[idx] = (pred.strip(), prompt)  # Store both prediction and prompt
-            prompt_tokens_map[idx] = response.prompt_tokens
-            completion_tokens_map[idx] = response.completion_tokens
-
-            # Update prior Q&A for next step
-            if use_gold:
-                prior_qa.append((sub_q, gold_answer))
-            else:
-                prior_qa.append((sub_q, _extract_boxed_answer(pred)))
-
-        # Evaluate all sub-questions (in original order)
-        for i, step in enumerate(decomp):
-            gold_answer = step["answer"]
-            pred, prompt_used = predictions.get(i, ("", ""))
-
-            em, f1 = _evaluate_answer(pred, gold_answer)
-
-            sample_details.append({
-                "sub_id": i,
-                "question": step["question"],
-                "gold_answer": gold_answer,
-                "prompt": prompt_used,
-                "prediction": pred,
-                "extracted_answer": _extract_boxed_answer(pred),
-                "em": em,
-                "f1": f1,
-                "prompt_tokens": prompt_tokens_map.get(i, 0),
-                "completion_tokens": completion_tokens_map.get(i, 0),
-            })
-
-        # Only count the LAST step for metrics
-        if sample_details:
-            last_step = sample_details[-1]
-            total_em += last_step["em"]
-            total_f1 += last_step["f1"]
-            total_samples += 1
-
-        details.append({
-            "main_question": sample["question"],
-            "gold_answer": sample["answer"],
-            "context": sample.get("context", []),
-            "n_hops": sample["n_hops"],
-            "shuffled_order": indices,
-            "sub_questions": sample_details,
-            "final_em": sample_details[-1]["em"] if sample_details else 0,
-            "final_f1": sample_details[-1]["f1"] if sample_details else 0,
-        })
-
-    avg_em = total_em / total_samples if total_samples > 0 else 0
-    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
-
-    return ExperimentResult(
-        condition=condition,
-        dataset="morehopqa",
-        n_samples=len(samples),
-        n_questions=total_samples,
-        accuracy=avg_em,
-        metrics={
-            "em": avg_em,
-            "f1": avg_f1,
-        },
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        details=details,
-    )
-
-
-def run_independent(
+def run_gold(
     samples: List[Dict[str, Any]],
     client: LLMClient,
     use_context: bool = True,
     max_tokens: int = 2048,
     batch_size: int = 16,
 ) -> ExperimentResult:
-    """Independent condition: Each sub-question answered independently.
+    """Gold condition: Only ask the last sub-question (with gold answers pre-embedded).
+
+    This is the upper bound - the last question already contains all prior gold answers.
 
     Args:
         samples: List of samples
@@ -486,11 +231,10 @@ def run_independent(
         batch_size: Batch size for inference
 
     Returns:
-        ExperimentResult with condition name based on parameters
+        ExperimentResult
     """
-    condition = "independent" if use_context else "independent_no_context"
-
-    logger.info(f"Running {condition} condition (batch_size={batch_size})...")
+    condition = "gold"
+    logger.info(f"Running {condition} condition...")
 
     total_em = 0.0
     total_f1 = 0.0
@@ -500,27 +244,28 @@ def run_independent(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Collect all prompts and metadata for batch processing
+    # Collect all prompts for batch processing
     all_prompts = []
-    all_metadata = []  # (sample_idx, sub_idx, sub_q, gold_answer, prompt)
+    all_metadata = []  # (sample_idx, last_q, gold_answer)
 
     for sample_idx, sample in enumerate(samples):
         decomp = sample["decomposition"]
         context_str = _format_context(sample.get("context", [])) if use_context else ""
 
-        for i, step in enumerate(decomp):
-            sub_q = step["question"]
-            gold_answer = step["answer"]
+        # Only the last sub-question
+        last_step = decomp[-1]
+        last_q = last_step["question"]
+        gold_answer = last_step["answer"]
 
-            # Build prompt (no prior Q&A)
-            prompt_parts = []
-            if context_str:
-                prompt_parts.append(f"Reference Information:\n{context_str}")
-            prompt_parts.append(f"Answer this question. Put your final answer in \\boxed{{}}.\nQ: {sub_q}")
-            prompt = "\n\n".join(prompt_parts)
+        # Build prompt
+        prompt_parts = []
+        if context_str:
+            prompt_parts.append(f"Reference Information:\n{context_str}")
+        prompt_parts.append(f"Answer this question. Put your final answer in \\boxed{{}}.\nQ: {last_q}")
+        prompt = "\n\n".join(prompt_parts)
 
-            all_prompts.append(prompt)
-            all_metadata.append((sample_idx, i, sub_q, gold_answer, prompt))
+        all_prompts.append(prompt)
+        all_metadata.append((sample_idx, last_q, gold_answer, prompt))
 
     # Process in batches
     all_results = []
@@ -529,41 +274,145 @@ def run_independent(
         batch_results = client.generate_batch(batch_prompts, max_tokens=max_tokens)
         all_results.extend(batch_results)
 
-    # Organize results by sample
-    sample_results = {}  # sample_idx -> list of (sub_idx, sub_q, gold_answer, prompt, pred, response)
+    # Evaluate results
     for idx, (pred, response) in enumerate(all_results):
-        sample_idx, sub_idx, sub_q, gold_answer, prompt_used = all_metadata[idx]
-        if sample_idx not in sample_results:
-            sample_results[sample_idx] = []
-        sample_results[sample_idx].append((sub_idx, sub_q, gold_answer, prompt_used, pred, response))
+        sample_idx, last_q, gold_answer, prompt_used = all_metadata[idx]
+        sample = samples[sample_idx]
 
-    # Evaluate and build details
-    for sample_idx, sample in enumerate(samples):
+        total_latency += response.latency
+        total_prompt_tokens += response.prompt_tokens
+        total_completion_tokens += response.completion_tokens
+
+        em, f1 = _evaluate_answer(pred, gold_answer)
+        total_em += em
+        total_f1 += f1
+        total_samples += 1
+
+        details.append({
+            "main_question": sample["question"],
+            "last_sub_question": last_q,
+            "gold_answer": gold_answer,
+            "prompt": prompt_used,
+            "prediction": pred.strip(),
+            "extracted_answer": _extract_boxed_answer(pred),
+            "em": em,
+            "f1": f1,
+            "n_hops": sample["n_hops"],
+            "prompt_tokens": response.prompt_tokens,
+            "completion_tokens": response.completion_tokens,
+        })
+
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
+
+    return ExperimentResult(
+        condition=condition,
+        dataset="morehopqa",
+        n_samples=len(samples),
+        n_questions=total_samples,
+        accuracy=avg_em,
+        metrics={
+            "em": avg_em,
+            "f1": avg_f1,
+        },
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_sequential(
+    samples: List[Dict[str, Any]],
+    client: LLMClient,
+    use_context: bool = True,
+    max_tokens: int = 2048,
+) -> ExperimentResult:
+    """Sequential condition: Answer sub-questions in order, replacing embedded answers.
+
+    Key difference from old implementation:
+    - Replace gold answers embedded in subsequent questions with model predictions
+    - This tests error propagation
+
+    Args:
+        samples: List of samples
+        client: LLM client
+        use_context: If True, include reference context paragraphs
+        max_tokens: Max tokens to generate
+
+    Returns:
+        ExperimentResult
+    """
+    condition = "sequential"
+    logger.info(f"Running {condition} condition...")
+
+    total_em = 0.0
+    total_f1 = 0.0
+    total_samples = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    for sample in tqdm(samples, desc=condition):
         decomp = sample["decomposition"]
+        context_str = _format_context(sample.get("context", [])) if use_context else ""
+
+        prior_qa = []
         sample_details = []
 
-        results = sample_results.get(sample_idx, [])
-        results.sort(key=lambda x: x[0])  # Sort by sub_idx
+        # Track gold -> pred answer mappings for replacement
+        answer_replacements = {}  # gold_answer -> pred_answer
 
-        for sub_idx, sub_q, gold_answer, prompt_used, pred, response in results:
+        for i, step in enumerate(decomp):
+            original_q = step["question"]
+            gold_answer = step["answer"]
+
+            # Replace any embedded gold answers with predicted answers
+            current_q = original_q
+            for gold_ans, pred_ans in answer_replacements.items():
+                current_q = _replace_embedded_answer(current_q, gold_ans, pred_ans)
+
+            # Build prompt
+            prompt_parts = []
+
+            if context_str:
+                prompt_parts.append(f"Reference Information:\n{context_str}")
+
+            if prior_qa:
+                qa_context = "Previous Q&A:\n" + "\n".join(
+                    [f"Q: {q}\nA: {a}" for q, a in prior_qa]
+                )
+                prompt_parts.append(qa_context)
+
+            prompt_parts.append(f"Now answer this question. Put your final answer in \\boxed{{}}.\nQ: {current_q}")
+            prompt = "\n\n".join(prompt_parts)
+
+            pred, response = client.generate(prompt, max_tokens=max_tokens)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
+            pred_answer = _extract_boxed_answer(pred)
             em, f1 = _evaluate_answer(pred, gold_answer)
 
             sample_details.append({
-                "sub_id": sub_idx,
-                "question": sub_q,
+                "sub_id": i,
+                "original_question": original_q,
+                "modified_question": current_q,
                 "gold_answer": gold_answer,
-                "prompt": prompt_used,
+                "prompt": prompt,
                 "prediction": pred.strip(),
-                "extracted_answer": _extract_boxed_answer(pred),
+                "extracted_answer": pred_answer,
                 "em": em,
                 "f1": f1,
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
             })
+
+            # Update mappings for next iteration
+            prior_qa.append((current_q, pred_answer))
+            answer_replacements[gold_answer] = pred_answer
 
         # Only count the LAST step for metrics
         if sample_details:
@@ -575,11 +424,115 @@ def run_independent(
         details.append({
             "main_question": sample["question"],
             "gold_answer": sample["answer"],
-            "context": sample.get("context", []),
             "n_hops": sample["n_hops"],
             "sub_questions": sample_details,
             "final_em": sample_details[-1]["em"] if sample_details else 0,
             "final_f1": sample_details[-1]["f1"] if sample_details else 0,
+        })
+
+    avg_em = total_em / total_samples if total_samples > 0 else 0
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
+
+    return ExperimentResult(
+        condition=condition,
+        dataset="morehopqa",
+        n_samples=len(samples),
+        n_questions=total_samples,
+        accuracy=avg_em,
+        metrics={
+            "em": avg_em,
+            "f1": avg_f1,
+        },
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_main_question(
+    samples: List[Dict[str, Any]],
+    client: LLMClient,
+    use_context: bool = True,
+    max_tokens: int = 2048,
+    batch_size: int = 16,
+) -> ExperimentResult:
+    """Main question condition: Ask the main question directly (no decomposition).
+
+    This tests whether the model can do multi-hop reasoning without decomposition.
+
+    Args:
+        samples: List of samples
+        client: LLM client
+        use_context: If True, include reference context paragraphs
+        max_tokens: Max tokens to generate
+        batch_size: Batch size for inference
+
+    Returns:
+        ExperimentResult
+    """
+    condition = "main_question"
+    logger.info(f"Running {condition} condition...")
+
+    total_em = 0.0
+    total_f1 = 0.0
+    total_samples = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    # Collect all prompts for batch processing
+    all_prompts = []
+    all_metadata = []  # (sample_idx, main_q, gold_answer)
+
+    for sample_idx, sample in enumerate(samples):
+        main_q = sample["question"]
+        gold_answer = sample["answer"]
+        context_str = _format_context(sample.get("context", [])) if use_context else ""
+
+        # Build prompt
+        prompt_parts = []
+        if context_str:
+            prompt_parts.append(f"Reference Information:\n{context_str}")
+        prompt_parts.append(f"Answer this question. Put your final answer in \\boxed{{}}.\nQ: {main_q}")
+        prompt = "\n\n".join(prompt_parts)
+
+        all_prompts.append(prompt)
+        all_metadata.append((sample_idx, main_q, gold_answer, prompt))
+
+    # Process in batches
+    all_results = []
+    for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc=condition):
+        batch_prompts = all_prompts[batch_start:batch_start + batch_size]
+        batch_results = client.generate_batch(batch_prompts, max_tokens=max_tokens)
+        all_results.extend(batch_results)
+
+    # Evaluate results
+    for idx, (pred, response) in enumerate(all_results):
+        sample_idx, main_q, gold_answer, prompt_used = all_metadata[idx]
+        sample = samples[sample_idx]
+
+        total_latency += response.latency
+        total_prompt_tokens += response.prompt_tokens
+        total_completion_tokens += response.completion_tokens
+
+        em, f1 = _evaluate_answer(pred, gold_answer)
+        total_em += em
+        total_f1 += f1
+        total_samples += 1
+
+        details.append({
+            "main_question": main_q,
+            "gold_answer": gold_answer,
+            "prompt": prompt_used,
+            "prediction": pred.strip(),
+            "extracted_answer": _extract_boxed_answer(pred),
+            "em": em,
+            "f1": f1,
+            "n_hops": sample["n_hops"],
+            "prompt_tokens": response.prompt_tokens,
+            "completion_tokens": response.completion_tokens,
         })
 
     avg_em = total_em / total_samples if total_samples > 0 else 0
@@ -647,22 +600,12 @@ def worker_process(
     for cond in conditions:
         logger.info(f"[Worker {rank}] Running {cond}...")
 
-        if cond == "oracle_gold":
-            results.append(run_sequential(samples, client, use_gold=True, use_context=True, max_tokens=max_tokens))
-        elif cond == "oracle_gold_no_context":
-            results.append(run_sequential(samples, client, use_gold=True, use_context=False, max_tokens=max_tokens))
-        elif cond == "oracle":
-            results.append(run_sequential(samples, client, use_gold=False, use_context=True, max_tokens=max_tokens))
-        elif cond == "shuffled_gold":
-            results.append(run_shuffled(samples, client, use_gold=True, use_context=True, max_tokens=max_tokens, seed=seed))
-        elif cond == "shuffled_gold_no_context":
-            results.append(run_shuffled(samples, client, use_gold=True, use_context=False, max_tokens=max_tokens, seed=seed))
-        elif cond == "shuffled":
-            results.append(run_shuffled(samples, client, use_gold=False, use_context=True, max_tokens=max_tokens, seed=seed))
-        elif cond == "independent":
-            results.append(run_independent(samples, client, use_context=True, max_tokens=max_tokens))
-        elif cond == "independent_no_context":
-            results.append(run_independent(samples, client, use_context=False, max_tokens=max_tokens))
+        if cond == "gold":
+            results.append(run_gold(samples, client, use_context=True, max_tokens=max_tokens))
+        elif cond == "sequential":
+            results.append(run_sequential(samples, client, use_context=True, max_tokens=max_tokens))
+        elif cond == "main_question":
+            results.append(run_main_question(samples, client, use_context=True, max_tokens=max_tokens))
 
     # Save results to temp file
     os.makedirs(output_dir, exist_ok=True)
@@ -793,22 +736,12 @@ def run_experiment_for_model(
         final_results = []
 
         for cond in conditions:
-            if cond == "oracle_gold":
-                final_results.append(run_sequential(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens))
-            elif cond == "oracle_gold_no_context":
-                final_results.append(run_sequential(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens))
-            elif cond == "oracle":
-                final_results.append(run_sequential(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens))
-            elif cond == "shuffled_gold":
-                final_results.append(run_shuffled(all_samples, client, use_gold=True, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
-            elif cond == "shuffled_gold_no_context":
-                final_results.append(run_shuffled(all_samples, client, use_gold=True, use_context=False, max_tokens=args.max_tokens, seed=args.seed))
-            elif cond == "shuffled":
-                final_results.append(run_shuffled(all_samples, client, use_gold=False, use_context=True, max_tokens=args.max_tokens, seed=args.seed))
-            elif cond == "independent":
-                final_results.append(run_independent(all_samples, client, use_context=True, max_tokens=args.max_tokens))
-            elif cond == "independent_no_context":
-                final_results.append(run_independent(all_samples, client, use_context=False, max_tokens=args.max_tokens))
+            if cond == "gold":
+                final_results.append(run_gold(all_samples, client, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "sequential":
+                final_results.append(run_sequential(all_samples, client, use_context=True, max_tokens=args.max_tokens))
+            elif cond == "main_question":
+                final_results.append(run_main_question(all_samples, client, use_context=True, max_tokens=args.max_tokens))
 
     # Print and save results for this model
     config = ExperimentConfig(
@@ -855,7 +788,7 @@ def main():
     )
     parser.add_argument(
         "--conditions", type=str,
-        default="oracle_gold,oracle_gold_no_context,oracle,shuffled_gold,shuffled_gold_no_context,shuffled,independent,independent_no_context",
+        default="gold,sequential,main_question",
         help="Comma-separated list of conditions to run"
     )
     parser.add_argument(

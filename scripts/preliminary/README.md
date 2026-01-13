@@ -17,22 +17,18 @@
 ### Exp 1: Answer Dependency (语义-强)
 
 - **Dataset**: MoreHopQA (3-5 hop reasoning, 含 gold sub-questions/sub-answers 和 context)
-- **RQ**: 按依赖顺序回答并传递前序答案是否提升多步推理性能？
-- **Setup** (8个条件 = 3种策略 × context变体):
+- **RQ**: 问题分解和传递prior答案是否提升多跳推理性能？
+- **Key Insight**: MoreHopQA的子问题已包含前序答案（如 Q2: "June 23, 1992 的数字之和？"）
+- **Setup** (3个条件):
 
-  | 条件 | 顺序 | Prior Q&A | Context |
-  |------|------|-----------|---------|
-  | oracle_gold | 顺序 | Gold答案 | ✅ |
-  | oracle_gold_no_context | 顺序 | Gold答案 | ❌ |
-  | oracle | 顺序 | 预测答案 | ✅ |
-  | shuffled_gold | 乱序 | Gold答案 | ✅ |
-  | shuffled_gold_no_context | 乱序 | Gold答案 | ❌ |
-  | shuffled | 乱序 | 预测答案 | ✅ |
-  | independent | 无 | ❌ | ✅ |
-  | independent_no_context | 无 | ❌ | ❌ |
+  | 条件 | 描述 | 示例 |
+  |------|------|------|
+  | gold | 只问最后一个子问题（答案已嵌入） | "June 23, 1992 的数字之和？" |
+  | sequential | 逐步回答，用模型预测替换嵌入的答案 | "[模型预测的日期] 的数字之和？" |
+  | main_question | 直接问主问题（不分解） | "导演X电影的人死于哪天的数字之和？" |
 
-- **评估**: 最后一个子问题的 EM/F1（最终答案）
-- **预期**: oracle_gold > oracle > shuffled > independent
+- **评估**: EM/F1
+- **预期**: gold > sequential > main_question
 
 ### Exp 2a: Shared Context (语义-中)
 
@@ -100,11 +96,11 @@ python scripts/preliminary/run_all.py --model gpt-4o --full
 ```bash
 # Exp 1: Answer Dependency (本地模型)
 python scripts/preliminary/exp1_answer_dependency.py \
-    --model Qwen/Qwen2.5-7B-Instruct \
+    --models Qwen/Qwen2.5-7B-Instruct \
     --use-local \
     --use-vllm \
     --n-samples 50 \
-    --conditions oracle_gold,oracle,shuffled,independent
+    --conditions gold,sequential,main_question
 
 # Exp 2a: Shared Context
 python scripts/preliminary/exp2a_shared_context.py \
