@@ -19,6 +19,12 @@ E.g., Q1: "When was X born?" -> A1: "June 23, 1992"
 
 from __future__ import annotations
 
+import os
+# Suppress vLLM verbose logging (must be set before importing vLLM)
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
+os.environ.setdefault("VLLM_NO_PROGRESS_BAR", "1")
+
 import argparse
 import logging
 import random
@@ -716,6 +722,9 @@ def worker_process(
     os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
     # Disable tqdm globally
     os.environ["TQDM_DISABLE"] = "1"
+    # Suppress vLLM verbose logging
+    os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+    os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
 
     logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(samples)} samples")
 
