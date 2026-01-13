@@ -941,7 +941,7 @@ def main():
     )
     parser.add_argument(
         "--conditions", type=str,
-        default="gold_context,sequential,main_question",
+        default="gold_context,gold_direct,sequential,chain_only,main_question",
         help="Comma-separated list of conditions to run. Available: gold_context, gold_direct, sequential, chain_only, main_question"
     )
     parser.add_argument(
