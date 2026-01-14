@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""Experiment 2a: Shared Context (Semantic - Medium)
+"""Experiment 2a: Shared Context (Multi-Query QA on SQuAD)
 
 Dataset: SQuAD (multiple questions per paragraph)
 
-Research Question: Do questions sharing the same context benefit from being
-processed together in the same batch?
+Research Question: How do different multi-query processing strategies compare
+when questions share the same context?
 
 Conditions:
-- Oracle: Group questions by paragraph (same paragraph = same batch)
-- Random: Mix questions from different paragraphs in each batch
+- Independent: Each question + context answered separately
+- All-in-One: All questions from same context in one prompt
+- Sequential (Random): Questions answered in random order, with Q&A history
+- Sequential (LLM-based): LLM determines optimal question order, with Q&A history
 
-Expected: Oracle > Random (shared context enables information reuse)
+Expected: Sequential strategies may benefit from information sharing between questions.
 """
 
 from __future__ import annotations
+
+import os
+# Suppress vLLM verbose logging
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 
 import argparse
 import json
 import logging
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,7 +67,7 @@ def load_squad_groups(
     """
     logger.info("Loading SQuAD dataset...")
 
-    dataset = load_dataset("squad", split="validation")
+    dataset = load_dataset("rajpurkar/squad", split="validation")
 
     # Group questions by context
     context_groups = defaultdict(list)
@@ -94,13 +102,12 @@ def load_squad_groups(
     return groups
 
 
-def run_oracle(
+def run_independent(
     groups: List[Dict[str, Any]],
     client: LLMClient,
-    batch_size: int = 4,
 ) -> ExperimentResult:
-    """Oracle condition: Process questions with their shared context."""
-    logger.info("Running Oracle condition...")
+    """Independent: Each question + context answered separately."""
+    logger.info("Running Independent condition...")
 
     total_correct = 0
     total_questions = 0
@@ -109,11 +116,10 @@ def run_oracle(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for group in tqdm(groups, desc="Oracle"):
+    for group in tqdm(groups, desc="Independent"):
         context = group["context"]
         questions = group["questions"]
 
-        # Process all questions with shared context
         for q_item in questions:
             question = q_item["question"]
             gold_answer = q_item["answer"]
@@ -132,7 +138,6 @@ Answer (be concise):"""
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            # Evaluate
             is_correct = compute_contains(pred, gold_answer) > 0
             total_correct += int(is_correct)
             total_questions += 1
@@ -148,14 +153,12 @@ Answer (be concise):"""
     accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="oracle",
+        condition="independent",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={
-            "exact_match": accuracy,
-        },
+        metrics={"exact_match": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -163,36 +166,12 @@ Answer (be concise):"""
     )
 
 
-def run_random(
+def run_all_in_one(
     groups: List[Dict[str, Any]],
     client: LLMClient,
-    batch_size: int = 4,
-    seed: int = 42,
 ) -> ExperimentResult:
-    """Random condition: Mix questions from different paragraphs."""
-    logger.info("Running Random condition...")
-
-    random.seed(seed)
-
-    # Flatten all questions with their contexts
-    all_questions = []
-    for group in groups:
-        context = group["context"]
-        for q_item in group["questions"]:
-            all_questions.append({
-                "context": context,
-                "question": q_item["question"],
-                "answer": q_item["answer"],
-            })
-
-    # Shuffle questions
-    random.shuffle(all_questions)
-
-    # Create random batches (questions from different contexts)
-    batches = []
-    for i in range(0, len(all_questions), batch_size):
-        batch = all_questions[i:i + batch_size]
-        batches.append(batch)
+    """All-in-One: All questions from same context in one prompt."""
+    logger.info("Running All-in-One condition...")
 
     total_correct = 0
     total_questions = 0
@@ -201,73 +180,7 @@ def run_random(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for batch in tqdm(batches, desc="Random"):
-        # Process batch - each question needs its own context
-        for q_item in batch:
-            context = q_item["context"]
-            question = q_item["question"]
-            gold_answer = q_item["answer"]
-
-            prompt = f"""Read the following passage and answer the question.
-
-Passage:
-{context}
-
-Question: {question}
-
-Answer (be concise):"""
-
-            pred, response = client.generate(prompt, max_tokens=64)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            # Evaluate
-            is_correct = compute_contains(pred, gold_answer) > 0
-            total_correct += int(is_correct)
-            total_questions += 1
-
-            details.append({
-                "question": question,
-                "gold_answer": gold_answer,
-                "prediction": pred,
-                "correct": is_correct,
-                "batch_size": len(batch),
-            })
-
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
-
-    return ExperimentResult(
-        condition="random",
-        dataset="squad",
-        n_samples=len(groups),
-        n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={
-            "exact_match": accuracy,
-        },
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        details=details,
-    )
-
-
-def run_oracle_batch(
-    groups: List[Dict[str, Any]],
-    client: LLMClient,
-) -> ExperimentResult:
-    """Oracle-Batch: Process multiple questions from same context in one prompt."""
-    logger.info("Running Oracle-Batch condition...")
-
-    total_correct = 0
-    total_questions = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for group in tqdm(groups, desc="Oracle-Batch"):
+    for group in tqdm(groups, desc="All-in-One"):
         context = group["context"]
         questions = group["questions"]
 
@@ -292,7 +205,6 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
         # Parse answers
         answers = _parse_batch_answers(pred, len(questions))
 
-        # Evaluate each question
         for i, q_item in enumerate(questions):
             gold_answer = q_item["answer"]
             pred_answer = answers.get(i, "")
@@ -311,14 +223,12 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
     accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="oracle_batch",
+        condition="all_in_one",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={
-            "exact_match": accuracy,
-        },
+        metrics={"exact_match": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -326,31 +236,15 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
     )
 
 
-def run_random_batch(
+def run_sequential_random(
     groups: List[Dict[str, Any]],
     client: LLMClient,
-    batch_size: int = 4,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Random-Batch: Process questions from different contexts in one prompt."""
-    logger.info("Running Random-Batch condition...")
+    """Sequential (Random): Questions in random order, each sees previous Q&A history."""
+    logger.info("Running Sequential (Random) condition...")
 
     random.seed(seed)
-
-    # Flatten all questions with their contexts
-    all_questions = []
-    for group in groups:
-        context = group["context"]
-        for q_item in group["questions"]:
-            all_questions.append({
-                "context": context,
-                "question": q_item["question"],
-                "answer": q_item["answer"],
-            })
-
-    # Shuffle and create batches
-    random.shuffle(all_questions)
-    batches = [all_questions[i:i + batch_size] for i in range(0, len(all_questions), batch_size)]
 
     total_correct = 0
     total_questions = 0
@@ -359,50 +253,191 @@ def run_random_batch(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for batch in tqdm(batches, desc="Random-Batch"):
-        # Build multi-context, multi-question prompt
-        prompt_parts = []
-        for i, q_item in enumerate(batch):
-            prompt_parts.append(f"Passage {i+1}:\n{q_item['context']}\n\nQ{i+1}: {q_item['question']}")
+    for group in tqdm(groups, desc="Sequential-Random"):
+        context = group["context"]
+        questions = group["questions"].copy()
 
-        prompt = "\n\n---\n\n".join(prompt_parts)
-        prompt += "\n\nAnswer each question concisely. Format: Q1: [answer], Q2: [answer], ..."
+        # Shuffle questions randomly
+        random.shuffle(questions)
 
-        pred, response = client.generate(prompt, max_tokens=256)
-        total_latency += response.latency
-        total_prompt_tokens += response.prompt_tokens
-        total_completion_tokens += response.completion_tokens
+        qa_history = []
 
-        # Parse answers
-        answers = _parse_batch_answers(pred, len(batch))
-
-        # Evaluate each question
-        for i, q_item in enumerate(batch):
+        for q_item in questions:
+            question = q_item["question"]
             gold_answer = q_item["answer"]
-            pred_answer = answers.get(i, "")
 
-            is_correct = compute_contains(pred_answer, gold_answer) > 0
+            # Build prompt with Q&A history
+            if qa_history:
+                history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
+                prompt = f"""Read the following passage and answer the question.
+You may use the previous Q&A pairs as reference.
+
+Passage:
+{context}
+
+Previous Q&A:
+{history_str}
+
+New Question: {question}
+
+Answer (be concise):"""
+            else:
+                prompt = f"""Read the following passage and answer the question.
+
+Passage:
+{context}
+
+Question: {question}
+
+Answer (be concise):"""
+
+            pred, response = client.generate(prompt, max_tokens=64)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            # Add to history
+            qa_history.append((question, pred.strip()))
+
+            is_correct = compute_contains(pred, gold_answer) > 0
             total_correct += int(is_correct)
             total_questions += 1
 
             details.append({
-                "question": q_item["question"],
+                "context_id": id(context),
+                "question": question,
                 "gold_answer": gold_answer,
-                "prediction": pred_answer,
+                "prediction": pred,
                 "correct": is_correct,
+                "history_length": len(qa_history) - 1,
             })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="random_batch",
+        condition="sequential_random",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={
-            "exact_match": accuracy,
-        },
+        metrics={"exact_match": accuracy},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_sequential_llm(
+    groups: List[Dict[str, Any]],
+    client: LLMClient,
+    ordering_client: Optional[LLMClient] = None,
+) -> ExperimentResult:
+    """Sequential (LLM-based): LLM determines optimal question order, then answers sequentially."""
+    logger.info("Running Sequential (LLM-based) condition...")
+
+    # Use same client for ordering if not specified
+    if ordering_client is None:
+        ordering_client = client
+
+    total_correct = 0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    for group in tqdm(groups, desc="Sequential-LLM"):
+        context = group["context"]
+        questions = group["questions"]
+
+        # Step 1: Ask LLM to determine optimal order
+        q_list = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(questions)])
+
+        ordering_prompt = f"""Given the following passage and questions, determine the optimal order to answer them.
+Consider which questions might provide useful information for answering subsequent questions.
+
+Passage:
+{context}
+
+Questions:
+{q_list}
+
+Return ONLY a comma-separated list of question numbers in the optimal order (e.g., "2,1,3,4").
+Optimal order:"""
+
+        order_response, order_meta = ordering_client.generate(ordering_prompt, max_tokens=32)
+        total_latency += order_meta.latency
+        total_prompt_tokens += order_meta.prompt_tokens
+        total_completion_tokens += order_meta.completion_tokens
+
+        # Parse order
+        ordered_indices = _parse_order(order_response, len(questions))
+        ordered_questions = [questions[i] for i in ordered_indices]
+
+        # Step 2: Answer questions in determined order
+        qa_history = []
+
+        for q_item in ordered_questions:
+            question = q_item["question"]
+            gold_answer = q_item["answer"]
+
+            # Build prompt with Q&A history
+            if qa_history:
+                history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
+                prompt = f"""Read the following passage and answer the question.
+You may use the previous Q&A pairs as reference.
+
+Passage:
+{context}
+
+Previous Q&A:
+{history_str}
+
+New Question: {question}
+
+Answer (be concise):"""
+            else:
+                prompt = f"""Read the following passage and answer the question.
+
+Passage:
+{context}
+
+Question: {question}
+
+Answer (be concise):"""
+
+            pred, response = client.generate(prompt, max_tokens=64)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            # Add to history
+            qa_history.append((question, pred.strip()))
+
+            is_correct = compute_contains(pred, gold_answer) > 0
+            total_correct += int(is_correct)
+            total_questions += 1
+
+            details.append({
+                "context_id": id(context),
+                "question": question,
+                "gold_answer": gold_answer,
+                "prediction": pred,
+                "correct": is_correct,
+                "history_length": len(qa_history) - 1,
+                "llm_order": ordered_indices,
+            })
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="sequential_llm",
+        dataset="squad",
+        n_samples=len(groups),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={"exact_match": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -412,8 +447,6 @@ def run_random_batch(
 
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
     """Parse batch answers from response like 'Q1: answer1, Q2: answer2'."""
-    import re
-
     answers = {}
 
     # Try pattern: Q1: answer
@@ -427,11 +460,32 @@ def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
     if not answers:
         parts = re.split(r"[,\n]", response)
         for i, part in enumerate(parts[:n_questions]):
-            # Remove Q1:, Q2:, etc. prefix if present
             clean = re.sub(r"^Q\d+[:\s]*", "", part.strip(), flags=re.IGNORECASE)
             answers[i] = clean
 
     return answers
+
+
+def _parse_order(response: str, n_questions: int) -> List[int]:
+    """Parse question order from LLM response like '2,1,3,4'."""
+    # Extract numbers from response
+    numbers = re.findall(r'\d+', response)
+
+    # Convert to 0-indexed and validate
+    indices = []
+    seen = set()
+    for num in numbers:
+        idx = int(num) - 1  # Convert to 0-indexed
+        if 0 <= idx < n_questions and idx not in seen:
+            indices.append(idx)
+            seen.add(idx)
+
+    # Add any missing indices at the end
+    for i in range(n_questions):
+        if i not in seen:
+            indices.append(i)
+
+    return indices
 
 
 def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
@@ -477,8 +531,8 @@ def main():
         description="Exp 2a: Shared Context - SQuAD"
     )
     parser.add_argument(
-        "--model", type=str, default="gpt-4o-mini",
-        help="Model to use for inference (e.g., gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct)"
+        "--model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
+        help="Model to use for inference"
     )
     parser.add_argument(
         "--use-local", action="store_true",
@@ -505,16 +559,12 @@ def main():
         help="Maximum questions per group"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=4,
-        help="Batch size for batched conditions"
-    )
-    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="oracle,random",
-        help="Comma-separated list of conditions: oracle,random,oracle_batch,random_batch"
+        "--conditions", type=str, default="independent,all_in_one,sequential_random,sequential_llm",
+        help="Comma-separated list of conditions: independent,all_in_one,sequential_random,sequential_llm"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
@@ -522,7 +572,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # Setup distributed (each GPU loads one model)
+    # Setup distributed
     rank, world_size = setup_distributed()
 
     # Configuration
@@ -535,7 +585,7 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # Load data (all ranks load the same data, then shard)
+    # Load data
     all_groups = load_squad_groups(
         n_groups=args.n_groups,
         min_questions=args.min_questions,
@@ -547,7 +597,7 @@ def main():
     groups = shard_data(all_groups, rank, world_size)
     logger.info(f"Rank {rank}/{world_size}: processing {len(groups)}/{len(all_groups)} groups")
 
-    # Initialize LLM client (will use current GPU)
+    # Initialize LLM client
     client = LLMClient(
         model=args.model,
         use_local=args.use_local,
@@ -555,21 +605,21 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
     )
 
-    # Run conditions on local shard
+    # Run conditions
     conditions = [c.strip() for c in args.conditions.split(",")]
     local_results = []
 
-    if "oracle" in conditions:
-        local_results.append(run_oracle(groups, client, batch_size=args.batch_size))
+    if "independent" in conditions:
+        local_results.append(run_independent(groups, client))
 
-    if "random" in conditions:
-        local_results.append(run_random(groups, client, batch_size=args.batch_size, seed=args.seed))
+    if "all_in_one" in conditions:
+        local_results.append(run_all_in_one(groups, client))
 
-    if "oracle_batch" in conditions:
-        local_results.append(run_oracle_batch(groups, client))
+    if "sequential_random" in conditions:
+        local_results.append(run_sequential_random(groups, client, seed=args.seed))
 
-    if "random_batch" in conditions:
-        local_results.append(run_random_batch(groups, client, batch_size=args.batch_size, seed=args.seed))
+    if "sequential_llm" in conditions:
+        local_results.append(run_sequential_llm(groups, client))
 
     # Gather results from all GPUs
     all_results_by_condition = {}
