@@ -390,6 +390,14 @@ def compute_squad_metrics(prediction: str, reference: str) -> dict:
     Returns:
         dict with 'exact_match' and 'f1' keys (values 0-100 scale)
     """
+    # Edge case: if both normalize to empty (e.g., answer is "a" which gets removed as article)
+    # Both official SQuAD metric and fallback may return F1=0 in this case, but it should be 1.0
+    pred_norm = _normalize_answer(prediction)
+    ref_norm = _normalize_answer(reference)
+    if not pred_norm and not ref_norm:
+        # Both empty after normalization - treat as exact match
+        return {"exact_match": 100.0, "f1": 100.0}
+
     if _squad_metric is None:
         # Fallback to manual implementation if evaluate not available
         em = _compute_exact_match_manual(prediction, reference)
@@ -401,6 +409,11 @@ def compute_squad_metrics(prediction: str, reference: str) -> dict:
     references = [{"id": "0", "answers": {"text": [reference], "answer_start": [0]}}]
 
     result = _squad_metric.compute(predictions=predictions, references=references)
+
+    # Ensure F1 >= EM (fix edge cases in official metric)
+    if result["f1"] < result["exact_match"]:
+        result["f1"] = result["exact_match"]
+
     return result
 
 
@@ -452,6 +465,10 @@ def _compute_f1_manual(prediction: str, reference: str) -> float:
     pred_tokens = _normalize_answer(prediction).split()
     ref_tokens = _normalize_answer(reference).split()
 
+    # Edge case: if both normalize to empty (e.g., answer is "a" which gets removed as article)
+    # Treat as exact match if both are empty
+    if not pred_tokens and not ref_tokens:
+        return 1.0
     if not pred_tokens or not ref_tokens:
         return 0.0
 
@@ -618,12 +635,17 @@ def topological_sort(n: int, edges: List[Tuple[int, int]]) -> List[int]:
     return result
 
 
-def setup_distributed() -> Tuple[int, int]:
+def setup_distributed(timeout_hours: float = 2.0) -> Tuple[int, int]:
     """Setup distributed training environment.
+
+    Args:
+        timeout_hours: Timeout for distributed operations in hours (default: 2 hours)
 
     Returns:
         Tuple of (rank, world_size)
     """
+    from datetime import timedelta
+
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("LOCAL_RANK", 0))
 
@@ -636,8 +658,9 @@ def setup_distributed() -> Tuple[int, int]:
 
         if not dist.is_initialized():
             backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-            logger.info(f"Initialized distributed backend: {backend} (rank {rank}/{world_size})")
+            timeout = timedelta(hours=timeout_hours)
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size, timeout=timeout)
+            logger.info(f"Initialized distributed backend: {backend} (rank {rank}/{world_size}, timeout={timeout_hours}h)")
 
     return rank, world_size
 

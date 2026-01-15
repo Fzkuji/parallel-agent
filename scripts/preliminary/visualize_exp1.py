@@ -121,7 +121,7 @@ def plot_context_comparison():
 
     ax1.set_xlabel("Model Size", fontsize=12)
     ax1.set_ylabel("Accuracy (%)", fontsize=12)
-    ax1.set_title("Gold Condition: Context as Noise", fontsize=13)
+    ax1.set_title("Gold Condition: Upper Bound Reference", fontsize=13)
     ax1.set_xticks(x)
     ax1.set_xticklabels(models)
     ax1.legend(loc="lower right", fontsize=10)

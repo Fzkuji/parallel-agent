@@ -139,8 +139,8 @@
 
 ## Key Findings
 
-1. **gold_direct > gold_context** (3B+): Context introduces noise when gold answers are pre-embedded
-2. **chain_only ≥ sequential** (7B+): Q&A history sufficient at final step
-3. **All decomposed > main_question**: Decomposition is essential
-4. **0.5B catastrophic failure**: Error propagation destroys sequential/chain_only performance
-5. **Per-step pattern**: Step 1 & 2 high accuracy (~70-90%), Step 3 drops significantly
+1. **Error Propagation**: Per-step accuracy drops from 70-90% (Steps 1-2) to 23-44% (Step 3), showing token-level answer propagation amplifies errors
+2. **Model Capacity Sensitivity**: 0.5B catastrophically fails under sequential reasoning (EM<1%), indicating token chains require substantial model capacity
+3. **Efficiency Cost**: Sequential processing is 10-20x slower (5-42s vs 0.2-3s) due to multiple inference rounds
+4. **Decomposition Essential**: All decomposed conditions >> main_question
+5. **Q&A History Effective**: chain_only ≥ sequential (7B+), structured history more efficient than repeated context

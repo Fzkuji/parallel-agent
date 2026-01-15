@@ -62,13 +62,16 @@ def compute_f1(prediction: str, references: List[str]) -> float:
         Best F1 score (0.0 to 1.0)
     """
     pred_tokens = normalize_answer(prediction).split()
-    if not pred_tokens:
-        return 0.0
 
     best = 0.0
     for ref in references:
         ref_tokens = normalize_answer(ref).split()
-        if not ref_tokens:
+
+        # Edge case: if both normalize to empty (e.g., answer is "a" which gets removed as article)
+        # Treat as exact match if both are empty
+        if not pred_tokens and not ref_tokens:
+            return 1.0
+        if not pred_tokens or not ref_tokens:
             continue
 
         overlap = set(pred_tokens) & set(ref_tokens)
