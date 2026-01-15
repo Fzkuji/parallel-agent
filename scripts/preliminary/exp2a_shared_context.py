@@ -41,7 +41,6 @@ from utils import (
     LLMClient,
     compute_exact_match,
     compute_f1,
-    compute_contains,
     print_summary,
     save_results,
     setup_distributed,
@@ -140,7 +139,7 @@ Answer (be concise):"""
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            is_correct = compute_contains(pred, gold_answer) > 0
+            is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
             total_f1 += f1_score
@@ -311,7 +310,7 @@ Answer (be concise):"""
             # Add to history
             qa_history.append((question, pred.strip()))
 
-            is_correct = compute_contains(pred, gold_answer) > 0
+            is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
             total_f1 += f1_score
@@ -432,7 +431,7 @@ Answer (be concise):"""
             # Add to history
             qa_history.append((question, pred.strip()))
 
-            is_correct = compute_contains(pred, gold_answer) > 0
+            is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
             total_f1 += f1_score
@@ -551,7 +550,7 @@ Answer (be concise):"""
         # Add to history
         qa_history.append((question, pred.strip()))
 
-        is_correct = compute_contains(pred, gold_answer) > 0
+        is_correct = compute_exact_match(pred, gold_answer) > 0
         f1_score = compute_f1(pred, gold_answer)
         total_correct += int(is_correct)
         total_f1 += f1_score

@@ -375,40 +375,55 @@ Output only the dependencies, one per line:"""
         return dependencies
 
 
+# Use official SQuAD evaluation from Hugging Face evaluate library
+# This ensures consistent, standard evaluation metrics
+try:
+    import evaluate
+    _squad_metric = evaluate.load("squad")
+except Exception:
+    _squad_metric = None
+
+
+def compute_squad_metrics(prediction: str, reference: str) -> dict:
+    """Compute EM and F1 using official SQuAD evaluation.
+
+    Returns:
+        dict with 'exact_match' and 'f1' keys (values 0-100 scale)
+    """
+    if _squad_metric is None:
+        # Fallback to manual implementation if evaluate not available
+        em = _compute_exact_match_manual(prediction, reference)
+        f1 = _compute_f1_manual(prediction, reference)
+        return {"exact_match": em * 100, "f1": f1 * 100}
+
+    # Format for SQuAD metric: predictions and references need specific format
+    predictions = [{"id": "0", "prediction_text": prediction}]
+    references = [{"id": "0", "answers": {"text": [reference], "answer_start": [0]}}]
+
+    result = _squad_metric.compute(predictions=predictions, references=references)
+    return result
+
+
 def compute_exact_match(prediction: str, reference: str) -> float:
-    """Compute exact match score."""
-    pred = normalize_answer(prediction)
-    ref = normalize_answer(reference)
-    return 1.0 if pred == ref else 0.0
+    """Compute exact match score using official SQuAD evaluation.
+
+    Returns: 1.0 if exact match, 0.0 otherwise
+    """
+    result = compute_squad_metrics(prediction, reference)
+    return result["exact_match"] / 100.0
 
 
 def compute_f1(prediction: str, reference: str) -> float:
-    """Compute token-level F1 score."""
-    pred_tokens = normalize_answer(prediction).split()
-    ref_tokens = normalize_answer(reference).split()
+    """Compute F1 score using official SQuAD evaluation.
 
-    if not pred_tokens or not ref_tokens:
-        return 0.0
-
-    common = set(pred_tokens) & set(ref_tokens)
-    if not common:
-        return 0.0
-
-    precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(ref_tokens)
-
-    return 2 * precision * recall / (precision + recall)
+    Returns: F1 score in range [0, 1]
+    """
+    result = compute_squad_metrics(prediction, reference)
+    return result["f1"] / 100.0
 
 
-def compute_contains(prediction: str, reference: str) -> float:
-    """Check if prediction contains the reference answer."""
-    pred = normalize_answer(prediction)
-    ref = normalize_answer(reference)
-    return 1.0 if ref in pred else 0.0
-
-
-def normalize_answer(text: str) -> str:
-    """Normalize answer for comparison."""
+def _normalize_answer(text: str) -> str:
+    """Normalize answer for comparison (SQuAD style)."""
     import re
     import string
 
@@ -421,6 +436,49 @@ def normalize_answer(text: str) -> str:
     text = " ".join(text.split())
 
     return text
+
+
+def _compute_exact_match_manual(prediction: str, reference: str) -> float:
+    """Fallback: Compute exact match score manually."""
+    pred = _normalize_answer(prediction)
+    ref = _normalize_answer(reference)
+    return 1.0 if pred == ref else 0.0
+
+
+def _compute_f1_manual(prediction: str, reference: str) -> float:
+    """Fallback: Compute token-level F1 score manually (SQuAD style)."""
+    from collections import Counter
+
+    pred_tokens = _normalize_answer(prediction).split()
+    ref_tokens = _normalize_answer(reference).split()
+
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+
+    # Use Counter for proper frequency-based overlap
+    pred_counter = Counter(pred_tokens)
+    ref_counter = Counter(ref_tokens)
+    common = pred_counter & ref_counter
+    num_same = sum(common.values())
+
+    if num_same == 0:
+        return 0.0
+
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(ref_tokens)
+
+    return 2 * precision * recall / (precision + recall)
+
+
+def compute_contains(prediction: str, reference: str) -> float:
+    """Check if prediction contains the reference answer (lenient metric).
+
+    WARNING: This is a lenient metric that may give inflated scores.
+    Use compute_exact_match for standard evaluation.
+    """
+    pred = _normalize_answer(prediction)
+    ref = _normalize_answer(reference)
+    return 1.0 if ref in pred else 0.0
 
 
 def save_results(

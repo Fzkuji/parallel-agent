@@ -32,8 +32,6 @@ from utils import (
     ExperimentConfig,
     ExperimentResult,
     LLMClient,
-    compute_exact_match,
-    compute_contains,
     print_summary,
     save_results,
     setup_distributed,
