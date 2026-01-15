@@ -481,6 +481,10 @@ def compute_contains(prediction: str, reference: str) -> float:
     return 1.0 if ref in pred else 0.0
 
 
+# Public alias for backward compatibility
+normalize_answer = _normalize_answer
+
+
 def save_results(
     results: List[ExperimentResult],
     config: ExperimentConfig,
