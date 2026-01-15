@@ -110,6 +110,7 @@ def run_independent(
     logger.info("Running Independent condition...")
 
     total_correct = 0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -139,7 +140,9 @@ Answer (be concise):"""
             total_completion_tokens += response.completion_tokens
 
             is_correct = compute_contains(pred, gold_answer) > 0
+            f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
+            total_f1 += f1_score
             total_questions += 1
 
             details.append({
@@ -148,17 +151,19 @@ Answer (be concise):"""
                 "gold_answer": gold_answer,
                 "prediction": pred,
                 "correct": is_correct,
+                "f1": f1_score,
             })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="independent",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"em": accuracy},
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -174,6 +179,7 @@ def run_all_in_one(
     logger.info("Running All-in-One condition...")
 
     total_correct = 0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -210,7 +216,9 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
             pred_answer = answers.get(i, "")
 
             is_correct = compute_contains(pred_answer, gold_answer) > 0
+            f1_score = compute_f1(pred_answer, gold_answer)
             total_correct += int(is_correct)
+            total_f1 += f1_score
             total_questions += 1
 
             details.append({
@@ -218,17 +226,19 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
                 "gold_answer": gold_answer,
                 "prediction": pred_answer,
                 "correct": is_correct,
+                "f1": f1_score,
             })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="all_in_one",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"em": accuracy},
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -247,6 +257,7 @@ def run_sequential_random(
     random.seed(seed)
 
     total_correct = 0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -300,7 +311,9 @@ Answer (be concise):"""
             qa_history.append((question, pred.strip()))
 
             is_correct = compute_contains(pred, gold_answer) > 0
+            f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
+            total_f1 += f1_score
             total_questions += 1
 
             details.append({
@@ -309,18 +322,20 @@ Answer (be concise):"""
                 "gold_answer": gold_answer,
                 "prediction": pred,
                 "correct": is_correct,
+                "f1": f1_score,
                 "history_length": len(qa_history) - 1,
             })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="sequential_random",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"em": accuracy},
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -341,6 +356,7 @@ def run_sequential_llm(
         ordering_client = client
 
     total_correct = 0
+    total_f1 = 0.0
     total_questions = 0
     details = []
     total_latency = 0.0
@@ -416,7 +432,9 @@ Answer (be concise):"""
             qa_history.append((question, pred.strip()))
 
             is_correct = compute_contains(pred, gold_answer) > 0
+            f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
+            total_f1 += f1_score
             total_questions += 1
 
             details.append({
@@ -425,19 +443,21 @@ Answer (be concise):"""
                 "gold_answer": gold_answer,
                 "prediction": pred,
                 "correct": is_correct,
+                "f1": f1_score,
                 "history_length": len(qa_history) - 1,
                 "llm_order": ordered_indices,
             })
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition="sequential_llm",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"em": accuracy},
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
@@ -496,6 +516,7 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         return results[0]
 
     total_correct = 0
+    total_f1 = 0.0
     total_questions = 0
     total_latency = 0.0
     total_prompt_tokens = 0
@@ -505,20 +526,22 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
     for r in results:
         total_questions += r.n_questions
         total_correct += int(r.accuracy * r.n_questions)
+        total_f1 += r.metrics.get("f1", 0) * r.n_questions
         total_latency += r.latency
         total_prompt_tokens += r.prompt_tokens
         total_completion_tokens += r.completion_tokens
         all_details.extend(r.details)
 
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
         condition=results[0].condition,
         dataset=results[0].dataset,
         n_samples=sum(r.n_samples for r in results),
         n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"em": accuracy},
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
