@@ -9,10 +9,11 @@ when questions share the same context?
 Conditions:
 - Independent: Each question + context answered separately
 - All-in-One: All questions from same context in one prompt
-- Sequential (Random): Questions answered in random order, with Q&A history
-- Sequential (LLM-based): LLM determines optimal question order, with Q&A history
+- Seq. (Cross-Ctx): Sequential with questions from DIFFERENT contexts (baseline)
+- Seq. (Shared, Rand): Sequential with shared context, random question order
+- Seq. (Shared, Ord): Sequential with shared context, LLM-optimized order
 
-Expected: Sequential strategies may benefit from information sharing between questions.
+Expected: Shared-context strategies should benefit from information sharing.
 """
 
 from __future__ import annotations
@@ -246,13 +247,13 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
     )
 
 
-def run_sequential_random(
+def run_seq_shared_rand(
     groups: List[Dict[str, Any]],
     client: LLMClient,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Sequential (Random): Questions in random order, each sees previous Q&A history."""
-    logger.info("Running Sequential (Random) condition...")
+    """Seq. (Shared, Rand): Questions in random order, each sees previous Q&A history."""
+    logger.info("Running Seq. (Shared, Rand) condition...")
 
     random.seed(seed)
 
@@ -264,7 +265,7 @@ def run_sequential_random(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for group in tqdm(groups, desc="Sequential-Random"):
+    for group in tqdm(groups, desc="Seq.(Shared,Rand)"):
         context = group["context"]
         questions = group["questions"].copy()
 
@@ -330,7 +331,7 @@ Answer (be concise):"""
     f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="sequential_random",
+        condition="seq_shared_rand",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
@@ -343,13 +344,13 @@ Answer (be concise):"""
     )
 
 
-def run_sequential_llm(
+def run_seq_shared_ord(
     groups: List[Dict[str, Any]],
     client: LLMClient,
     ordering_client: Optional[LLMClient] = None,
 ) -> ExperimentResult:
-    """Sequential (LLM-based): LLM determines optimal question order, then answers sequentially."""
-    logger.info("Running Sequential (LLM-based) condition...")
+    """Seq. (Shared, Ord): LLM determines optimal question order, then answers sequentially."""
+    logger.info("Running Seq. (Shared, Ord) condition...")
 
     # Use same client for ordering if not specified
     if ordering_client is None:
@@ -363,7 +364,7 @@ def run_sequential_llm(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for group in tqdm(groups, desc="Sequential-LLM"):
+    for group in tqdm(groups, desc="Seq.(Shared,Ord)"):
         context = group["context"]
         questions = group["questions"]
 
@@ -452,7 +453,126 @@ Answer (be concise):"""
     f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="sequential_llm",
+        condition="seq_shared_ord",
+        dataset="squad",
+        n_samples=len(groups),
+        n_questions=total_questions,
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_seq_cross_ctx(
+    groups: List[Dict[str, Any]],
+    client: LLMClient,
+    seed: int = 42,
+) -> ExperimentResult:
+    """Seq. (Cross-Ctx): Sequential with questions from DIFFERENT contexts (baseline).
+
+    This serves as a control condition to measure the benefit of shared context.
+    Questions are randomly sampled from different context groups.
+    """
+    logger.info("Running Seq. (Cross-Ctx) condition...")
+
+    random.seed(seed)
+
+    total_correct = 0
+    total_f1 = 0.0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    # Flatten all questions with their contexts
+    all_qa_pairs = []
+    for group in groups:
+        context = group["context"]
+        for q_item in group["questions"]:
+            all_qa_pairs.append({
+                "context": context,
+                "question": q_item["question"],
+                "answer": q_item["answer"],
+            })
+
+    # Shuffle to mix questions from different contexts
+    random.shuffle(all_qa_pairs)
+
+    # Process in batches matching the average group size
+    avg_group_size = sum(g["n_questions"] for g in groups) // len(groups) if groups else 4
+
+    qa_history = []
+    batch_count = 0
+
+    for i, qa_pair in enumerate(tqdm(all_qa_pairs, desc="Seq.(Cross-Ctx)")):
+        context = qa_pair["context"]
+        question = qa_pair["question"]
+        gold_answer = qa_pair["answer"]
+
+        # Reset history at batch boundaries (simulating group boundaries)
+        if i > 0 and i % avg_group_size == 0:
+            qa_history = []
+            batch_count += 1
+
+        # Build prompt with Q&A history (from different contexts!)
+        if qa_history:
+            history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
+            prompt = f"""Read the following passage and answer the question.
+You may use the previous Q&A pairs as reference.
+
+Passage:
+{context}
+
+Previous Q&A:
+{history_str}
+
+New Question: {question}
+
+Answer (be concise):"""
+        else:
+            prompt = f"""Read the following passage and answer the question.
+
+Passage:
+{context}
+
+Question: {question}
+
+Answer (be concise):"""
+
+        pred, response = client.generate(prompt, max_tokens=64)
+        total_latency += response.latency
+        total_prompt_tokens += response.prompt_tokens
+        total_completion_tokens += response.completion_tokens
+
+        # Add to history
+        qa_history.append((question, pred.strip()))
+
+        is_correct = compute_contains(pred, gold_answer) > 0
+        f1_score = compute_f1(pred, gold_answer)
+        total_correct += int(is_correct)
+        total_f1 += f1_score
+        total_questions += 1
+
+        details.append({
+            "context_id": id(context),
+            "question": question,
+            "gold_answer": gold_answer,
+            "prediction": pred,
+            "correct": is_correct,
+            "f1": f1_score,
+            "history_length": len(qa_history) - 1,
+            "batch": batch_count,
+        })
+
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="seq_cross_ctx",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
@@ -586,8 +706,8 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="independent,all_in_one,sequential_random,sequential_llm",
-        help="Comma-separated list of conditions: independent,all_in_one,sequential_random,sequential_llm"
+        "--conditions", type=str, default="independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord",
+        help="Comma-separated list of conditions: independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
@@ -638,11 +758,14 @@ def main():
     if "all_in_one" in conditions:
         local_results.append(run_all_in_one(groups, client))
 
-    if "sequential_random" in conditions:
-        local_results.append(run_sequential_random(groups, client, seed=args.seed))
+    if "seq_cross_ctx" in conditions:
+        local_results.append(run_seq_cross_ctx(groups, client, seed=args.seed))
 
-    if "sequential_llm" in conditions:
-        local_results.append(run_sequential_llm(groups, client))
+    if "seq_shared_rand" in conditions:
+        local_results.append(run_seq_shared_rand(groups, client, seed=args.seed))
+
+    if "seq_shared_ord" in conditions:
+        local_results.append(run_seq_shared_ord(groups, client))
 
     # Gather results from all GPUs
     all_results_by_condition = {}
