@@ -130,11 +130,12 @@ Question: {question}
 
 Answer (be concise):"""
 
-            pred, response = client.generate(prompt, max_tokens=64)
+            pred_raw, response = client.generate(prompt, max_tokens=64)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
+            pred = _extract_answer(pred_raw)
             is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
             total_correct += int(is_correct)
@@ -146,6 +147,7 @@ Answer (be concise):"""
                 "question": question,
                 "gold_answer": gold_answer,
                 "prediction": pred,
+                "prediction_raw": pred_raw,
                 "correct": is_correct,
                 "f1": f1_score,
             })
@@ -209,7 +211,8 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
 
         for i, q_item in enumerate(questions):
             gold_answer = q_item["answer"]
-            pred_answer = answers.get(i, "")
+            pred_answer_raw = answers.get(i, "")
+            pred_answer = _extract_answer(pred_answer_raw)
 
             is_correct = compute_exact_match(pred_answer, gold_answer) > 0
             f1_score = compute_f1(pred_answer, gold_answer)
@@ -298,13 +301,15 @@ Question: {question}
 
 Answer (be concise):"""
 
-            pred, response = client.generate(prompt, max_tokens=64)
+            pred_raw, response = client.generate(prompt, max_tokens=64)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            # Add to history
-            qa_history.append((question, pred.strip()))
+            pred = _extract_answer(pred_raw)
+
+            # Add to history (use cleaned answer)
+            qa_history.append((question, pred))
 
             is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
@@ -317,6 +322,7 @@ Answer (be concise):"""
                 "question": question,
                 "gold_answer": gold_answer,
                 "prediction": pred,
+                "prediction_raw": pred_raw,
                 "correct": is_correct,
                 "f1": f1_score,
                 "history_length": len(qa_history) - 1,
@@ -419,13 +425,15 @@ Question: {question}
 
 Answer (be concise):"""
 
-            pred, response = client.generate(prompt, max_tokens=64)
+            pred_raw, response = client.generate(prompt, max_tokens=64)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            # Add to history
-            qa_history.append((question, pred.strip()))
+            pred = _extract_answer(pred_raw)
+
+            # Add to history (use cleaned answer)
+            qa_history.append((question, pred))
 
             is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
@@ -438,6 +446,7 @@ Answer (be concise):"""
                 "question": question,
                 "gold_answer": gold_answer,
                 "prediction": pred,
+                "prediction_raw": pred_raw,
                 "correct": is_correct,
                 "f1": f1_score,
                 "history_length": len(qa_history) - 1,
@@ -538,13 +547,15 @@ Question: {question}
 
 Answer (be concise):"""
 
-        pred, response = client.generate(prompt, max_tokens=64)
+        pred_raw, response = client.generate(prompt, max_tokens=64)
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
 
-        # Add to history
-        qa_history.append((question, pred.strip()))
+        pred = _extract_answer(pred_raw)
+
+        # Add to history (use cleaned answer)
+        qa_history.append((question, pred))
 
         is_correct = compute_exact_match(pred, gold_answer) > 0
         f1_score = compute_f1(pred, gold_answer)
@@ -557,6 +568,7 @@ Answer (be concise):"""
             "question": question,
             "gold_answer": gold_answer,
             "prediction": pred,
+            "prediction_raw": pred_raw,
             "correct": is_correct,
             "f1": f1_score,
             "history_length": len(qa_history) - 1,
@@ -578,6 +590,36 @@ Answer (be concise):"""
         completion_tokens=total_completion_tokens,
         details=details,
     )
+
+
+def _extract_answer(response: str) -> str:
+    """Extract clean answer from model response.
+
+    Handles common patterns like:
+    - "The answer is: John Smith"
+    - "Answer: John Smith"
+    - "John Smith." (just the answer with punctuation)
+    """
+    response = response.strip()
+
+    # Remove common prefixes
+    prefixes = [
+        r"^(?:the\s+)?answer\s*(?:is|:)\s*",
+        r"^based\s+on\s+(?:the\s+)?(?:passage|context|text)[,\s]+(?:the\s+)?answer\s*(?:is|:)\s*",
+        r"^according\s+to\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
+    ]
+
+    cleaned = response
+    for prefix in prefixes:
+        cleaned = re.sub(prefix, "", cleaned, flags=re.IGNORECASE)
+
+    # Take first line/sentence if multiple
+    cleaned = cleaned.split('\n')[0].strip()
+
+    # Remove trailing punctuation (but keep internal punctuation)
+    cleaned = cleaned.rstrip('.,;:')
+
+    return cleaned
 
 
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
