@@ -39,6 +39,7 @@ from utils import (
     ExperimentConfig,
     ExperimentResult,
     LLMClient,
+    compute_contains,
     compute_exact_match,
     compute_f1,
     print_summary,
@@ -673,8 +674,8 @@ def main():
         description="Exp 2a: Shared Context - SQuAD"
     )
     parser.add_argument(
-        "--model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
-        help="Model to use for inference"
+        "--models", type=str, default="Qwen/Qwen2.5-7B-Instruct",
+        help="Comma-separated list of models (e.g., 'Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-14B-Instruct')"
     )
     parser.add_argument(
         "--use-local", action="store_true",
@@ -714,20 +715,13 @@ def main():
     )
     args = parser.parse_args()
 
+    # Parse models list
+    models = [m.strip() for m in args.models.split(",")]
+
     # Setup distributed
     rank, world_size = setup_distributed()
 
-    # Configuration
-    config = ExperimentConfig(
-        exp_name="exp2a_shared_context",
-        dataset="squad",
-        model=args.model,
-        n_samples=args.n_groups,
-        seed=args.seed,
-        output_dir=args.output_dir,
-    )
-
-    # Load data
+    # Load data (only once, shared across models)
     all_groups = load_squad_groups(
         n_groups=args.n_groups,
         min_questions=args.min_questions,
@@ -739,46 +733,67 @@ def main():
     groups = shard_data(all_groups, rank, world_size)
     logger.info(f"Rank {rank}/{world_size}: processing {len(groups)}/{len(all_groups)} groups")
 
-    # Initialize LLM client
-    client = LLMClient(
-        model=args.model,
-        use_local=args.use_local,
-        use_vllm=args.use_vllm,
-        tensor_parallel_size=args.tensor_parallel_size,
-    )
+    # Run for each model
+    for model in models:
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Running experiments for model: {model}")
+        logger.info(f"{'='*60}\n")
 
-    # Run conditions
-    conditions = [c.strip() for c in args.conditions.split(",")]
-    local_results = []
+        # Configuration for this model
+        config = ExperimentConfig(
+            exp_name="exp2a_shared_context",
+            dataset="squad",
+            model=model,
+            n_samples=args.n_groups,
+            seed=args.seed,
+            output_dir=args.output_dir,
+        )
 
-    if "independent" in conditions:
-        local_results.append(run_independent(groups, client))
+        # Initialize LLM client for this model
+        client = LLMClient(
+            model=model,
+            use_local=args.use_local,
+            use_vllm=args.use_vllm,
+            tensor_parallel_size=args.tensor_parallel_size,
+        )
 
-    if "all_in_one" in conditions:
-        local_results.append(run_all_in_one(groups, client))
+        # Run conditions
+        conditions = [c.strip() for c in args.conditions.split(",")]
+        local_results = []
 
-    if "seq_cross_ctx" in conditions:
-        local_results.append(run_seq_cross_ctx(groups, client, seed=args.seed))
+        if "independent" in conditions:
+            local_results.append(run_independent(groups, client))
 
-    if "seq_shared_rand" in conditions:
-        local_results.append(run_seq_shared_rand(groups, client, seed=args.seed))
+        if "all_in_one" in conditions:
+            local_results.append(run_all_in_one(groups, client))
 
-    if "seq_shared_ord" in conditions:
-        local_results.append(run_seq_shared_ord(groups, client))
+        if "seq_cross_ctx" in conditions:
+            local_results.append(run_seq_cross_ctx(groups, client, seed=args.seed))
 
-    # Gather results from all GPUs
-    all_results_by_condition = {}
-    for result in local_results:
-        gathered = gather_results([result], world_size)
+        if "seq_shared_rand" in conditions:
+            local_results.append(run_seq_shared_rand(groups, client, seed=args.seed))
+
+        if "seq_shared_ord" in conditions:
+            local_results.append(run_seq_shared_ord(groups, client))
+
+        # Gather results from all GPUs
+        all_results_by_condition = {}
+        for result in local_results:
+            gathered = gather_results([result], world_size)
+            if rank == 0:
+                merged = _merge_results(gathered)
+                all_results_by_condition[result.condition] = merged
+
+        # Print and save results (only rank 0)
         if rank == 0:
-            merged = _merge_results(gathered)
-            all_results_by_condition[result.condition] = merged
+            results = list(all_results_by_condition.values())
+            print_summary(results)
+            save_results(results, config)
 
-    # Print and save results (only rank 0)
-    if rank == 0:
-        results = list(all_results_by_condition.values())
-        print_summary(results)
-        save_results(results, config)
+        # Clean up vLLM model to free GPU memory before loading next model
+        if hasattr(client, 'cleanup'):
+            client.cleanup()
+        del client
 
     cleanup_distributed()
 
