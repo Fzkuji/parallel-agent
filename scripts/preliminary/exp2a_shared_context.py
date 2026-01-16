@@ -122,12 +122,13 @@ def run_independent(
             gold_answer = q_item["answer"]
 
             prompt = f"""Read the following passage and answer the question.
-Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}"""
+Question: {question}
+
+Respond with: <answer>your answer</answer>"""
 
             pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
@@ -287,7 +288,6 @@ def run_seq_shared_rand(
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
                 prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
-Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
@@ -295,15 +295,18 @@ Passage:
 Previous Q&A:
 {history_str}
 
-New Question: {question}"""
+New Question: {question}
+
+Respond with: <answer>your answer</answer>"""
             else:
                 prompt = f"""Read the following passage and answer the question.
-Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}"""
+Question: {question}
+
+Respond with: <answer>your answer</answer>"""
 
             pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
@@ -409,7 +412,6 @@ Optimal order:"""
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
                 prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
-Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
@@ -417,15 +419,18 @@ Passage:
 Previous Q&A:
 {history_str}
 
-New Question: {question}"""
+New Question: {question}
+
+Respond with: <answer>your answer</answer>"""
             else:
                 prompt = f"""Read the following passage and answer the question.
-Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}"""
+Question: {question}
+
+Respond with: <answer>your answer</answer>"""
 
             pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
@@ -529,7 +534,6 @@ def run_seq_cross_ctx(
             history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
             prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
-Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
@@ -539,15 +543,16 @@ Previous Q&A:
 
 New Question: {question}
 
-Answer:"""
+Respond with: <answer>your answer</answer>"""
         else:
             prompt = f"""Read the following passage and answer the question.
-Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}"""
+Question: {question}
+
+Respond with: <answer>your answer</answer>"""
 
         pred_raw, response = client.generate(prompt, max_tokens=128)
         total_latency += response.latency
