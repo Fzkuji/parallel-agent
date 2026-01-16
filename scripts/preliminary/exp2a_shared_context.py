@@ -122,15 +122,16 @@ def run_independent(
             gold_answer = q_item["answer"]
 
             prompt = f"""Read the following passage and answer the question.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
 
 Question: {question}
 
-Answer (be concise):"""
+Answer:"""
 
-            pred_raw, response = client.generate(prompt, max_tokens=64)
+            pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -192,6 +193,7 @@ def run_all_in_one(
         q_list = "\n".join([f"Q{i+1}: {q['question']}" for i, q in enumerate(questions)])
 
         prompt = f"""Read the following passage and answer all questions.
+Put each answer in \\boxed{{}}.
 
 Passage:
 {context}
@@ -199,9 +201,9 @@ Passage:
 Questions:
 {q_list}
 
-Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
+Format: Q1: \\boxed{{answer1}}, Q2: \\boxed{{answer2}}, ..."""
 
-        pred, response = client.generate(prompt, max_tokens=256)
+        pred, response = client.generate(prompt, max_tokens=512)
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
@@ -221,9 +223,12 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
             total_questions += 1
 
             details.append({
+                "context_id": id(context),
                 "question": q_item["question"],
                 "gold_answer": gold_answer,
                 "prediction": pred_answer,
+                "prediction_raw": pred_answer_raw,
+                "batch_response": pred,
                 "correct": is_correct,
                 "f1": f1_score,
             })
@@ -281,6 +286,7 @@ def run_seq_shared_rand(
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
                 prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
@@ -290,18 +296,19 @@ Previous Q&A:
 
 New Question: {question}
 
-Answer (be concise):"""
+Answer:"""
             else:
                 prompt = f"""Read the following passage and answer the question.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
 
 Question: {question}
 
-Answer (be concise):"""
+Answer:"""
 
-            pred_raw, response = client.generate(prompt, max_tokens=64)
+            pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -405,6 +412,7 @@ Optimal order:"""
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
                 prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
@@ -414,18 +422,19 @@ Previous Q&A:
 
 New Question: {question}
 
-Answer (be concise):"""
+Answer:"""
             else:
                 prompt = f"""Read the following passage and answer the question.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
 
 Question: {question}
 
-Answer (be concise):"""
+Answer:"""
 
-            pred_raw, response = client.generate(prompt, max_tokens=64)
+            pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -527,6 +536,7 @@ def run_seq_cross_ctx(
             history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
             prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
@@ -536,18 +546,19 @@ Previous Q&A:
 
 New Question: {question}
 
-Answer (be concise):"""
+Answer:"""
         else:
             prompt = f"""Read the following passage and answer the question.
+Put your final answer in \\boxed{{}}.
 
 Passage:
 {context}
 
 Question: {question}
 
-Answer (be concise):"""
+Answer:"""
 
-        pred_raw, response = client.generate(prompt, max_tokens=64)
+        pred_raw, response = client.generate(prompt, max_tokens=128)
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
@@ -598,9 +609,15 @@ def _extract_answer(response: str) -> str:
     Handles common patterns like:
     - "The answer is: John Smith"
     - "Answer: John Smith"
+    - "\\boxed{John Smith}"
     - "John Smith." (just the answer with punctuation)
     """
     response = response.strip()
+
+    # First, try to extract from \boxed{} format (common in Qwen models)
+    boxed_match = re.search(r'\\boxed\{([^}]+)\}', response)
+    if boxed_match:
+        return boxed_match.group(1).strip()
 
     # Remove common prefixes
     prefixes = [
@@ -623,17 +640,37 @@ def _extract_answer(response: str) -> str:
 
 
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
-    """Parse batch answers from response like 'Q1: answer1, Q2: answer2'."""
+    """Parse batch answers from response like 'Q1: \\boxed{answer1}, Q2: \\boxed{answer2}'."""
     answers = {}
 
-    # Try pattern: Q1: answer
+    # First, try to extract \boxed{} answers for each question
     for i in range(n_questions):
-        pattern = rf"Q{i+1}[:\s]+([^Q\n]+)"
-        match = re.search(pattern, response, re.IGNORECASE)
+        # Pattern: Q1: ... \boxed{answer} ... (until Q2 or end)
+        # Use lookahead to stop at next Qn: pattern
+        if i < n_questions - 1:
+            pattern = rf"Q{i+1}[:\s]+.*?\\boxed\{{([^}}]+)\}}.*?(?=Q{i+2}[:\s])"
+        else:
+            pattern = rf"Q{i+1}[:\s]+.*?\\boxed\{{([^}}]+)\}}"
+        match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
+        if match:
+            answers[i] = match.group(1).strip()
+
+    # If \boxed{} parsing got all answers, return
+    if len(answers) == n_questions:
+        return answers
+
+    # Fallback: try simpler pattern (Q1: answer until next Q or newline)
+    answers = {}
+    for i in range(n_questions):
+        if i < n_questions - 1:
+            pattern = rf"Q{i+1}[:\s]+(.+?)(?=Q{i+2}[:\s])"
+        else:
+            pattern = rf"Q{i+1}[:\s]+(.+?)(?:\n|$)"
+        match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
         if match:
             answers[i] = match.group(1).strip().rstrip(",")
 
-    # Fallback: split by comma or newline if no Q patterns found
+    # Final fallback: split by comma or newline
     if not answers:
         parts = re.split(r"[,\n]", response)
         for i, part in enumerate(parts[:n_questions]):
