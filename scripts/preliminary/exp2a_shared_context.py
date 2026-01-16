@@ -964,11 +964,83 @@ def run_experiment_for_model(
     return final_results
 
 
+def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*.json"):
+    """Read saved result files and print combined summary."""
+    import glob
+
+    # Find all matching files
+    file_pattern = os.path.join(output_dir, pattern)
+    files = glob.glob(file_pattern)
+
+    if not files:
+        print(f"No files found matching: {file_pattern}")
+        return
+
+    print(f"\nFound {len(files)} result file(s):\n")
+    for f in sorted(files):
+        print(f"  - {os.path.basename(f)}")
+
+    # Load all results
+    all_results = []
+    for filepath in sorted(files):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        model = data.get("config", {}).get("model", "unknown")
+        model_short = model.split("/")[-1] if "/" in model else model
+
+        for r in data.get("results", []):
+            all_results.append({
+                "model": model_short,
+                "condition": r.get("condition", ""),
+                "em": r.get("metrics", {}).get("em", 0),
+                "f1": r.get("metrics", {}).get("f1", 0),
+                "n_samples": r.get("n_samples", 0),
+                "n_questions": r.get("n_questions", 0),
+                "latency": r.get("latency", 0),
+                "prompt_tokens": r.get("prompt_tokens", 0),
+                "completion_tokens": r.get("completion_tokens", 0),
+            })
+
+    if not all_results:
+        print("No results found in files.")
+        return
+
+    # Print summary table
+    print("\n" + "=" * 100)
+    print("EXPERIMENT 2A SUMMARY - ALL SAVED RESULTS")
+    print("=" * 100 + "\n")
+
+    headers = ["Model", "Condition", "EM", "F1", "Groups", "Questions", "Avg Latency"]
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    for r in all_results:
+        n = r["n_samples"] if r["n_samples"] > 0 else 1
+        avg_latency = r["latency"] / n if r["latency"] > 0 else 0
+        row = [
+            r["model"],
+            r["condition"],
+            f"{r['em']:.4f}",
+            f"{r['f1']:.4f}",
+            str(r["n_samples"]),
+            str(r["n_questions"]),
+            f"{avg_latency:.2f}s",
+        ]
+        print("| " + " | ".join(row) + " |")
+
+    print()
+
+
 def main():
     import torch
 
     parser = argparse.ArgumentParser(
         description="Exp 2a: Shared Context - SQuAD"
+    )
+    parser.add_argument(
+        "--summarize", action="store_true",
+        help="Read saved result files and print summary (no experiment run)"
     )
     parser.add_argument(
         "--models", type=str, default="Qwen/Qwen2.5-7B-Instruct",
@@ -1012,6 +1084,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # If --summarize, just read saved files and print summary
+    if args.summarize:
+        summarize_from_files(args.output_dir)
+        return
+
     # Parse models and conditions
     models = [m.strip() for m in args.models.split(",")]
     conditions = [c.strip() for c in args.conditions.split(",")]
@@ -1034,15 +1111,38 @@ def main():
 
     logger.info(f"Loaded {len(all_groups)} groups")
 
-    # Run for each model
+    # Run for each model and collect results
+    all_model_results = {}
     for model in models:
-        run_experiment_for_model(
+        results = run_experiment_for_model(
             model=model,
             all_groups=all_groups,
             conditions=conditions,
             args=args,
             num_gpus=num_gpus,
         )
+        all_model_results[model] = results
+
+    # Print final combined summary if multiple models
+    if len(models) > 1:
+        print("\n" + "=" * 80)
+        print("FINAL SUMMARY - ALL MODELS")
+        print("=" * 80 + "\n")
+
+        # Build combined table
+        headers = ["Model", "Condition", "EM", "F1", "Samples"]
+        print("| " + " | ".join(headers) + " |")
+        print("| " + " | ".join(["---"] * len(headers)) + " |")
+
+        for model, results in all_model_results.items():
+            model_short = model.split("/")[-1] if "/" in model else model
+            for r in results:
+                em = r.metrics.get("em", 0)
+                f1 = r.metrics.get("f1", 0)
+                row = [model_short, r.condition, f"{em:.4f}", f"{f1:.4f}", str(r.n_samples)]
+                print("| " + " | ".join(row) + " |")
+
+        print()
 
 
 if __name__ == "__main__":
