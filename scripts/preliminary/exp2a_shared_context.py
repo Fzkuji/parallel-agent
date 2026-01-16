@@ -39,7 +39,6 @@ from utils import (
     ExperimentConfig,
     ExperimentResult,
     LLMClient,
-    compute_contains,
     compute_exact_match,
     compute_f1,
     print_summary,
@@ -212,7 +211,7 @@ Answer each question concisely. Format: Q1: [answer], Q2: [answer], ..."""
             gold_answer = q_item["answer"]
             pred_answer = answers.get(i, "")
 
-            is_correct = compute_contains(pred_answer, gold_answer) > 0
+            is_correct = compute_exact_match(pred_answer, gold_answer) > 0
             f1_score = compute_f1(pred_answer, gold_answer)
             total_correct += int(is_correct)
             total_f1 += f1_score
