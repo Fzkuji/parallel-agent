@@ -12,13 +12,13 @@ import numpy as np
 models = ["0.5B", "3B", "7B", "14B", "32B"]
 model_sizes = [0.5, 3, 7, 14, 32]  # For x-axis scaling
 
-# Accuracy (%) for each condition
+# Accuracy (EM %) for each condition - Updated 2026-01-16
 results = {
-    "gold_context": [48.0, 52.2, 57.0, 60.0, 63.6],
-    "gold_direct": [59.6, 63.0, 68.4, 71.8, 75.2],
-    "sequential": [8.6, 42.6, 52.0, 58.6, 64.0],
-    "chain_only": [9.0, 42.0, 54.8, 62.8, 67.8],
-    "main_question": [7.4, 26.0, 29.0, 30.6, 39.2],
+    "gold_context": [8.05, 28.44, 40.61, 40.25, 47.76],
+    "gold_direct": [1.70, 40.43, 48.75, 46.87, 53.58],
+    "sequential": [0.72, 23.17, 38.46, 46.60, 44.10],
+    "chain_only": [0.18, 25.67, 39.62, 49.91, 48.84],
+    "main_question": [5.90, 17.53, 33.36, 33.90, 38.10],
 }
 
 # Color scheme
@@ -68,7 +68,7 @@ def plot_line_chart():
     ax.set_title("Exp 1: Answer Dependency Study on MoreHopQA", fontsize=14)
     ax.legend(loc="lower right", fontsize=10)
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(0, 85)
+    ax.set_ylim(0, 60)
 
     plt.tight_layout()
     return fig
@@ -98,7 +98,7 @@ def plot_grouped_bar():
     ax.set_xticks(x)
     ax.set_xticklabels(models)
     ax.legend(loc="upper left", fontsize=9)
-    ax.set_ylim(0, 85)
+    ax.set_ylim(0, 60)
     ax.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
@@ -125,7 +125,7 @@ def plot_context_comparison():
     ax1.set_xticks(x)
     ax1.set_xticklabels(models)
     ax1.legend(loc="lower right", fontsize=10)
-    ax1.set_ylim(0, 85)
+    ax1.set_ylim(0, 60)
     ax1.grid(True, alpha=0.3, axis='y')
 
     # Add improvement annotations
@@ -143,7 +143,7 @@ def plot_context_comparison():
     ax2.set_xticks(x)
     ax2.set_xticklabels(models)
     ax2.legend(loc="lower right", fontsize=10)
-    ax2.set_ylim(0, 85)
+    ax2.set_ylim(0, 60)
     ax2.grid(True, alpha=0.3, axis='y')
 
     # Add improvement annotations
@@ -175,13 +175,13 @@ def plot_error_propagation():
     ax.set_xticks(x)
     ax.set_xticklabels(models)
     ax.legend(loc="upper left", fontsize=10)
-    ax.set_ylim(0, 85)
+    ax.set_ylim(0, 60)
     ax.grid(True, alpha=0.3, axis='y')
 
     # Highlight 0.5B catastrophic failure
     ax.annotate(
-        "Catastrophic\nError Propagation",
-        xy=(0, 8.6), xytext=(0.5, 30),
+        "Catastrophic\nFailure (<1%)",
+        xy=(0, 0.72), xytext=(0.5, 20),
         arrowprops=dict(arrowstyle="->", color="red"),
         fontsize=10, color="red", ha='center'
     )
