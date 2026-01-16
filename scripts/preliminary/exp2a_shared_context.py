@@ -122,14 +122,12 @@ def run_independent(
             gold_answer = q_item["answer"]
 
             prompt = f"""Read the following passage and answer the question.
-Put your final answer in \\boxed{{}}.
+Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}
-
-Answer:"""
+Question: {question}"""
 
             pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
@@ -193,7 +191,7 @@ def run_all_in_one(
         q_list = "\n".join([f"Q{i+1}: {q['question']}" for i, q in enumerate(questions)])
 
         prompt = f"""Read the following passage and answer all questions.
-Put each answer in \\boxed{{}}.
+Put each answer in <answer></answer> tags.
 
 Passage:
 {context}
@@ -201,7 +199,10 @@ Passage:
 Questions:
 {q_list}
 
-Format: Q1: \\boxed{{answer1}}, Q2: \\boxed{{answer2}}, ..."""
+Format:
+Q1: <answer>answer1</answer>
+Q2: <answer>answer2</answer>
+..."""
 
         pred, response = client.generate(prompt, max_tokens=512)
         total_latency += response.latency
@@ -286,7 +287,7 @@ def run_seq_shared_rand(
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
                 prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
-Put your final answer in \\boxed{{}}.
+Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
@@ -294,19 +295,15 @@ Passage:
 Previous Q&A:
 {history_str}
 
-New Question: {question}
-
-Answer:"""
+New Question: {question}"""
             else:
                 prompt = f"""Read the following passage and answer the question.
-Put your final answer in \\boxed{{}}.
+Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}
-
-Answer:"""
+Question: {question}"""
 
             pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
@@ -412,7 +409,7 @@ Optimal order:"""
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
                 prompt = f"""Read the following passage and answer the question.
 You may use the previous Q&A pairs as reference.
-Put your final answer in \\boxed{{}}.
+Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
@@ -420,19 +417,15 @@ Passage:
 Previous Q&A:
 {history_str}
 
-New Question: {question}
-
-Answer:"""
+New Question: {question}"""
             else:
                 prompt = f"""Read the following passage and answer the question.
-Put your final answer in \\boxed{{}}.
+Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}
-
-Answer:"""
+Question: {question}"""
 
             pred_raw, response = client.generate(prompt, max_tokens=128)
             total_latency += response.latency
@@ -549,14 +542,12 @@ New Question: {question}
 Answer:"""
         else:
             prompt = f"""Read the following passage and answer the question.
-Put your final answer in \\boxed{{}}.
+Put your final answer in <answer></answer> tags.
 
 Passage:
 {context}
 
-Question: {question}
-
-Answer:"""
+Question: {question}"""
 
         pred_raw, response = client.generate(prompt, max_tokens=128)
         total_latency += response.latency
@@ -607,34 +598,17 @@ def _extract_answer(response: str) -> str:
     """Extract clean answer from model response.
 
     Handles common patterns like:
+    - "<answer>John Smith</answer>"
     - "The answer is: John Smith"
     - "Answer: John Smith"
-    - "\\boxed{John Smith}"
-    - "\\boxed{\\text{Han Chinese}}" (nested braces)
     - "John Smith." (just the answer with punctuation)
     """
     response = response.strip()
 
-    # First, try to extract from \boxed{} format (common in Qwen models)
-    # Handle nested braces by counting brace depth
-    boxed_start = response.find(r'\boxed{')
-    if boxed_start != -1:
-        start = boxed_start + len(r'\boxed{')
-        depth = 1
-        end = start
-        while end < len(response) and depth > 0:
-            if response[end] == '{':
-                depth += 1
-            elif response[end] == '}':
-                depth -= 1
-            end += 1
-        if depth == 0:
-            content = response[start:end-1].strip()
-            # Clean up LaTeX formatting like \text{...}
-            content = re.sub(r'\\text\{([^}]*)\}', r'\1', content)
-            content = re.sub(r'\\textbf\{([^}]*)\}', r'\1', content)
-            content = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', content)
-            return content.strip()
+    # First, try to extract from <answer></answer> tags
+    answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL | re.IGNORECASE)
+    if answer_match:
+        return answer_match.group(1).strip()
 
     # Remove common prefixes
     prefixes = [
@@ -656,49 +630,22 @@ def _extract_answer(response: str) -> str:
     return cleaned
 
 
-def _extract_boxed_content(text: str) -> Optional[str]:
-    """Extract content from \\boxed{...}, handling nested braces."""
-    boxed_start = text.find(r'\boxed{')
-    if boxed_start == -1:
-        return None
-    start = boxed_start + len(r'\boxed{')
-    depth = 1
-    end = start
-    while end < len(text) and depth > 0:
-        if text[end] == '{':
-            depth += 1
-        elif text[end] == '}':
-            depth -= 1
-        end += 1
-    if depth == 0:
-        content = text[start:end-1].strip()
-        # Clean up LaTeX formatting
-        content = re.sub(r'\\text\{([^}]*)\}', r'\1', content)
-        content = re.sub(r'\\textbf\{([^}]*)\}', r'\1', content)
-        content = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', content)
-        return content.strip()
-    return None
-
-
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
-    """Parse batch answers from response like 'Q1: \\boxed{answer1}, Q2: \\boxed{answer2}'."""
+    """Parse batch answers from response like 'Q1: <answer>answer1</answer>'."""
     answers = {}
 
-    # First, try to extract \boxed{} answers for each question
+    # First, try to extract <answer> tags for each question
     for i in range(n_questions):
         # Find the section for this question
         if i < n_questions - 1:
-            pattern = rf"Q{i+1}[:\s]+(.+?)(?=Q{i+2}[:\s])"
+            pattern = rf"Q{i+1}[:\s]+.*?<answer>(.*?)</answer>.*?(?=Q{i+2}[:\s])"
         else:
-            pattern = rf"Q{i+1}[:\s]+(.+?)(?:\n\n|$)"
+            pattern = rf"Q{i+1}[:\s]+.*?<answer>(.*?)</answer>"
         match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
         if match:
-            section = match.group(1)
-            boxed = _extract_boxed_content(section)
-            if boxed:
-                answers[i] = boxed
+            answers[i] = match.group(1).strip()
 
-    # If \boxed{} parsing got all answers, return
+    # If <answer> parsing got all answers, return
     if len(answers) == n_questions:
         return answers
 
@@ -711,14 +658,24 @@ def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
             pattern = rf"Q{i+1}[:\s]+(.+?)(?:\n|$)"
         match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
         if match:
-            answers[i] = match.group(1).strip().rstrip(",")
+            content = match.group(1).strip()
+            # Try to extract from <answer> tag if present
+            tag_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL | re.IGNORECASE)
+            if tag_match:
+                answers[i] = tag_match.group(1).strip()
+            else:
+                answers[i] = content.rstrip(",")
 
-    # Final fallback: split by comma or newline
+    # Final fallback: split by newline and look for answers
     if not answers:
-        parts = re.split(r"[,\n]", response)
-        for i, part in enumerate(parts[:n_questions]):
-            clean = re.sub(r"^Q\d+[:\s]*", "", part.strip(), flags=re.IGNORECASE)
-            answers[i] = clean
+        lines = response.strip().split('\n')
+        for i, line in enumerate(lines[:n_questions]):
+            tag_match = re.search(r'<answer>(.*?)</answer>', line, re.DOTALL | re.IGNORECASE)
+            if tag_match:
+                answers[i] = tag_match.group(1).strip()
+            else:
+                clean = re.sub(r"^Q\d+[:\s]*", "", line.strip(), flags=re.IGNORECASE)
+                answers[i] = clean
 
     return answers
 
