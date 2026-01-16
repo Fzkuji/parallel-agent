@@ -965,7 +965,7 @@ def run_experiment_for_model(
 
 
 def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*.json"):
-    """Read saved result files and print combined summary."""
+    """Read saved result files and print combined summary in markdown format."""
     import glob
 
     # Find all matching files
@@ -976,57 +976,164 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print(f"No files found matching: {file_pattern}")
         return
 
-    print(f"\nFound {len(files)} result file(s):\n")
-    for f in sorted(files):
-        print(f"  - {os.path.basename(f)}")
-
-    # Load all results
-    all_results = []
+    # Load all data grouped by model
+    model_data = {}
     for filepath in sorted(files):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         model = data.get("config", {}).get("model", "unknown")
-        model_short = model.split("/")[-1] if "/" in model else model
+        n_samples = data.get("config", {}).get("n_samples", -1)
+
+        if model not in model_data:
+            model_data[model] = {
+                "config": data.get("config", {}),
+                "results": [],
+                "timestamp": data.get("timestamp", ""),
+            }
 
         for r in data.get("results", []):
-            all_results.append({
-                "model": model_short,
-                "condition": r.get("condition", ""),
-                "em": r.get("metrics", {}).get("em", 0),
-                "f1": r.get("metrics", {}).get("f1", 0),
-                "n_samples": r.get("n_samples", 0),
-                "n_questions": r.get("n_questions", 0),
-                "latency": r.get("latency", 0),
-                "prompt_tokens": r.get("prompt_tokens", 0),
-                "completion_tokens": r.get("completion_tokens", 0),
-            })
+            model_data[model]["results"].append(r)
 
-    if not all_results:
+    if not model_data:
         print("No results found in files.")
         return
 
-    # Print summary table
-    print("\n" + "=" * 100)
-    print("EXPERIMENT 2A SUMMARY - ALL SAVED RESULTS")
-    print("=" * 100 + "\n")
+    # Print header
+    print("# Experiment 2a: Shared Context Study - Full Results")
+    print()
+    print("## Dataset")
+    print("- **SQuAD**: Multiple questions per paragraph (3-6 questions/group)")
+    first_config = list(model_data.values())[0]["config"]
+    n_samples = first_config.get("n_samples", "all")
+    print(f"- **Groups**: {n_samples if n_samples > 0 else 'all'}")
+    print(f"- **Models**: {', '.join([m.split('/')[-1] for m in model_data.keys()])}")
+    print()
 
-    headers = ["Model", "Condition", "EM", "F1", "Groups", "Questions", "Avg Latency"]
+    print("## Experimental Conditions")
+    print()
+    print("| Condition | Description |")
+    print("|-----------|-------------|")
+    print("| independent | Each question answered separately with full context |")
+    print("| all_in_one | All questions answered in single prompt |")
+    print("| seq_cross_ctx | Sequential with Q&A history from DIFFERENT contexts |")
+    print("| seq_shared_rand | Sequential with shared context, random order |")
+    print("| seq_shared_ord | Sequential with shared context, LLM-optimized order |")
+    print()
+    print("---")
+    print()
+
+    # Print each model's results
+    all_model_results = {}
+    for model, data in model_data.items():
+        model_short = model.split("/")[-1] if "/" in model else model
+        all_model_results[model_short] = {}
+
+        print(f"## {model}")
+        print()
+        print("**EXPERIMENT SUMMARY**")
+        print()
+
+        headers = ["Condition", "EM", "F1", "Groups", "Questions", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
+        print("| " + " | ".join(headers) + " |")
+        print("| " + " | ".join(["---"] * len(headers)) + " |")
+
+        for r in data["results"]:
+            condition = r.get("condition", "")
+            em = r.get("metrics", {}).get("em", 0)
+            f1 = r.get("metrics", {}).get("f1", 0)
+            n_samples = r.get("n_samples", 0)
+            n_questions = r.get("n_questions", 0)
+            latency = r.get("latency", 0)
+            prompt_tokens = r.get("prompt_tokens", 0)
+            completion_tokens = r.get("completion_tokens", 0)
+
+            n = n_samples if n_samples > 0 else 1
+            avg_prompt = prompt_tokens / n
+            avg_compl = completion_tokens / n
+            avg_latency = latency / n
+
+            all_model_results[model_short][condition] = {"em": em, "f1": f1}
+
+            row = [
+                condition,
+                f"{em:.4f}",
+                f"{f1:.4f}",
+                str(n_samples),
+                str(n_questions),
+                f"{avg_prompt:.1f}",
+                f"{avg_compl:.1f}",
+                f"{avg_latency:.2f}",
+            ]
+            print("| " + " | ".join(row) + " |")
+
+        # Print per-history-length accuracy if available (for sequential conditions)
+        seq_results = [r for r in data["results"] if r.get("condition", "").startswith("seq_shared")]
+        if seq_results and seq_results[0].get("details"):
+            print()
+            print("**PER-HISTORY-LENGTH ACCURACY (seq_shared_rand)**")
+            print()
+
+            # Analyze by history_length
+            details = [r for r in data["results"] if r.get("condition") == "seq_shared_rand"]
+            if details:
+                details = details[0].get("details", [])
+                history_stats = {}
+                for d in details:
+                    h_len = d.get("history_length", 0)
+                    if h_len not in history_stats:
+                        history_stats[h_len] = {"correct": 0, "total": 0, "f1_sum": 0}
+                    history_stats[h_len]["total"] += 1
+                    history_stats[h_len]["correct"] += int(d.get("correct", False))
+                    history_stats[h_len]["f1_sum"] += d.get("f1", 0)
+
+                if history_stats:
+                    print("| History Length | Samples | EM | F1 |")
+                    print("| --- | --- | --- | --- |")
+                    for h_len in sorted(history_stats.keys()):
+                        stats = history_stats[h_len]
+                        em = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
+                        f1 = stats["f1_sum"] / stats["total"] if stats["total"] > 0 else 0
+                        print(f"| {h_len} | {stats['total']} | {em:.4f} | {f1:.4f} |")
+
+        print()
+        print("---")
+        print()
+
+    # Print final summary table
+    print("## Summary Table (EM)")
+    print()
+
+    # Get all conditions
+    all_conditions = set()
+    for model_results in all_model_results.values():
+        all_conditions.update(model_results.keys())
+    conditions = sorted(all_conditions)
+
+    headers = ["Model"] + conditions
     print("| " + " | ".join(headers) + " |")
     print("| " + " | ".join(["---"] * len(headers)) + " |")
 
-    for r in all_results:
-        n = r["n_samples"] if r["n_samples"] > 0 else 1
-        avg_latency = r["latency"] / n if r["latency"] > 0 else 0
-        row = [
-            r["model"],
-            r["condition"],
-            f"{r['em']:.4f}",
-            f"{r['f1']:.4f}",
-            str(r["n_samples"]),
-            str(r["n_questions"]),
-            f"{avg_latency:.2f}s",
-        ]
+    for model_short, results in all_model_results.items():
+        # Extract size for sorting (e.g., "7B" -> 7)
+        row = [model_short]
+        for cond in conditions:
+            em = results.get(cond, {}).get("em", 0)
+            row.append(f"{em:.4f}")
+        print("| " + " | ".join(row) + " |")
+
+    print()
+    print("## Summary Table (F1)")
+    print()
+
+    print("| " + " | ".join(headers) + " |")
+    print("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    for model_short, results in all_model_results.items():
+        row = [model_short]
+        for cond in conditions:
+            f1 = results.get(cond, {}).get("f1", 0)
+            row.append(f"{f1:.4f}")
         print("| " + " | ".join(row) + " |")
 
     print()
