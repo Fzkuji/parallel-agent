@@ -968,6 +968,9 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
     """Read saved result files and print combined summary in markdown format."""
     import glob
 
+    # Valid exp2a conditions
+    VALID_CONDITIONS = ["independent", "all_in_one", "seq_cross_ctx", "seq_shared_rand", "seq_shared_ord"]
+
     # Find all matching files
     file_pattern = os.path.join(output_dir, pattern)
     files = glob.glob(file_pattern)
@@ -976,40 +979,50 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print(f"No files found matching: {file_pattern}")
         return
 
-    # Load all data grouped by model
-    model_data = {}
-    for filepath in sorted(files):
+    # Load data, keep only the file with largest n_samples per model
+    model_files = {}
+    for filepath in files:
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         model = data.get("config", {}).get("model", "unknown")
-        n_samples = data.get("config", {}).get("n_samples", -1)
+        n_samples = data.get("config", {}).get("n_samples", 0)
+        timestamp = data.get("timestamp", "")
 
-        if model not in model_data:
-            model_data[model] = {
-                "config": data.get("config", {}),
-                "results": [],
-                "timestamp": data.get("timestamp", ""),
-            }
+        # Check if this file has valid conditions
+        result_conditions = [r.get("condition", "") for r in data.get("results", [])]
+        has_valid = any(c in VALID_CONDITIONS for c in result_conditions)
+        if not has_valid:
+            continue
 
-        for r in data.get("results", []):
-            model_data[model]["results"].append(r)
+        # Keep the file with largest n_samples (or latest timestamp if same)
+        if model not in model_files or n_samples > model_files[model]["n_samples"]:
+            model_files[model] = {"data": data, "n_samples": n_samples, "timestamp": timestamp}
 
-    if not model_data:
-        print("No results found in files.")
+    if not model_files:
+        print("No valid results found.")
         return
+
+    # Sort models by size
+    def model_size(name):
+        import re
+        match = re.search(r'(\d+(?:\.\d+)?)[Bb]', name)
+        return float(match.group(1)) if match else 0
+
+    sorted_models = sorted(model_files.keys(), key=model_size)
+
+    # Get n_samples from first model
+    first_data = model_files[sorted_models[0]]["data"]
+    n_samples = first_data.get("config", {}).get("n_samples", "all")
 
     # Print header
     print("# Experiment 2a: Shared Context Study - Full Results")
     print()
     print("## Dataset")
     print("- **SQuAD**: Multiple questions per paragraph (3-6 questions/group)")
-    first_config = list(model_data.values())[0]["config"]
-    n_samples = first_config.get("n_samples", "all")
-    print(f"- **Groups**: {n_samples if n_samples > 0 else 'all'}")
-    print(f"- **Models**: {', '.join([m.split('/')[-1] for m in model_data.keys()])}")
+    print(f"- **Groups**: {n_samples}")
+    print(f"- **Models**: Qwen2.5-Instruct series ({', '.join([m.split('/')[-1].replace('Qwen2.5-', '').replace('-Instruct', '') for m in sorted_models])})")
     print()
-
     print("## Experimental Conditions")
     print()
     print("| Condition | Description |")
@@ -1025,7 +1038,13 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
 
     # Print each model's results
     all_model_results = {}
-    for model, data in model_data.items():
+    for model in sorted_models:
+        data = model_files[model]["data"]
+        results = data.get("results", [])
+
+        # Filter to valid conditions only
+        results = [r for r in results if r.get("condition", "") in VALID_CONDITIONS]
+
         model_short = model.split("/")[-1] if "/" in model else model
         all_model_results[model_short] = {}
 
@@ -1038,17 +1057,17 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print("| " + " | ".join(headers) + " |")
         print("| " + " | ".join(["---"] * len(headers)) + " |")
 
-        for r in data["results"]:
+        for r in results:
             condition = r.get("condition", "")
             em = r.get("metrics", {}).get("em", 0)
             f1 = r.get("metrics", {}).get("f1", 0)
-            n_samples = r.get("n_samples", 0)
+            r_n_samples = r.get("n_samples", 0)
             n_questions = r.get("n_questions", 0)
             latency = r.get("latency", 0)
             prompt_tokens = r.get("prompt_tokens", 0)
             completion_tokens = r.get("completion_tokens", 0)
 
-            n = n_samples if n_samples > 0 else 1
+            n = r_n_samples if r_n_samples > 0 else 1
             avg_prompt = prompt_tokens / n
             avg_compl = completion_tokens / n
             avg_latency = latency / n
@@ -1059,7 +1078,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
                 condition,
                 f"{em:.4f}",
                 f"{f1:.4f}",
-                str(n_samples),
+                str(r_n_samples),
                 str(n_questions),
                 f"{avg_prompt:.1f}",
                 f"{avg_compl:.1f}",
@@ -1067,57 +1086,50 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
             ]
             print("| " + " | ".join(row) + " |")
 
-        # Print per-history-length accuracy if available (for sequential conditions)
-        seq_results = [r for r in data["results"] if r.get("condition", "").startswith("seq_shared")]
-        if seq_results and seq_results[0].get("details"):
+        # Print per-history-length accuracy
+        seq_rand = [r for r in results if r.get("condition") == "seq_shared_rand"]
+        if seq_rand and seq_rand[0].get("details"):
             print()
             print("**PER-HISTORY-LENGTH ACCURACY (seq_shared_rand)**")
             print()
 
-            # Analyze by history_length
-            details = [r for r in data["results"] if r.get("condition") == "seq_shared_rand"]
-            if details:
-                details = details[0].get("details", [])
-                history_stats = {}
-                for d in details:
-                    h_len = d.get("history_length", 0)
-                    if h_len not in history_stats:
-                        history_stats[h_len] = {"correct": 0, "total": 0, "f1_sum": 0}
-                    history_stats[h_len]["total"] += 1
-                    history_stats[h_len]["correct"] += int(d.get("correct", False))
-                    history_stats[h_len]["f1_sum"] += d.get("f1", 0)
+            details = seq_rand[0].get("details", [])
+            history_stats = {}
+            for d in details:
+                h_len = d.get("history_length", 0)
+                if h_len not in history_stats:
+                    history_stats[h_len] = {"correct": 0, "total": 0, "f1_sum": 0}
+                history_stats[h_len]["total"] += 1
+                history_stats[h_len]["correct"] += int(d.get("correct", False))
+                history_stats[h_len]["f1_sum"] += d.get("f1", 0)
 
-                if history_stats:
-                    print("| History Length | Samples | EM | F1 |")
-                    print("| --- | --- | --- | --- |")
-                    for h_len in sorted(history_stats.keys()):
-                        stats = history_stats[h_len]
-                        em = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
-                        f1 = stats["f1_sum"] / stats["total"] if stats["total"] > 0 else 0
-                        print(f"| {h_len} | {stats['total']} | {em:.4f} | {f1:.4f} |")
+            if history_stats:
+                print("| History Length | Samples | EM | F1 |")
+                print("| --- | --- | --- | --- |")
+                for h_len in sorted(history_stats.keys()):
+                    stats = history_stats[h_len]
+                    h_em = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
+                    h_f1 = stats["f1_sum"] / stats["total"] if stats["total"] > 0 else 0
+                    print(f"| {h_len} | {stats['total']} | {h_em:.4f} | {h_f1:.4f} |")
 
         print()
         print("---")
         print()
 
-    # Print final summary table
+    # Print final summary tables
     print("## Summary Table (EM)")
     print()
 
-    # Get all conditions
-    all_conditions = set()
-    for model_results in all_model_results.values():
-        all_conditions.update(model_results.keys())
-    conditions = sorted(all_conditions)
-
-    headers = ["Model"] + conditions
+    headers = ["Model"] + VALID_CONDITIONS
     print("| " + " | ".join(headers) + " |")
-    print("| " + " | ".join(["---"] * len(headers)) + " |")
+    print("|" + "|".join(["-------"] * len(headers)) + "|")
 
-    for model_short, results in all_model_results.items():
-        # Extract size for sorting (e.g., "7B" -> 7)
-        row = [model_short]
-        for cond in conditions:
+    for model in sorted_models:
+        model_short = model.split("/")[-1] if "/" in model else model
+        size = model_short.replace("Qwen2.5-", "").replace("-Instruct", "")
+        results = all_model_results.get(model_short, {})
+        row = [size]
+        for cond in VALID_CONDITIONS:
             em = results.get(cond, {}).get("em", 0)
             row.append(f"{em:.4f}")
         print("| " + " | ".join(row) + " |")
@@ -1127,11 +1139,14 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
     print()
 
     print("| " + " | ".join(headers) + " |")
-    print("| " + " | ".join(["---"] * len(headers)) + " |")
+    print("|" + "|".join(["-------"] * len(headers)) + "|")
 
-    for model_short, results in all_model_results.items():
-        row = [model_short]
-        for cond in conditions:
+    for model in sorted_models:
+        model_short = model.split("/")[-1] if "/" in model else model
+        size = model_short.replace("Qwen2.5-", "").replace("-Instruct", "")
+        results = all_model_results.get(model_short, {})
+        row = [size]
+        for cond in VALID_CONDITIONS:
             f1 = results.get(cond, {}).get("f1", 0)
             row.append(f"{f1:.4f}")
         print("| " + " | ".join(row) + " |")
