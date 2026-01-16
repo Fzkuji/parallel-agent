@@ -610,14 +610,31 @@ def _extract_answer(response: str) -> str:
     - "The answer is: John Smith"
     - "Answer: John Smith"
     - "\\boxed{John Smith}"
+    - "\\boxed{\\text{Han Chinese}}" (nested braces)
     - "John Smith." (just the answer with punctuation)
     """
     response = response.strip()
 
     # First, try to extract from \boxed{} format (common in Qwen models)
-    boxed_match = re.search(r'\\boxed\{([^}]+)\}', response)
-    if boxed_match:
-        return boxed_match.group(1).strip()
+    # Handle nested braces by counting brace depth
+    boxed_start = response.find(r'\boxed{')
+    if boxed_start != -1:
+        start = boxed_start + len(r'\boxed{')
+        depth = 1
+        end = start
+        while end < len(response) and depth > 0:
+            if response[end] == '{':
+                depth += 1
+            elif response[end] == '}':
+                depth -= 1
+            end += 1
+        if depth == 0:
+            content = response[start:end-1].strip()
+            # Clean up LaTeX formatting like \text{...}
+            content = re.sub(r'\\text\{([^}]*)\}', r'\1', content)
+            content = re.sub(r'\\textbf\{([^}]*)\}', r'\1', content)
+            content = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', content)
+            return content.strip()
 
     # Remove common prefixes
     prefixes = [
@@ -639,21 +656,47 @@ def _extract_answer(response: str) -> str:
     return cleaned
 
 
+def _extract_boxed_content(text: str) -> Optional[str]:
+    """Extract content from \\boxed{...}, handling nested braces."""
+    boxed_start = text.find(r'\boxed{')
+    if boxed_start == -1:
+        return None
+    start = boxed_start + len(r'\boxed{')
+    depth = 1
+    end = start
+    while end < len(text) and depth > 0:
+        if text[end] == '{':
+            depth += 1
+        elif text[end] == '}':
+            depth -= 1
+        end += 1
+    if depth == 0:
+        content = text[start:end-1].strip()
+        # Clean up LaTeX formatting
+        content = re.sub(r'\\text\{([^}]*)\}', r'\1', content)
+        content = re.sub(r'\\textbf\{([^}]*)\}', r'\1', content)
+        content = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', content)
+        return content.strip()
+    return None
+
+
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
     """Parse batch answers from response like 'Q1: \\boxed{answer1}, Q2: \\boxed{answer2}'."""
     answers = {}
 
     # First, try to extract \boxed{} answers for each question
     for i in range(n_questions):
-        # Pattern: Q1: ... \boxed{answer} ... (until Q2 or end)
-        # Use lookahead to stop at next Qn: pattern
+        # Find the section for this question
         if i < n_questions - 1:
-            pattern = rf"Q{i+1}[:\s]+.*?\\boxed\{{([^}}]+)\}}.*?(?=Q{i+2}[:\s])"
+            pattern = rf"Q{i+1}[:\s]+(.+?)(?=Q{i+2}[:\s])"
         else:
-            pattern = rf"Q{i+1}[:\s]+.*?\\boxed\{{([^}}]+)\}}"
+            pattern = rf"Q{i+1}[:\s]+(.+?)(?:\n\n|$)"
         match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
         if match:
-            answers[i] = match.group(1).strip()
+            section = match.group(1)
+            boxed = _extract_boxed_content(section)
+            if boxed:
+                answers[i] = boxed
 
     # If \boxed{} parsing got all answers, return
     if len(answers) == n_questions:
