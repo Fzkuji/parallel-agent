@@ -44,10 +44,6 @@ from utils import (
     compute_f1,
     print_summary,
     save_results,
-    setup_distributed,
-    cleanup_distributed,
-    shard_data,
-    gather_results,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -669,7 +665,230 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
     )
 
 
+def worker_process(
+    rank: int,
+    world_size: int,
+    gpu_id: int,
+    model: str,
+    use_vllm: bool,
+    groups: List[Dict[str, Any]],
+    conditions: List[str],
+    seed: int,
+    output_dir: str,
+):
+    """Worker process that runs on a single GPU."""
+    import json
+
+    # IMPORTANT: Set environment variables BEFORE importing anything CUDA-related
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Disable vLLM V1 engine which spawns EngineCore processes and uses distributed
+    os.environ["VLLM_USE_V1"] = "0"
+    # Prevent vLLM from trying to use distributed
+    os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
+    # Disable vLLM progress bar
+    os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
+    # Disable tqdm globally
+    os.environ["TQDM_DISABLE"] = "1"
+    # Suppress vLLM verbose logging
+    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+    os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(groups)} groups")
+
+    # Initialize LLM client
+    client = LLMClient(
+        model=model,
+        use_local=True,
+        use_vllm=use_vllm,
+        tensor_parallel_size=1,
+    )
+
+    logger.info(f"[Worker {rank}] Model loaded, running conditions: {conditions}")
+
+    # Run conditions
+    results = []
+
+    if "independent" in conditions:
+        logger.info(f"[Worker {rank}] Running independent...")
+        results.append(run_independent(groups, client))
+
+    if "all_in_one" in conditions:
+        logger.info(f"[Worker {rank}] Running all_in_one...")
+        results.append(run_all_in_one(groups, client))
+
+    if "seq_cross_ctx" in conditions:
+        logger.info(f"[Worker {rank}] Running seq_cross_ctx...")
+        results.append(run_seq_cross_ctx(groups, client, seed=seed))
+
+    if "seq_shared_rand" in conditions:
+        logger.info(f"[Worker {rank}] Running seq_shared_rand...")
+        results.append(run_seq_shared_rand(groups, client, seed=seed))
+
+    if "seq_shared_ord" in conditions:
+        logger.info(f"[Worker {rank}] Running seq_shared_ord...")
+        results.append(run_seq_shared_ord(groups, client))
+
+    # Save results to temp file
+    os.makedirs(output_dir, exist_ok=True)
+    temp_file = os.path.join(output_dir, f"temp_rank{rank}.json")
+
+    # Convert results to serializable format
+    results_data = []
+    for r in results:
+        results_data.append({
+            "condition": r.condition,
+            "n_samples": r.n_samples,
+            "n_questions": r.n_questions,
+            "accuracy": r.accuracy,
+            "metrics": r.metrics,
+            "latency": r.latency,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "details": r.details,
+        })
+
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(results_data, f)
+
+    logger.info(f"[Worker {rank}] Done, saved to {temp_file}")
+
+
+def run_experiment_for_model(
+    model: str,
+    all_groups: List[Dict[str, Any]],
+    conditions: List[str],
+    args,
+    num_gpus: int,
+):
+    """Run experiment for a single model."""
+    import multiprocessing as mp
+    import json
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Running experiment for model: {model}")
+    logger.info(f"{'='*60}\n")
+
+    if args.use_local and num_gpus > 1:
+        # Multi-GPU parallel mode with multiprocessing
+        gpus = list(range(num_gpus))
+        world_size = num_gpus
+
+        logger.info(f"Parallel mode with {world_size} GPUs: {gpus}")
+
+        # Set spawn method (required for CUDA)
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+
+        # Clean up old temp files
+        for rank in range(world_size):
+            temp_file = os.path.join(args.output_dir, f"temp_rank{rank}.json")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        # Shard data
+        shards = [[] for _ in range(world_size)]
+        for i, group in enumerate(all_groups):
+            shards[i % world_size].append(group)
+
+        # Start all workers
+        processes = []
+        for rank, gpu_id in enumerate(gpus):
+            p = mp.Process(
+                target=worker_process,
+                args=(rank, world_size, gpu_id, model, args.use_vllm,
+                      shards[rank], conditions, args.seed, args.output_dir)
+            )
+            p.start()
+            processes.append(p)
+            logger.info(f"Started worker {rank} on GPU {gpu_id} (PID: {p.pid})")
+
+        # Wait for all workers
+        for p in processes:
+            p.join()
+
+        logger.info("All workers finished, merging results...")
+
+        # Merge results from all workers
+        all_results_by_condition = {}
+        for rank in range(world_size):
+            temp_file = os.path.join(args.output_dir, f"temp_rank{rank}.json")
+            if os.path.exists(temp_file):
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    results_data = json.load(f)
+                for r in results_data:
+                    cond = r["condition"]
+                    if cond not in all_results_by_condition:
+                        all_results_by_condition[cond] = []
+                    all_results_by_condition[cond].append(ExperimentResult(
+                        condition=r["condition"],
+                        dataset="squad",
+                        n_samples=r["n_samples"],
+                        n_questions=r["n_questions"],
+                        accuracy=r["accuracy"],
+                        metrics=r["metrics"],
+                        latency=r["latency"],
+                        prompt_tokens=r["prompt_tokens"],
+                        completion_tokens=r["completion_tokens"],
+                        details=r["details"],
+                    ))
+                os.remove(temp_file)
+
+        # Merge results
+        final_results = []
+        for cond, results_list in all_results_by_condition.items():
+            merged = _merge_results(results_list)
+            final_results.append(merged)
+
+    else:
+        # Single process mode (API or single GPU)
+        if args.use_local and num_gpus == 1:
+            logger.info("Single GPU mode: using GPU 0")
+
+        client = LLMClient(
+            model=model,
+            use_local=args.use_local,
+            use_vllm=args.use_vllm,
+            tensor_parallel_size=args.tensor_parallel_size,
+        )
+
+        final_results = []
+
+        if "independent" in conditions:
+            final_results.append(run_independent(all_groups, client))
+
+        if "all_in_one" in conditions:
+            final_results.append(run_all_in_one(all_groups, client))
+
+        if "seq_cross_ctx" in conditions:
+            final_results.append(run_seq_cross_ctx(all_groups, client, seed=args.seed))
+
+        if "seq_shared_rand" in conditions:
+            final_results.append(run_seq_shared_rand(all_groups, client, seed=args.seed))
+
+        if "seq_shared_ord" in conditions:
+            final_results.append(run_seq_shared_ord(all_groups, client))
+
+    # Print and save results for this model
+    config = ExperimentConfig(
+        exp_name="exp2a_shared_context",
+        dataset="squad",
+        model=model,
+        n_samples=args.n_groups,
+        seed=args.seed,
+        output_dir=args.output_dir,
+    )
+
+    print_summary(final_results)
+    save_results(final_results, config)
+
+    return final_results
+
+
 def main():
+    import torch
+
     parser = argparse.ArgumentParser(
         description="Exp 2a: Shared Context - SQuAD"
     )
@@ -687,7 +906,7 @@ def main():
     )
     parser.add_argument(
         "--tensor-parallel-size", type=int, default=1,
-        help="Number of GPUs for tensor parallelism (vLLM only)"
+        help="Number of GPUs for tensor parallelism (vLLM only, for single-GPU mode)"
     )
     parser.add_argument(
         "--n-groups", type=int, default=-1,
@@ -715,11 +934,17 @@ def main():
     )
     args = parser.parse_args()
 
-    # Parse models list
+    # Parse models and conditions
     models = [m.strip() for m in args.models.split(",")]
+    conditions = [c.strip() for c in args.conditions.split(",")]
 
-    # Setup distributed
-    rank, world_size = setup_distributed()
+    # Detect number of GPUs
+    if args.use_local and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        logger.info(f"Detected {num_gpus} GPU(s)")
+    else:
+        num_gpus = 0
+        logger.info("Using CPU or API mode")
 
     # Load data (only once, shared across models)
     all_groups = load_squad_groups(
@@ -729,73 +954,17 @@ def main():
         seed=args.seed,
     )
 
-    # Shard data across GPUs
-    groups = shard_data(all_groups, rank, world_size)
-    logger.info(f"Rank {rank}/{world_size}: processing {len(groups)}/{len(all_groups)} groups")
+    logger.info(f"Loaded {len(all_groups)} groups")
 
     # Run for each model
     for model in models:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Running experiments for model: {model}")
-        logger.info(f"{'='*60}\n")
-
-        # Configuration for this model
-        config = ExperimentConfig(
-            exp_name="exp2a_shared_context",
-            dataset="squad",
+        run_experiment_for_model(
             model=model,
-            n_samples=args.n_groups,
-            seed=args.seed,
-            output_dir=args.output_dir,
+            all_groups=all_groups,
+            conditions=conditions,
+            args=args,
+            num_gpus=num_gpus,
         )
-
-        # Initialize LLM client for this model
-        client = LLMClient(
-            model=model,
-            use_local=args.use_local,
-            use_vllm=args.use_vllm,
-            tensor_parallel_size=args.tensor_parallel_size,
-        )
-
-        # Run conditions
-        conditions = [c.strip() for c in args.conditions.split(",")]
-        local_results = []
-
-        if "independent" in conditions:
-            local_results.append(run_independent(groups, client))
-
-        if "all_in_one" in conditions:
-            local_results.append(run_all_in_one(groups, client))
-
-        if "seq_cross_ctx" in conditions:
-            local_results.append(run_seq_cross_ctx(groups, client, seed=args.seed))
-
-        if "seq_shared_rand" in conditions:
-            local_results.append(run_seq_shared_rand(groups, client, seed=args.seed))
-
-        if "seq_shared_ord" in conditions:
-            local_results.append(run_seq_shared_ord(groups, client))
-
-        # Gather results from all GPUs
-        all_results_by_condition = {}
-        for result in local_results:
-            gathered = gather_results([result], world_size)
-            if rank == 0:
-                merged = _merge_results(gathered)
-                all_results_by_condition[result.condition] = merged
-
-        # Print and save results (only rank 0)
-        if rank == 0:
-            results = list(all_results_by_condition.values())
-            print_summary(results)
-            save_results(results, config)
-
-        # Clean up vLLM model to free GPU memory before loading next model
-        if hasattr(client, 'cleanup'):
-            client.cleanup()
-        del client
-
-    cleanup_distributed()
 
 
 if __name__ == "__main__":
