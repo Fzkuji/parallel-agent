@@ -753,6 +753,7 @@ def worker_process(
     conditions: List[str],
     seed: int,
     output_dir: str,
+    enable_thinking: bool = False,
 ):
     """Worker process that runs on a single GPU."""
     import json
@@ -779,6 +780,7 @@ def worker_process(
         use_local=True,
         use_vllm=use_vllm,
         tensor_parallel_size=1,
+        enable_thinking=enable_thinking,
     )
 
     logger.info(f"[Worker {rank}] Model loaded, running conditions: {conditions}")
@@ -876,7 +878,8 @@ def run_experiment_for_model(
             p = mp.Process(
                 target=worker_process,
                 args=(rank, world_size, gpu_id, model, args.use_vllm,
-                      shards[rank], conditions, args.seed, args.output_dir)
+                      shards[rank], conditions, args.seed, args.output_dir,
+                      args.enable_thinking)
             )
             p.start()
             processes.append(p)
@@ -929,6 +932,7 @@ def run_experiment_for_model(
             use_local=args.use_local,
             use_vllm=args.use_vllm,
             tensor_parallel_size=args.tensor_parallel_size,
+            enable_thinking=args.enable_thinking,
         )
 
         final_results = []
@@ -1203,6 +1207,10 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
         help="Output directory for results"
+    )
+    parser.add_argument(
+        "--enable-thinking", action="store_true",
+        help="Enable thinking mode for Qwen3 models (default: disabled for faster inference)"
     )
     args = parser.parse_args()
 

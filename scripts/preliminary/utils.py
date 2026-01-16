@@ -85,11 +85,13 @@ class LLMClient:
         device: str = "auto",
         use_vllm: bool = False,
         tensor_parallel_size: int = 1,
+        enable_thinking: bool = False,
     ):
         self.model = model
         self.temperature = temperature
         self.use_local = use_local
         self.use_vllm = use_vllm
+        self.enable_thinking = enable_thinking
         self._tokenizer = None
         self._model = None
         self._vllm_model = None
@@ -120,10 +122,16 @@ class LLMClient:
         """
         try:
             from vllm import LLM, SamplingParams
+            from transformers import AutoTokenizer
         except ImportError:
-            raise ImportError("Please install vllm: pip install vllm")
+            raise ImportError("Please install vllm and transformers")
 
         logger.info(f"Loading model with vLLM: {model} (tensor_parallel_size={tensor_parallel_size})")
+
+        # Load tokenizer for chat template support (needed for Qwen3, etc.)
+        self._tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
 
         self._vllm_model = LLM(
             model=model,
@@ -133,7 +141,7 @@ class LLMClient:
             gpu_memory_utilization=0.9,
             disable_log_stats=True,
         )
-        logger.info(f"vLLM model loaded with {tensor_parallel_size} GPU(s)")
+        logger.info(f"vLLM model loaded with {tensor_parallel_size} GPU(s), enable_thinking={self.enable_thinking}")
 
     def _init_local_model(self, model: str, device: str):
         """Initialize local model with transformers."""
@@ -228,19 +236,51 @@ class LLMClient:
         from vllm import SamplingParams
         import time
 
-        # Build full prompts with system prompt if provided
+        # Build full prompts using chat template if tokenizer supports it
         full_prompts = []
         for prompt in prompts:
+            messages = []
             if system_prompt:
-                full_prompt = f"{system_prompt}\n\n{prompt}"
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            if hasattr(self._tokenizer, "apply_chat_template"):
+                # Use chat template (supports Qwen3 enable_thinking, etc.)
+                try:
+                    full_prompt = self._tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=self.enable_thinking,
+                    )
+                except TypeError:
+                    # Fallback for models that don't support enable_thinking
+                    full_prompt = self._tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
             else:
-                full_prompt = prompt
+                # Fallback for models without chat template
+                if system_prompt:
+                    full_prompt = f"{system_prompt}\n\n{prompt}"
+                else:
+                    full_prompt = prompt
             full_prompts.append(full_prompt)
 
-        sampling_params = SamplingParams(
-            temperature=self.temperature if self.temperature > 0 else 0,
-            max_tokens=max_tokens,
-        )
+        # Sampling params: Qwen3 recommends temp=0.7, top_p=0.8 for non-thinking mode
+        if self.temperature > 0:
+            sampling_params = SamplingParams(
+                temperature=self.temperature,
+                top_p=0.8 if not self.enable_thinking else 0.95,
+                top_k=20,
+                max_tokens=max_tokens,
+            )
+        else:
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=max_tokens,
+            )
 
         start_time = time.perf_counter()
         outputs = self._vllm_model.generate(full_prompts, sampling_params, use_tqdm=False)
@@ -292,9 +332,19 @@ class LLMClient:
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
-            full_prompt = self._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            try:
+                # Support Qwen3 enable_thinking parameter
+                full_prompt = self._tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
+                )
+            except TypeError:
+                # Fallback for models that don't support enable_thinking
+                full_prompt = self._tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
         else:
             full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
