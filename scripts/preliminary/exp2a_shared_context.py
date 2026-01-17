@@ -48,6 +48,17 @@ from utils import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# System prompt for answer extraction
+SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
+Output ONLY your answer wrapped in <answer></answer> tags.
+Example: <answer>Paris</answer>"""
+
+SYSTEM_PROMPT_MULTI = """You are a helpful assistant. Answer all questions based on the given passage.
+Output each answer wrapped in <answer></answer> tags.
+Example format:
+Q1: <answer>Paris</answer>
+Q2: <answer>1789</answer>"""
+
 
 def load_squad_groups(
     n_groups: int = -1,
@@ -121,16 +132,12 @@ def run_independent(
             question = q_item["question"]
             gold_answer = q_item["answer"]
 
-            prompt = f"""Read the following passage and answer the question.
-
-Passage:
+            prompt = f"""Passage:
 {context}
 
-Question: {question}
+Question: {question}"""
 
-Respond with: <answer>your answer</answer>"""
-
-            pred_raw, response = client.generate(prompt, max_tokens=128)
+            pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -191,21 +198,13 @@ def run_all_in_one(
         # Build multi-question prompt
         q_list = "\n".join([f"Q{i+1}: {q['question']}" for i, q in enumerate(questions)])
 
-        prompt = f"""Read the following passage and answer all questions.
-Put each answer in <answer></answer> tags.
-
-Passage:
+        prompt = f"""Passage:
 {context}
 
 Questions:
-{q_list}
+{q_list}"""
 
-Format:
-Q1: <answer>answer1</answer>
-Q2: <answer>answer2</answer>
-..."""
-
-        pred, response = client.generate(prompt, max_tokens=512)
+        pred, response = client.generate(prompt, max_tokens=512, system_prompt=SYSTEM_PROMPT_MULTI)
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
@@ -286,29 +285,20 @@ def run_seq_shared_rand(
             # Build prompt with Q&A history
             if qa_history:
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
-                prompt = f"""Read the following passage and answer the question.
-You may use the previous Q&A pairs as reference.
-
-Passage:
+                prompt = f"""Passage:
 {context}
 
 Previous Q&A:
 {history_str}
 
-New Question: {question}
-
-Respond with: <answer>your answer</answer>"""
+Question: {question}"""
             else:
-                prompt = f"""Read the following passage and answer the question.
-
-Passage:
+                prompt = f"""Passage:
 {context}
 
-Question: {question}
+Question: {question}"""
 
-Respond with: <answer>your answer</answer>"""
-
-            pred_raw, response = client.generate(prompt, max_tokens=128)
+            pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -410,29 +400,20 @@ Optimal order:"""
             # Build prompt with Q&A history
             if qa_history:
                 history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
-                prompt = f"""Read the following passage and answer the question.
-You may use the previous Q&A pairs as reference.
-
-Passage:
+                prompt = f"""Passage:
 {context}
 
 Previous Q&A:
 {history_str}
 
-New Question: {question}
-
-Respond with: <answer>your answer</answer>"""
+Question: {question}"""
             else:
-                prompt = f"""Read the following passage and answer the question.
-
-Passage:
+                prompt = f"""Passage:
 {context}
 
-Question: {question}
+Question: {question}"""
 
-Respond with: <answer>your answer</answer>"""
-
-            pred_raw, response = client.generate(prompt, max_tokens=128)
+            pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
@@ -532,29 +513,20 @@ def run_seq_cross_ctx(
         # Build prompt with Q&A history (from different contexts!)
         if qa_history:
             history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
-            prompt = f"""Read the following passage and answer the question.
-You may use the previous Q&A pairs as reference.
-
-Passage:
+            prompt = f"""Passage:
 {context}
 
 Previous Q&A:
 {history_str}
 
-New Question: {question}
-
-Respond with: <answer>your answer</answer>"""
+Question: {question}"""
         else:
-            prompt = f"""Read the following passage and answer the question.
-
-Passage:
+            prompt = f"""Passage:
 {context}
 
-Question: {question}
+Question: {question}"""
 
-Respond with: <answer>your answer</answer>"""
-
-        pred_raw, response = client.generate(prompt, max_tokens=128)
+        pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
