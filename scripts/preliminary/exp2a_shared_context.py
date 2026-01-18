@@ -256,7 +256,11 @@ def run_seq_shared_rand(
     client: LLMClient,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Seq. (Shared, Rand): Questions in random order, each sees previous Q&A history."""
+    """Seq. (Shared, Rand): Questions in random order, using multi-turn chat format.
+
+    Context is only provided in the first turn. Subsequent turns only contain the question.
+    This leverages the chat history to maintain context awareness.
+    """
     logger.info("Running Seq. (Shared, Rand) condition...")
 
     random.seed(seed)
@@ -276,37 +280,35 @@ def run_seq_shared_rand(
         # Shuffle questions randomly
         random.shuffle(questions)
 
-        qa_history = []
+        # Initialize messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        for q_item in questions:
+        for i, q_item in enumerate(questions):
             question = q_item["question"]
             gold_answer = q_item["answer"]
 
-            # Build prompt with Q&A history
-            if qa_history:
-                history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
-                prompt = f"""Passage:
+            # First question includes context, subsequent questions only include the question
+            if i == 0:
+                user_content = f"""Passage:
 {context}
-
-Previous Q&A:
-{history_str}
 
 Question: {question}"""
             else:
-                prompt = f"""Passage:
-{context}
+                user_content = f"Question: {question}"
 
-Question: {question}"""
+            # Add user message
+            messages.append({"role": "user", "content": user_content})
 
-            pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
+            # Generate response
+            pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
-            # Add to history (use cleaned answer)
-            qa_history.append((question, pred))
+            # Add assistant response to history
+            messages.append({"role": "assistant", "content": pred_raw})
 
             is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
@@ -322,7 +324,7 @@ Question: {question}"""
                 "prediction_raw": pred_raw,
                 "correct": is_correct,
                 "f1": f1_score,
-                "history_length": len(qa_history) - 1,
+                "history_length": i,  # Number of previous QA pairs
             })
 
     em = total_correct / total_questions if total_questions > 0 else 0
@@ -347,7 +349,11 @@ def run_seq_shared_ord(
     client: LLMClient,
     ordering_client: Optional[LLMClient] = None,
 ) -> ExperimentResult:
-    """Seq. (Shared, Ord): LLM determines optimal question order, then answers sequentially."""
+    """Seq. (Shared, Ord): LLM determines optimal question order, then answers sequentially.
+
+    Context is only provided in the first turn. Subsequent turns only contain the question.
+    This leverages the chat history to maintain context awareness.
+    """
     logger.info("Running Seq. (Shared, Ord) condition...")
 
     # Use same client for ordering if not specified
@@ -390,38 +396,36 @@ Optimal order:"""
         ordered_indices = _parse_order(order_response, len(questions))
         ordered_questions = [questions[i] for i in ordered_indices]
 
-        # Step 2: Answer questions in determined order
-        qa_history = []
+        # Step 2: Answer questions in determined order using multi-turn chat format
+        # Initialize messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        for q_item in ordered_questions:
+        for i, q_item in enumerate(ordered_questions):
             question = q_item["question"]
             gold_answer = q_item["answer"]
 
-            # Build prompt with Q&A history
-            if qa_history:
-                history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
-                prompt = f"""Passage:
+            # First question includes context, subsequent questions only include the question
+            if i == 0:
+                user_content = f"""Passage:
 {context}
-
-Previous Q&A:
-{history_str}
 
 Question: {question}"""
             else:
-                prompt = f"""Passage:
-{context}
+                user_content = f"Question: {question}"
 
-Question: {question}"""
+            # Add user message
+            messages.append({"role": "user", "content": user_content})
 
-            pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
+            # Generate response
+            pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
-            # Add to history (use cleaned answer)
-            qa_history.append((question, pred))
+            # Add assistant response to history
+            messages.append({"role": "assistant", "content": pred_raw})
 
             is_correct = compute_exact_match(pred, gold_answer) > 0
             f1_score = compute_f1(pred, gold_answer)
@@ -437,7 +441,7 @@ Question: {question}"""
                 "prediction_raw": pred_raw,
                 "correct": is_correct,
                 "f1": f1_score,
-                "history_length": len(qa_history) - 1,
+                "history_length": i,  # Number of previous QA pairs
                 "llm_order": ordered_indices,
             })
 
@@ -467,6 +471,8 @@ def run_seq_cross_ctx(
 
     This serves as a control condition to measure the benefit of shared context.
     Questions are randomly sampled from different context groups.
+    Each question includes its own context, and the full conversation history
+    (with previous contexts) is accumulated using multi-turn chat format.
     """
     logger.info("Running Seq. (Cross-Ctx) condition...")
 
@@ -497,7 +503,8 @@ def run_seq_cross_ctx(
     # Process in batches matching the average group size
     avg_group_size = sum(g["n_questions"] for g in groups) // len(groups) if groups else 4
 
-    qa_history = []
+    # Use multi-turn messages format
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     batch_count = 0
 
     for i, qa_pair in enumerate(tqdm(all_qa_pairs, desc="Seq.(Cross-Ctx)")):
@@ -505,36 +512,30 @@ def run_seq_cross_ctx(
         question = qa_pair["question"]
         gold_answer = qa_pair["answer"]
 
-        # Reset history at batch boundaries (simulating group boundaries)
+        # Reset messages at batch boundaries (simulating group boundaries)
         if i > 0 and i % avg_group_size == 0:
-            qa_history = []
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             batch_count += 1
 
-        # Build prompt with Q&A history (from different contexts!)
-        if qa_history:
-            history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_history])
-            prompt = f"""Passage:
-{context}
-
-Previous Q&A:
-{history_str}
-
-Question: {question}"""
-        else:
-            prompt = f"""Passage:
+        # Build user message with context + question
+        user_content = f"""Passage:
 {context}
 
 Question: {question}"""
 
-        pred_raw, response = client.generate(prompt, max_tokens=128, system_prompt=SYSTEM_PROMPT)
+        # Add user message
+        messages.append({"role": "user", "content": user_content})
+
+        # Generate response
+        pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
 
         pred = _extract_answer(pred_raw)
 
-        # Add to history (use cleaned answer)
-        qa_history.append((question, pred))
+        # Add assistant response to history
+        messages.append({"role": "assistant", "content": pred_raw})
 
         is_correct = compute_exact_match(pred, gold_answer) > 0
         f1_score = compute_f1(pred, gold_answer)
@@ -550,7 +551,7 @@ Question: {question}"""
             "prediction_raw": pred_raw,
             "correct": is_correct,
             "f1": f1_score,
-            "history_length": len(qa_history) - 1,
+            "history_length": (len(messages) - 2) // 2,  # Number of previous QA pairs
             "batch": batch_count,
         })
 

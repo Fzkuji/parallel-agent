@@ -199,6 +199,152 @@ class LLMClient:
         else:
             return self._generate_api(prompt, max_tokens, system_prompt)
 
+    def generate_with_messages(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 1024,
+    ) -> Tuple[str, Union[SimpleResponse, Any]]:
+        """Generate response from LLM using multi-turn message format.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content' keys.
+                     Roles can be 'system', 'user', 'assistant'.
+            max_tokens: Maximum tokens to generate.
+
+        Returns:
+            Tuple of (response_text, response_object)
+        """
+        if self.use_local:
+            if self.use_vllm:
+                return self._generate_vllm_messages(messages, max_tokens)
+            else:
+                return self._generate_local_messages(messages, max_tokens)
+        else:
+            return self._generate_api_messages(messages, max_tokens)
+
+    def _generate_vllm_messages(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> Tuple[str, SimpleResponse]:
+        """Generate using vLLM with multi-turn messages."""
+        from vllm import SamplingParams
+        import time
+
+        # Apply chat template to messages
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            try:
+                full_prompt = self._tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
+                )
+            except TypeError:
+                # Fallback for models that don't support enable_thinking
+                full_prompt = self._tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+        else:
+            # Fallback: concatenate messages
+            full_prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+
+        # Sampling params
+        if self.temperature > 0:
+            sampling_params = SamplingParams(
+                temperature=self.temperature,
+                top_p=0.8 if not self.enable_thinking else 0.95,
+                top_k=20,
+                max_tokens=max_tokens,
+            )
+        else:
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_tokens=max_tokens,
+            )
+
+        start_time = time.perf_counter()
+        outputs = self._vllm_model.generate([full_prompt], sampling_params, use_tqdm=False)
+        latency = time.perf_counter() - start_time
+
+        output = outputs[0]
+        text = output.outputs[0].text
+        prompt_tokens = len(output.prompt_token_ids)
+        completion_tokens = len(output.outputs[0].token_ids)
+
+        response = SimpleResponse(
+            text=text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency=latency,
+        )
+        return text, response
+
+    def _generate_local_messages(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> Tuple[str, SimpleResponse]:
+        """Generate using local model with multi-turn messages."""
+        import torch
+
+        # Build chat template
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            try:
+                full_prompt = self._tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
+                )
+            except TypeError:
+                full_prompt = self._tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+        else:
+            full_prompt = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+
+        # Tokenize
+        inputs = self._tokenizer(full_prompt, return_tensors="pt")
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        prompt_tokens = inputs["input_ids"].shape[1]
+
+        # Generate
+        start_time = time.perf_counter()
+        with torch.no_grad():
+            outputs = self._model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=self.temperature if self.temperature > 0 else None,
+                do_sample=self.temperature > 0,
+                pad_token_id=self._tokenizer.pad_token_id,
+            )
+        latency = time.perf_counter() - start_time
+
+        # Decode (only new tokens)
+        new_tokens = outputs[0][prompt_tokens:]
+        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+        completion_tokens = len(new_tokens)
+
+        response = SimpleResponse(
+            text=text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency=latency,
+        )
+        return text, response
+
+    def _generate_api_messages(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> Tuple[str, Any]:
+        """Generate using API client with multi-turn messages."""
+        response = self.client.generate(messages=messages, max_tokens=max_tokens)
+        return response.text, response
+
     def generate_batch(
         self,
         prompts: List[str],
