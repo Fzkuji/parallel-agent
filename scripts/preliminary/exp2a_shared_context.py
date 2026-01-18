@@ -62,15 +62,19 @@ Q2: <answer>1789</answer>"""
 
 def load_squad_groups(
     n_groups: int = -1,
-    min_questions: int = 3,
-    max_questions: int = 6,
+    n_questions: int = 5,
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Load SQuAD dataset grouped by paragraph.
 
+    Args:
+        n_groups: Number of groups to sample (-1 for all)
+        n_questions: Exact number of questions per group (default: 5)
+        seed: Random seed for reproducibility
+
     Returns list of groups, each containing:
     - context: The paragraph text
-    - questions: List of {question, answer} dicts
+    - questions: List of {question, answer} dicts (exactly n_questions per group)
     """
     logger.info("Loading SQuAD dataset...")
 
@@ -86,10 +90,10 @@ def load_squad_groups(
             "id": item["id"],
         })
 
-    # Filter groups with enough questions
+    # Filter groups with exactly n_questions questions
     valid_groups = []
     for context, questions in context_groups.items():
-        if min_questions <= len(questions) <= max_questions:
+        if len(questions) == n_questions:
             valid_groups.append({
                 "context": context,
                 "questions": questions,
@@ -104,7 +108,7 @@ def load_squad_groups(
     else:
         groups = valid_groups  # Use all groups
 
-    logger.info(f"Loaded {len(groups)} groups with {min_questions}-{max_questions} questions each")
+    logger.info(f"Loaded {len(groups)} groups with exactly {n_questions} questions each")
 
     return groups
 
@@ -470,9 +474,11 @@ def run_seq_cross_ctx(
     """Seq. (Cross-Ctx): Sequential with questions from DIFFERENT contexts (baseline).
 
     This serves as a control condition to measure the benefit of shared context.
-    Questions are randomly sampled from different context groups.
-    Each question includes its own context, and the full conversation history
-    (with previous contexts) is accumulated using multi-turn chat format.
+    All questions are shuffled and regrouped into batches of the same size as
+    the original groups. Each question keeps its own context, so questions in
+    the same batch come from different contexts.
+
+    The question set is identical to shared context conditions, only the grouping differs.
     """
     logger.info("Running Seq. (Cross-Ctx) condition...")
 
@@ -485,6 +491,9 @@ def run_seq_cross_ctx(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+
+    # Get the fixed group size (all groups should have the same size)
+    group_size = groups[0]["n_questions"] if groups else 5
 
     # Flatten all questions with their contexts
     all_qa_pairs = []
@@ -500,60 +509,59 @@ def run_seq_cross_ctx(
     # Shuffle to mix questions from different contexts
     random.shuffle(all_qa_pairs)
 
-    # Process in batches matching the average group size
-    avg_group_size = sum(g["n_questions"] for g in groups) // len(groups) if groups else 4
+    # Process in batches of group_size (same as original groups)
+    n_batches = len(all_qa_pairs) // group_size
 
-    # Use multi-turn messages format
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    batch_count = 0
+    for batch_idx in tqdm(range(n_batches), desc="Seq.(Cross-Ctx)"):
+        # Get questions for this batch
+        batch_start = batch_idx * group_size
+        batch_pairs = all_qa_pairs[batch_start:batch_start + group_size]
 
-    for i, qa_pair in enumerate(tqdm(all_qa_pairs, desc="Seq.(Cross-Ctx)")):
-        context = qa_pair["context"]
-        question = qa_pair["question"]
-        gold_answer = qa_pair["answer"]
+        # Initialize messages for this batch
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        # Reset messages at batch boundaries (simulating group boundaries)
-        if i > 0 and i % avg_group_size == 0:
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            batch_count += 1
+        for i, qa_pair in enumerate(batch_pairs):
+            context = qa_pair["context"]
+            question = qa_pair["question"]
+            gold_answer = qa_pair["answer"]
 
-        # Build user message with context + question
-        user_content = f"""Passage:
+            # Every question includes its own context (different from shared conditions)
+            user_content = f"""Passage:
 {context}
 
 Question: {question}"""
 
-        # Add user message
-        messages.append({"role": "user", "content": user_content})
+            # Add user message
+            messages.append({"role": "user", "content": user_content})
 
-        # Generate response
-        pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
-        total_latency += response.latency
-        total_prompt_tokens += response.prompt_tokens
-        total_completion_tokens += response.completion_tokens
+            # Generate response
+            pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
 
-        pred = _extract_answer(pred_raw)
+            pred = _extract_answer(pred_raw)
 
-        # Add assistant response to history
-        messages.append({"role": "assistant", "content": pred_raw})
+            # Add assistant response to history
+            messages.append({"role": "assistant", "content": pred_raw})
 
-        is_correct = compute_exact_match(pred, gold_answer) > 0
-        f1_score = compute_f1(pred, gold_answer)
-        total_correct += int(is_correct)
-        total_f1 += f1_score
-        total_questions += 1
+            is_correct = compute_exact_match(pred, gold_answer) > 0
+            f1_score = compute_f1(pred, gold_answer)
+            total_correct += int(is_correct)
+            total_f1 += f1_score
+            total_questions += 1
 
-        details.append({
-            "context_id": id(context),
-            "question": question,
-            "gold_answer": gold_answer,
-            "prediction": pred,
-            "prediction_raw": pred_raw,
-            "correct": is_correct,
-            "f1": f1_score,
-            "history_length": (len(messages) - 2) // 2,  # Number of previous QA pairs
-            "batch": batch_count,
-        })
+            details.append({
+                "context_id": id(context),
+                "question": question,
+                "gold_answer": gold_answer,
+                "prediction": pred,
+                "prediction_raw": pred_raw,
+                "correct": is_correct,
+                "f1": f1_score,
+                "history_length": i,  # Position within batch
+                "batch": batch_idx,
+            })
 
     em = total_correct / total_questions if total_questions > 0 else 0
     f1 = total_f1 / total_questions if total_questions > 0 else 0
@@ -561,7 +569,7 @@ Question: {question}"""
     return ExperimentResult(
         condition="seq_cross_ctx",
         dataset="squad",
-        n_samples=len(groups),
+        n_samples=n_batches,  # Number of batches processed
         n_questions=total_questions,
         accuracy=em,
         metrics={"em": em, "f1": f1},
@@ -1167,12 +1175,8 @@ def main():
         help="Number of context groups to evaluate (-1 for all)"
     )
     parser.add_argument(
-        "--min-questions", type=int, default=3,
-        help="Minimum questions per group"
-    )
-    parser.add_argument(
-        "--max-questions", type=int, default=6,
-        help="Maximum questions per group"
+        "--n-questions", type=int, default=5,
+        help="Exact number of questions per group (default: 5)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -1212,8 +1216,7 @@ def main():
     # Load data (only once, shared across models)
     all_groups = load_squad_groups(
         n_groups=args.n_groups,
-        min_questions=args.min_questions,
-        max_questions=args.max_questions,
+        n_questions=args.n_questions,
         seed=args.seed,
     )
 
