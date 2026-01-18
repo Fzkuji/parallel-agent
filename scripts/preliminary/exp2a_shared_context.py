@@ -10,8 +10,10 @@ Conditions:
 - Independent: Each question + context answered separately
 - All-in-One: All questions from same context in one prompt
 - Seq. (Cross-Ctx): Sequential with questions from DIFFERENT contexts (baseline)
-- Seq. (Shared, Rand): Sequential with shared context, random question order
-- Seq. (Shared, Ord): Sequential with shared context, LLM-optimized order
+- Seq. (Shared, Rand): Sequential with shared context, random order, context only in first turn
+- Seq. (Shared, Ord): Sequential with shared context, LLM-optimized order, context only in first turn
+- Seq. (Shared, Rand, Full): Sequential with shared context, random order, context in every turn
+- Seq. (Shared, Ord, Full): Sequential with shared context, LLM-optimized order, context in every turn
 
 Expected: Shared-context strategies should benefit from information sharing.
 """
@@ -262,8 +264,8 @@ def run_seq_shared_rand(
 ) -> ExperimentResult:
     """Seq. (Shared, Rand): Questions from same context in random order.
 
-    All questions share the same context. Each turn includes context + question.
-    The difference from cross_ctx is that all questions in a group are from the same context.
+    All questions share the same context. Context is only provided in the first turn,
+    subsequent turns only include the question.
     """
     logger.info("Running Seq. (Shared, Rand) condition...")
 
@@ -291,11 +293,14 @@ def run_seq_shared_rand(
             question = q_item["question"]
             gold_answer = q_item["answer"]
 
-            # Every question includes context (same as cross_ctx for fair comparison)
-            user_content = f"""Passage:
+            # First question includes context, subsequent questions only include the question
+            if i == 0:
+                user_content = f"""Passage:
 {context}
 
 Question: {question}"""
+            else:
+                user_content = f"Question: {question}"
 
             # Add user message
             messages.append({"role": "user", "content": user_content})
@@ -352,8 +357,8 @@ def run_seq_shared_ord(
 ) -> ExperimentResult:
     """Seq. (Shared, Ord): LLM determines optimal question order, then answers sequentially.
 
-    All questions share the same context. Each turn includes context + question.
-    The difference from cross_ctx is that all questions in a group are from the same context.
+    All questions share the same context. Context is only provided in the first turn,
+    subsequent turns only include the question.
     """
     logger.info("Running Seq. (Shared, Ord) condition...")
 
@@ -370,6 +375,214 @@ def run_seq_shared_ord(
     total_completion_tokens = 0
 
     for group in tqdm(groups, desc="Seq.(Shared,Ord)"):
+        context = group["context"]
+        questions = group["questions"]
+
+        # Step 1: Ask LLM to determine optimal order
+        q_list = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(questions)])
+
+        ordering_prompt = f"""Given the following passage and questions, determine the optimal order to answer them.
+Consider which questions might provide useful information for answering subsequent questions.
+
+Passage:
+{context}
+
+Questions:
+{q_list}
+
+Return ONLY a comma-separated list of question numbers in the optimal order (e.g., "2,1,3,4").
+Optimal order:"""
+
+        order_response, order_meta = ordering_client.generate(ordering_prompt, max_tokens=32)
+        total_latency += order_meta.latency
+        total_prompt_tokens += order_meta.prompt_tokens
+        total_completion_tokens += order_meta.completion_tokens
+
+        # Parse order
+        ordered_indices = _parse_order(order_response, len(questions))
+        ordered_questions = [questions[i] for i in ordered_indices]
+
+        # Step 2: Answer questions in determined order using multi-turn chat format
+        # Initialize messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        for i, q_item in enumerate(ordered_questions):
+            question = q_item["question"]
+            gold_answer = q_item["answer"]
+
+            # First question includes context, subsequent questions only include the question
+            if i == 0:
+                user_content = f"""Passage:
+{context}
+
+Question: {question}"""
+            else:
+                user_content = f"Question: {question}"
+
+            # Add user message
+            messages.append({"role": "user", "content": user_content})
+
+            # Generate response
+            pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            pred = _extract_answer(pred_raw)
+
+            # Add assistant response to history
+            messages.append({"role": "assistant", "content": pred_raw})
+
+            is_correct = compute_exact_match(pred, gold_answer) > 0
+            f1_score = compute_f1(pred, gold_answer)
+            total_correct += int(is_correct)
+            total_f1 += f1_score
+            total_questions += 1
+
+            details.append({
+                "context_id": id(context),
+                "question": question,
+                "gold_answer": gold_answer,
+                "prediction": pred,
+                "prediction_raw": pred_raw,
+                "correct": is_correct,
+                "f1": f1_score,
+                "history_length": i,  # Number of previous QA pairs
+                "llm_order": ordered_indices,
+            })
+
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="seq_shared_ord",
+        dataset="squad",
+        n_samples=len(groups),
+        n_questions=total_questions,
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_seq_shared_rand_full(
+    groups: List[Dict[str, Any]],
+    client: LLMClient,
+    seed: int = 42,
+) -> ExperimentResult:
+    """Seq. (Shared, Rand, Full): Questions from same context in random order.
+
+    All questions share the same context. Every turn includes context + question
+    (same format as cross_ctx for fair comparison of token usage).
+    """
+    logger.info("Running Seq. (Shared, Rand, Full) condition...")
+
+    random.seed(seed)
+
+    total_correct = 0
+    total_f1 = 0.0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    for group in tqdm(groups, desc="Seq.(Shared,Rand,Full)"):
+        context = group["context"]
+        questions = group["questions"].copy()
+
+        # Shuffle questions randomly
+        random.shuffle(questions)
+
+        # Initialize messages with system prompt
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        for i, q_item in enumerate(questions):
+            question = q_item["question"]
+            gold_answer = q_item["answer"]
+
+            # Every question includes context (same as cross_ctx for fair comparison)
+            user_content = f"""Passage:
+{context}
+
+Question: {question}"""
+
+            # Add user message
+            messages.append({"role": "user", "content": user_content})
+
+            # Generate response
+            pred_raw, response = client.generate_with_messages(messages, max_tokens=128)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            pred = _extract_answer(pred_raw)
+
+            # Add assistant response to history
+            messages.append({"role": "assistant", "content": pred_raw})
+
+            is_correct = compute_exact_match(pred, gold_answer) > 0
+            f1_score = compute_f1(pred, gold_answer)
+            total_correct += int(is_correct)
+            total_f1 += f1_score
+            total_questions += 1
+
+            details.append({
+                "context_id": id(context),
+                "question": question,
+                "gold_answer": gold_answer,
+                "prediction": pred,
+                "prediction_raw": pred_raw,
+                "correct": is_correct,
+                "f1": f1_score,
+                "history_length": i,  # Number of previous QA pairs
+            })
+
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="seq_shared_rand_full",
+        dataset="squad",
+        n_samples=len(groups),
+        n_questions=total_questions,
+        accuracy=em,
+        metrics={"em": em, "f1": f1},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_seq_shared_ord_full(
+    groups: List[Dict[str, Any]],
+    client: LLMClient,
+    ordering_client: Optional[LLMClient] = None,
+) -> ExperimentResult:
+    """Seq. (Shared, Ord, Full): LLM determines optimal question order, then answers sequentially.
+
+    All questions share the same context. Every turn includes context + question
+    (same format as cross_ctx for fair comparison of token usage).
+    """
+    logger.info("Running Seq. (Shared, Ord, Full) condition...")
+
+    # Use same client for ordering if not specified
+    if ordering_client is None:
+        ordering_client = client
+
+    total_correct = 0
+    total_f1 = 0.0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    for group in tqdm(groups, desc="Seq.(Shared,Ord,Full)"):
         context = group["context"]
         questions = group["questions"]
 
@@ -447,7 +660,7 @@ Question: {question}"""
     f1 = total_f1 / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="seq_shared_ord",
+        condition="seq_shared_ord_full",
         dataset="squad",
         n_samples=len(groups),
         n_questions=total_questions,
@@ -788,6 +1001,14 @@ def worker_process(
         logger.info(f"[Worker {rank}] Running seq_shared_ord...")
         results.append(run_seq_shared_ord(groups, client))
 
+    if "seq_shared_rand_full" in conditions:
+        logger.info(f"[Worker {rank}] Running seq_shared_rand_full...")
+        results.append(run_seq_shared_rand_full(groups, client, seed=seed))
+
+    if "seq_shared_ord_full" in conditions:
+        logger.info(f"[Worker {rank}] Running seq_shared_ord_full...")
+        results.append(run_seq_shared_ord_full(groups, client))
+
     # Save results to temp file
     os.makedirs(output_dir, exist_ok=True)
     temp_file = os.path.join(output_dir, f"temp_rank{rank}.json")
@@ -932,6 +1153,12 @@ def run_experiment_for_model(
         if "seq_shared_ord" in conditions:
             final_results.append(run_seq_shared_ord(all_groups, client))
 
+        if "seq_shared_rand_full" in conditions:
+            final_results.append(run_seq_shared_rand_full(all_groups, client, seed=args.seed))
+
+        if "seq_shared_ord_full" in conditions:
+            final_results.append(run_seq_shared_ord_full(all_groups, client))
+
     # Print and save results for this model
     config = ExperimentConfig(
         exp_name="exp2a_shared_context",
@@ -953,7 +1180,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
     import glob
 
     # Valid exp2a conditions
-    VALID_CONDITIONS = ["independent", "all_in_one", "seq_cross_ctx", "seq_shared_rand", "seq_shared_ord"]
+    VALID_CONDITIONS = ["independent", "all_in_one", "seq_cross_ctx", "seq_shared_rand", "seq_shared_ord", "seq_shared_rand_full", "seq_shared_ord_full"]
 
     # Find all matching files
     file_pattern = os.path.join(output_dir, pattern)
@@ -1177,8 +1404,8 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord",
-        help="Comma-separated list of conditions: independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord"
+        "--conditions", type=str, default="independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord,seq_shared_rand_full,seq_shared_ord_full",
+        help="Comma-separated list of conditions: independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord,seq_shared_rand_full,seq_shared_ord_full"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
