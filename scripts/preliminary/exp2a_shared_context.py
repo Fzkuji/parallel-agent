@@ -260,10 +260,10 @@ def run_seq_shared_rand(
     client: LLMClient,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Seq. (Shared, Rand): Questions in random order, using multi-turn chat format.
+    """Seq. (Shared, Rand): Questions from same context in random order.
 
-    Context is only provided in the first turn. Subsequent turns only contain the question.
-    This leverages the chat history to maintain context awareness.
+    All questions share the same context. Each turn includes context + question.
+    The difference from cross_ctx is that all questions in a group are from the same context.
     """
     logger.info("Running Seq. (Shared, Rand) condition...")
 
@@ -291,14 +291,11 @@ def run_seq_shared_rand(
             question = q_item["question"]
             gold_answer = q_item["answer"]
 
-            # First question includes context, subsequent questions only include the question
-            if i == 0:
-                user_content = f"""Passage:
+            # Every question includes context (same as cross_ctx for fair comparison)
+            user_content = f"""Passage:
 {context}
 
 Question: {question}"""
-            else:
-                user_content = f"Question: {question}"
 
             # Add user message
             messages.append({"role": "user", "content": user_content})
@@ -355,8 +352,8 @@ def run_seq_shared_ord(
 ) -> ExperimentResult:
     """Seq. (Shared, Ord): LLM determines optimal question order, then answers sequentially.
 
-    Context is only provided in the first turn. Subsequent turns only contain the question.
-    This leverages the chat history to maintain context awareness.
+    All questions share the same context. Each turn includes context + question.
+    The difference from cross_ctx is that all questions in a group are from the same context.
     """
     logger.info("Running Seq. (Shared, Ord) condition...")
 
@@ -408,14 +405,11 @@ Optimal order:"""
             question = q_item["question"]
             gold_answer = q_item["answer"]
 
-            # First question includes context, subsequent questions only include the question
-            if i == 0:
-                user_content = f"""Passage:
+            # Every question includes context (same as cross_ctx for fair comparison)
+            user_content = f"""Passage:
 {context}
 
 Question: {question}"""
-            else:
-                user_content = f"Question: {question}"
 
             # Add user message
             messages.append({"role": "user", "content": user_content})
