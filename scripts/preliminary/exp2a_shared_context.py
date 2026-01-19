@@ -922,57 +922,21 @@ Question: {question}"""
 
 
 def _extract_answer(response: str) -> str:
-    """Extract clean answer from model response.
+    """Extract answer from model response.
 
-    Simplified extraction that works better with various model outputs:
-    1. Try <answer> tags first (for backward compatibility)
-    2. Remove common prefixes like "The answer is:", "Based on the passage,"
-    3. Take first line/sentence
-    4. Clean up punctuation
+    Same logic as train_cross_batch.py's extract_box_answer:
+    - If <answer>...</answer> tag present, extract content
+    - Otherwise, return raw text (let F1 handle partial matching)
     """
     response = response.strip()
 
-    # If empty, return empty
-    if not response:
-        return ""
-
-    # 1. Try to extract from <answer></answer> tags (backward compatibility)
+    # Try to extract from <answer></answer> tags
     answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL | re.IGNORECASE)
     if answer_match:
         return answer_match.group(1).strip()
 
-    # 2. Remove common prefixes
-    prefixes = [
-        r"^(?:the\s+)?answer\s*(?:is|:)\s*",
-        r"^based\s+on\s+(?:the\s+)?(?:passage|context|text)[,\s]+(?:the\s+)?answer\s*(?:is|:)\s*",
-        r"^based\s+on\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
-        r"^according\s+to\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
-        r"^from\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
-    ]
-
-    cleaned = response
-    for prefix in prefixes:
-        cleaned = re.sub(prefix, "", cleaned, flags=re.IGNORECASE)
-
-    # 3. Take first line if multiple lines
-    first_line = cleaned.split('\n')[0].strip()
-
-    # 4. If first line is too long (likely an explanation), try to find the key answer
-    # Look for patterns like "X is Y" or quoted answers
-    if len(first_line) > 100:
-        # Try to extract quoted content
-        quote_match = re.search(r'["\']([^"\']+)["\']', first_line)
-        if quote_match:
-            return quote_match.group(1).strip()
-        # Try to get content before first period
-        sentence = first_line.split('.')[0].strip()
-        if len(sentence) < 100:
-            first_line = sentence
-
-    # 5. Remove trailing punctuation (but keep internal punctuation)
-    cleaned = first_line.rstrip('.,;:')
-
-    return cleaned
+    # No tag found - return raw text (same as extract_box_answer)
+    return response
 
 
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
