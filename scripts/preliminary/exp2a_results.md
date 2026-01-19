@@ -37,15 +37,15 @@
 
 **EXPERIMENT SUMMARY**
 
-| Condition | EM | F1 | Samples | Avg Prompt | Avg Compl | Avg Latency (s) |
+| Condition | EM | F1 | Samples | Avg SeqLen | Avg Compl | Avg Latency (s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| independent | 0.4526 | 0.6120 | 1000 | 1228.5 | 61.9 | 0.14 |
-| all_in_one | 0.4858 | 0.6320 | 1000 | 327.6 | 66.6 | 0.14 |
-| seq_cross_ctx | 0.4534 | 0.6165 | 1000 | 3354.8 | 63.0 | 0.15 |
-| seq_shared_rand | 0.4704 | 0.6362 | 1000 | 1591.2 | 63.0 | 0.14 |
-| seq_shared_ord | 0.4664 | 0.6318 | 1000 | 1911.0 | 72.2 | 0.16 |
-| seq_shared_rand_full | 0.4902 | 0.6589 | 1000 | 3359.2 | 61.9 | 0.15 |
-| seq_shared_ord_full | 0.4868 | 0.6504 | 1000 | 3679.8 | 71.4 | 0.17 |
+| independent | 0.4526 | 0.6120 | 1000 | 1290.4 | 61.9 | 0.14 |
+| all_in_one | 0.4858 | 0.6320 | 1000 | 394.2 | 66.6 | 0.14 |
+| seq_cross_ctx | 0.4534 | 0.6165 | 1000 | 1111.5 | 63.0 | 0.15 |
+| seq_shared_rand | 0.4704 | 0.6362 | 1000 | 403.6 | 63.0 | 0.14 |
+| seq_shared_ord | 0.4664 | 0.6318 | 1000 | 734.3 | 72.2 | 0.16 |
+| seq_shared_rand_full | 0.4902 | 0.6589 | 1000 | 1110.4 | 61.9 | 0.15 |
+| seq_shared_ord_full | 0.4868 | 0.6504 | 1000 | 1441.4 | 71.4 | 0.17 |
 
 **PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**
 
@@ -63,15 +63,15 @@
 
 **EXPERIMENT SUMMARY**
 
-| Condition | EM | F1 | Samples | Avg Prompt | Avg Compl | Avg Latency (s) |
+| Condition | EM | F1 | Samples | Avg SeqLen | Avg Compl | Avg Latency (s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| independent | 0.4344 | 0.6303 | 1000 | 1228.5 | 63.4 | 0.18 |
-| all_in_one | 0.6126 | 0.7750 | 1000 | 327.6 | 75.9 | 0.21 |
-| seq_cross_ctx | 0.4366 | 0.6380 | 1000 | 3354.0 | 60.3 | 0.20 |
-| seq_shared_rand | 0.4322 | 0.6389 | 1000 | 1594.1 | 62.0 | 0.18 |
-| seq_shared_ord | 0.4044 | 0.6165 | 1000 | 1916.6 | 74.1 | 0.22 |
-| seq_shared_rand_full | 0.4502 | 0.6567 | 1000 | 3356.0 | 58.7 | 0.19 |
-| seq_shared_ord_full | 0.4168 | 0.6320 | 1000 | 3679.2 | 71.1 | 0.23 |
+| independent | 0.4344 | 0.6303 | 1000 | 1291.9 | 63.4 | 0.18 |
+| all_in_one | 0.6126 | 0.7750 | 1000 | 403.4 | 75.9 | 0.21 |
+| seq_cross_ctx | 0.4366 | 0.6380 | 1000 | 1108.8 | 60.3 | 0.20 |
+| seq_shared_rand | 0.4322 | 0.6389 | 1000 | 402.5 | 62.0 | 0.18 |
+| seq_shared_ord | 0.4044 | 0.6165 | 1000 | 736.3 | 74.1 | 0.22 |
+| seq_shared_rand_full | 0.4502 | 0.6567 | 1000 | 1107.2 | 58.7 | 0.19 |
+| seq_shared_ord_full | 0.4168 | 0.6320 | 1000 | 1441.2 | 71.1 | 0.22 |
 
 **PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**
 
@@ -103,15 +103,15 @@
 
 **EXPERIMENT SUMMARY**
 
-| Condition | EM | F1 | Samples | Avg Prompt | Avg Compl | Avg Latency (s) |
+| Condition | EM | F1 | Samples | Avg SeqLen | Avg Compl | Avg Latency (s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| independent | 0.6362 | 0.8003 | 1000 | 1228.5 | 68.0 | 0.32 |
-| all_in_one | 0.6770 | 0.8377 | 1000 | 327.6 | 72.7 | 0.33 |
-| seq_cross_ctx | 0.6584 | 0.8200 | 1000 | 3360.9 | 64.6 | 0.35 |
-| seq_shared_rand | 0.6478 | 0.8158 | 1000 | 1599.2 | 65.3 | 0.30 |
-| seq_shared_ord | 0.6512 | 0.8192 | 1000 | 1915.2 | 74.6 | 0.36 |
-| seq_shared_rand_full | 0.6610 | 0.8263 | 1000 | 3367.9 | 64.6 | 0.35 |
-| seq_shared_ord_full | 0.6688 | 0.8312 | 1000 | 3684.2 | 74.0 | 0.39 |
+| independent | 0.6362 | 0.8003 | 1000 | 1296.5 | 68.0 | 0.32 |
+| all_in_one | 0.6770 | 0.8377 | 1000 | 400.2 | 72.7 | 0.33 |
+| seq_cross_ctx | 0.6584 | 0.8200 | 1000 | 1113.1 | 64.6 | 0.35 |
+| seq_shared_rand | 0.6478 | 0.8158 | 1000 | 405.8 | 65.3 | 0.30 |
+| seq_shared_ord | 0.6512 | 0.8192 | 1000 | 736.7 | 74.6 | 0.36 |
+| seq_shared_rand_full | 0.6610 | 0.8263 | 1000 | 1113.1 | 64.6 | 0.35 |
+| seq_shared_ord_full | 0.6688 | 0.8312 | 1000 | 1444.0 | 74.0 | 0.39 |
 
 **PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**
 
@@ -143,15 +143,15 @@
 
 **EXPERIMENT SUMMARY**
 
-| Condition | EM | F1 | Samples | Avg Prompt | Avg Compl | Avg Latency (s) |
+| Condition | EM | F1 | Samples | Avg SeqLen | Avg Compl | Avg Latency (s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| independent | 0.6696 | 0.8260 | 1000 | 1228.5 | 65.0 | 0.46 |
-| all_in_one | 0.6678 | 0.8372 | 1000 | 327.6 | 73.3 | 0.51 |
-| seq_cross_ctx | 0.6878 | 0.8416 | 1000 | 3356.1 | 61.7 | 0.51 |
-| seq_shared_rand | 0.6818 | 0.8385 | 1000 | 1593.4 | 62.9 | 0.43 |
-| seq_shared_ord | 0.6878 | 0.8448 | 1000 | 1911.0 | 73.1 | 0.53 |
-| seq_shared_rand_full | 0.6926 | 0.8498 | 1000 | 3362.0 | 62.1 | 0.51 |
-| seq_shared_ord_full | 0.6982 | 0.8524 | 1000 | 3680.0 | 72.2 | 0.58 |
+| independent | 0.6696 | 0.8260 | 1000 | 1293.5 | 65.0 | 0.46 |
+| all_in_one | 0.6678 | 0.8372 | 1000 | 400.9 | 73.3 | 0.51 |
+| seq_cross_ctx | 0.6878 | 0.8416 | 1000 | 1110.2 | 61.7 | 0.51 |
+| seq_shared_rand | 0.6818 | 0.8385 | 1000 | 403.5 | 62.9 | 0.43 |
+| seq_shared_ord | 0.6878 | 0.8448 | 1000 | 735.2 | 73.1 | 0.53 |
+| seq_shared_rand_full | 0.6926 | 0.8498 | 1000 | 1110.6 | 62.1 | 0.51 |
+| seq_shared_ord_full | 0.6982 | 0.8524 | 1000 | 1442.3 | 72.2 | 0.58 |
 
 **PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**
 
@@ -169,15 +169,15 @@
 
 **EXPERIMENT SUMMARY**
 
-| Condition | EM | F1 | Samples | Avg Prompt | Avg Compl | Avg Latency (s) |
+| Condition | EM | F1 | Samples | Avg SeqLen | Avg Compl | Avg Latency (s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| independent | 0.6800 | 0.8365 | 1000 | 1228.5 | 66.0 | 0.74 |
-| all_in_one | 0.6726 | 0.8474 | 1000 | 327.6 | 73.5 | 0.81 |
-| seq_cross_ctx | 0.6814 | 0.8433 | 1000 | 3360.0 | 64.0 | 0.85 |
-| seq_shared_rand | 0.6784 | 0.8418 | 1000 | 1596.7 | 64.6 | 0.70 |
-| seq_shared_ord | 0.6850 | 0.8445 | 1000 | 1914.1 | 74.6 | 0.86 |
-| seq_shared_rand_full | 0.6790 | 0.8445 | 1000 | 3365.9 | 64.4 | 0.85 |
-| seq_shared_ord_full | 0.6838 | 0.8461 | 1000 | 3683.4 | 74.3 | 0.95 |
+| independent | 0.6800 | 0.8365 | 1000 | 1294.5 | 66.0 | 0.74 |
+| all_in_one | 0.6726 | 0.8474 | 1000 | 401.1 | 73.5 | 0.81 |
+| seq_cross_ctx | 0.6814 | 0.8433 | 1000 | 1112.5 | 64.0 | 0.85 |
+| seq_shared_rand | 0.6784 | 0.8418 | 1000 | 405.2 | 64.6 | 0.70 |
+| seq_shared_ord | 0.6850 | 0.8445 | 1000 | 736.7 | 74.6 | 0.86 |
+| seq_shared_rand_full | 0.6790 | 0.8445 | 1000 | 1112.9 | 64.4 | 0.85 |
+| seq_shared_ord_full | 0.6838 | 0.8461 | 1000 | 1444.4 | 74.3 | 0.95 |
 
 **PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**
 
@@ -209,15 +209,15 @@
 
 **EXPERIMENT SUMMARY**
 
-| Condition | EM | F1 | Samples | Avg Prompt | Avg Compl | Avg Latency (s) |
+| Condition | EM | F1 | Samples | Avg SeqLen | Avg Compl | Avg Latency (s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| independent | 0.6572 | 0.8186 | 1000 | 1228.5 | 69.8 | 1.69 |
-| all_in_one | 0.5928 | 0.7872 | 1000 | 327.6 | 82.3 | 1.98 |
-| seq_cross_ctx | 0.6682 | 0.8326 | 1000 | 3365.6 | 65.8 | 1.97 |
-| seq_shared_rand | 0.6410 | 0.8188 | 1000 | 1601.9 | 67.1 | 1.64 |
-| seq_shared_ord | 0.6526 | 0.8259 | 1000 | 1919.6 | 77.3 | 1.99 |
-| seq_shared_rand_full | 0.6500 | 0.8234 | 1000 | 3371.4 | 66.8 | 2.02 |
-| seq_shared_ord_full | 0.6550 | 0.8286 | 1000 | 3689.0 | 76.8 | 2.38 |
+| independent | 0.6572 | 0.8186 | 1000 | 1298.3 | 69.8 | 1.69 |
+| all_in_one | 0.5928 | 0.7872 | 1000 | 409.8 | 82.3 | 1.98 |
+| seq_cross_ctx | 0.6682 | 0.8326 | 1000 | 1114.3 | 65.8 | 1.97 |
+| seq_shared_rand | 0.6410 | 0.8188 | 1000 | 407.7 | 67.1 | 1.64 |
+| seq_shared_ord | 0.6526 | 0.8259 | 1000 | 739.4 | 77.3 | 1.99 |
+| seq_shared_rand_full | 0.6500 | 0.8234 | 1000 | 1115.3 | 66.8 | 2.02 |
+| seq_shared_ord_full | 0.6550 | 0.8286 | 1000 | 1446.9 | 76.8 | 2.38 |
 
 **PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**
 
@@ -245,26 +245,32 @@
 
 ---
 
-## Summary Table (EM) - Qwen3 Series
+## Summary Table (EM) - All Models
 
 | Model | independent | all_in_one | seq_cross_ctx | seq_shared_rand | seq_shared_ord | seq_shared_rand_full | seq_shared_ord_full |
 |-------|-------------|------------|---------------|-----------------|----------------|----------------------|---------------------|
-| 0.6B | 0.4526 | 0.4858 | 0.4534 | 0.4704 | 0.4664 | 0.4902 | 0.4868 |
-| 1.7B | 0.4344 | 0.6126 | 0.4366 | 0.4322 | 0.4044 | 0.4502 | 0.4168 |
-| 4B | 0.6362 | 0.6770 | 0.6584 | 0.6478 | 0.6512 | 0.6610 | 0.6688 |
-| 8B | 0.6696 | 0.6678 | 0.6878 | 0.6818 | 0.6878 | 0.6926 | **0.6982** |
-| 14B | 0.6800 | 0.6726 | 0.6814 | 0.6784 | 0.6850 | 0.6790 | 0.6838 |
-| 32B | 0.6572 | 0.5928 | 0.6682 | 0.6410 | 0.6526 | 0.6500 | 0.6550 |
+| Qwen2.5-0.5B | 0.0026 | 0.0699 | 0.0007 | 0.0013 | 0.0009 | - | - |
+| Qwen3-0.6B | 0.4526 | 0.4858 | 0.4534 | 0.4704 | 0.4664 | 0.4902 | 0.4868 |
+| Qwen3-1.7B | 0.4344 | 0.6126 | 0.4366 | 0.4322 | 0.4044 | 0.4502 | 0.4168 |
+| Qwen2.5-3B | 0.0002 | 0.2806 | 0.0015 | 0.0026 | 0.0015 | - | - |
+| Qwen3-4B | 0.6362 | 0.6770 | 0.6584 | 0.6478 | 0.6512 | 0.6610 | 0.6688 |
+| Qwen2.5-7B | 0.0004 | 0.3776 | 0.0013 | 0.0031 | 0.0013 | - | - |
+| Qwen3-8B | 0.6696 | 0.6678 | 0.6878 | 0.6818 | 0.6878 | 0.6926 | **0.6982** |
+| Qwen3-14B | 0.6800 | 0.6726 | 0.6814 | 0.6784 | 0.6850 | 0.6790 | 0.6838 |
+| Qwen2.5-14B | 0.6640 | 0.6413 | 0.6605 | 0.6675 | 0.6662 | - | - |
+| Qwen3-32B | 0.6572 | 0.5928 | 0.6682 | 0.6410 | 0.6526 | 0.6500 | 0.6550 |
+| Qwen2.5-32B | 0.6623 | 0.6124 | 0.6557 | 0.6654 | 0.6645 | - | - |
 
-## Summary Table (EM) - Qwen2.5 Series
+## Summary Table (Avg SeqLen) - Qwen3 Series
 
-| Model | independent | all_in_one | seq_cross_ctx | seq_shared_rand | seq_shared_ord |
-|-------|-------------|------------|---------------|-----------------|----------------|
-| 0.5B | 0.0026 | 0.0699 | 0.0007 | 0.0013 | 0.0009 |
-| 3B | 0.0002 | 0.2806 | 0.0015 | 0.0026 | 0.0015 |
-| 7B | 0.0004 | 0.3776 | 0.0013 | 0.0031 | 0.0013 |
-| 14B | 0.6640 | 0.6413 | 0.6605 | 0.6675 | 0.6662 |
-| 32B | 0.6623 | 0.6124 | 0.6557 | 0.6654 | 0.6645 |
+| Model | independent | all_in_one | seq_cross_ctx | seq_shared_rand | seq_shared_ord | seq_shared_rand_full | seq_shared_ord_full |
+|-------|-------------|------------|---------------|-----------------|----------------|----------------------|---------------------|
+| 0.6B | 1290.4 | 394.2 | 1111.5 | 403.6 | 734.3 | 1110.4 | 1441.4 |
+| 1.7B | 1291.9 | 403.4 | 1108.8 | 402.5 | 736.3 | 1107.2 | 1441.2 |
+| 4B | 1296.5 | 400.2 | 1113.1 | 405.8 | 736.7 | 1113.1 | 1444.0 |
+| 8B | 1293.5 | 400.9 | 1110.2 | 403.5 | 735.2 | 1110.6 | 1442.3 |
+| 14B | 1294.5 | 401.1 | 1112.5 | 405.2 | 736.7 | 1112.9 | 1444.4 |
+| 32B | 1298.3 | 409.8 | 1114.3 | 407.7 | 739.4 | 1115.3 | 1446.9 |
 
 ## Key Findings
 
@@ -272,10 +278,17 @@
 
 2. **seq_shared_*_full > seq_shared_***: Adding context every turn improves accuracy (e.g., 8B: 0.6926 vs 0.6818)
 
-3. **seq_shared_* > seq_cross_ctx**: Shared context benefits from information sharing between related questions
+3. **seq_shared_* ≈ seq_cross_ctx**: With KV cache, shared context has similar cost to cross-context but benefits from information sharing
 
 4. **LLM ordering (ord) >= random**: Optimized question order provides slight improvement
 
 5. **8B is optimal**: Qwen3-8B achieves best performance; larger models (14B, 32B) show degradation due to verbose answers
 
 6. **32B verbose output issue**: Qwen3-32B tends to give overly complete answers (e.g., "East African Community (EAC)" instead of "East African Community"), hurting EM scores
+
+7. **Token efficiency with KV cache**:
+   - `independent`: ~1295 tokens (5 separate requests, no reuse)
+   - `all_in_one`: ~400 tokens (single request)
+   - `seq_shared_rand`: ~405 tokens (context cached, only new Q+A per turn)
+   - `seq_shared_rand_full`: ~1110 tokens (context repeated but cached)
+   - `seq_cross_ctx`: ~1110 tokens (different contexts, less cache benefit)
