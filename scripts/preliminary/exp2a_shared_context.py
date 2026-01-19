@@ -1443,10 +1443,6 @@ def main():
         description="Exp 2a: Shared Context - SQuAD"
     )
     parser.add_argument(
-        "--summarize", action="store_true",
-        help="Read saved result files and print summary (no experiment run)"
-    )
-    parser.add_argument(
         "--models", type=str, default="Qwen/Qwen2.5-7B-Instruct",
         help="Comma-separated list of models (e.g., 'Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-14B-Instruct')"
     )
@@ -1491,11 +1487,6 @@ def main():
         help="Force re-run experiments even if results already exist"
     )
     args = parser.parse_args()
-
-    # If --summarize, just read saved files and print summary
-    if args.summarize:
-        summarize_from_files(args.output_dir)
-        return
 
     # Parse models and conditions
     models = [m.strip() for m in args.models.split(",")]
@@ -1542,17 +1533,13 @@ def main():
     # Run experiments for models that need it
     all_model_results = {}
 
-    # First, load existing results
+    # First, load existing results (just log, don't print details - will summarize at end)
     for model, filepath in models_with_results:
-        logger.info(f"Loading existing results for {model}")
+        logger.info(f"Using cached results for {model}: {filepath}")
         results = load_results_from_file(filepath)
         # Filter to only requested conditions
         results = [r for r in results if r.condition in conditions]
         all_model_results[model] = results
-        print(f"\n{'='*60}")
-        print(f"Loaded existing results for: {model}")
-        print(f"{'='*60}\n")
-        print_summary(results)
 
     # Then, run new experiments
     for model in models_to_run:
