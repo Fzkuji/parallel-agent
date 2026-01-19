@@ -54,8 +54,16 @@ def load_squad_groups(
 
     formatted: List[dict] = []
     for context_text, rows in selected:
+        # Randomly sample number of questions between min_questions and max_questions
         if max_questions:
-            rows = rows[:max_questions]
+            # Determine actual range based on available questions
+            actual_max = min(max_questions, len(rows))
+            actual_min = min(min_questions, actual_max)
+            # Random sample count between min and max
+            num_questions = rng.randint(actual_min, actual_max)
+            # Shuffle and take first num_questions
+            rng.shuffle(rows)
+            rows = rows[:num_questions]
         questions = []
         for idx, row in enumerate(rows):
             qid = f"Q{idx + 1}"

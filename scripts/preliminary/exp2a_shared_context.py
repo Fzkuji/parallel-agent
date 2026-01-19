@@ -50,16 +50,15 @@ from utils import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# System prompt for answer extraction
+# System prompt for answer extraction - simplified for better model compatibility
 SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
-Output ONLY your answer wrapped in <answer></answer> tags.
-Example: <answer>Paris</answer>"""
+Give a short, direct answer. Do not explain or elaborate."""
 
 SYSTEM_PROMPT_MULTI = """You are a helpful assistant. Answer all questions based on the given passage.
-Output each answer wrapped in <answer></answer> tags.
-Example format:
-Q1: <answer>Paris</answer>
-Q2: <answer>1789</answer>"""
+Give short, direct answers. Format your response as:
+Q1: [answer]
+Q2: [answer]
+..."""
 
 
 def load_squad_groups(
@@ -925,46 +924,70 @@ Question: {question}"""
 def _extract_answer(response: str) -> str:
     """Extract clean answer from model response.
 
-    Handles common patterns like:
-    - "<answer>John Smith</answer>"
-    - "The answer is: John Smith"
-    - "Answer: John Smith"
-    - "John Smith." (just the answer with punctuation)
+    Simplified extraction that works better with various model outputs:
+    1. Try <answer> tags first (for backward compatibility)
+    2. Remove common prefixes like "The answer is:", "Based on the passage,"
+    3. Take first line/sentence
+    4. Clean up punctuation
     """
     response = response.strip()
 
-    # First, try to extract from <answer></answer> tags
+    # If empty, return empty
+    if not response:
+        return ""
+
+    # 1. Try to extract from <answer></answer> tags (backward compatibility)
     answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL | re.IGNORECASE)
     if answer_match:
         return answer_match.group(1).strip()
 
-    # Remove common prefixes
+    # 2. Remove common prefixes
     prefixes = [
         r"^(?:the\s+)?answer\s*(?:is|:)\s*",
         r"^based\s+on\s+(?:the\s+)?(?:passage|context|text)[,\s]+(?:the\s+)?answer\s*(?:is|:)\s*",
+        r"^based\s+on\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
         r"^according\s+to\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
+        r"^from\s+(?:the\s+)?(?:passage|context|text)[,\s]+",
     ]
 
     cleaned = response
     for prefix in prefixes:
         cleaned = re.sub(prefix, "", cleaned, flags=re.IGNORECASE)
 
-    # Take first line/sentence if multiple
-    cleaned = cleaned.split('\n')[0].strip()
+    # 3. Take first line if multiple lines
+    first_line = cleaned.split('\n')[0].strip()
 
-    # Remove trailing punctuation (but keep internal punctuation)
-    cleaned = cleaned.rstrip('.,;:')
+    # 4. If first line is too long (likely an explanation), try to find the key answer
+    # Look for patterns like "X is Y" or quoted answers
+    if len(first_line) > 100:
+        # Try to extract quoted content
+        quote_match = re.search(r'["\']([^"\']+)["\']', first_line)
+        if quote_match:
+            return quote_match.group(1).strip()
+        # Try to get content before first period
+        sentence = first_line.split('.')[0].strip()
+        if len(sentence) < 100:
+            first_line = sentence
+
+    # 5. Remove trailing punctuation (but keep internal punctuation)
+    cleaned = first_line.rstrip('.,;:')
 
     return cleaned
 
 
 def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
-    """Parse batch answers from response like 'Q1: <answer>answer1</answer>'."""
+    """Parse batch answers from response.
+
+    Handles various formats:
+    - Q1: answer1  Q2: answer2
+    - Q1: <answer>answer1</answer>
+    - 1. answer1  2. answer2
+    - Line-by-line answers
+    """
     answers = {}
 
-    # First, try to extract <answer> tags for each question
+    # Method 1: Try to extract <answer> tags for each question (backward compatibility)
     for i in range(n_questions):
-        # Find the section for this question
         if i < n_questions - 1:
             pattern = rf"Q{i+1}[:\s]+.*?<answer>(.*?)</answer>.*?(?=Q{i+2}[:\s])"
         else:
@@ -973,37 +996,62 @@ def _parse_batch_answers(response: str, n_questions: int) -> Dict[int, str]:
         if match:
             answers[i] = match.group(1).strip()
 
-    # If <answer> parsing got all answers, return
     if len(answers) == n_questions:
         return answers
 
-    # Fallback: try simpler pattern (Q1: answer until next Q or newline)
+    # Method 2: Q1: answer format (most common)
     answers = {}
     for i in range(n_questions):
+        # Match Q1:, Q1., Q1), etc.
         if i < n_questions - 1:
-            pattern = rf"Q{i+1}[:\s]+(.+?)(?=Q{i+2}[:\s])"
+            pattern = rf"Q{i+1}[:\.\)]\s*(.+?)(?=Q{i+2}[:\.\)]|\n\n|$)"
         else:
-            pattern = rf"Q{i+1}[:\s]+(.+?)(?:\n|$)"
+            pattern = rf"Q{i+1}[:\.\)]\s*(.+?)(?:\n\n|$)"
         match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
         if match:
             content = match.group(1).strip()
-            # Try to extract from <answer> tag if present
+            # Clean up the content
             tag_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL | re.IGNORECASE)
             if tag_match:
                 answers[i] = tag_match.group(1).strip()
             else:
-                answers[i] = content.rstrip(",")
+                # Take first line/sentence
+                first_line = content.split('\n')[0].strip()
+                answers[i] = first_line.rstrip('.,;:')
 
-    # Final fallback: split by newline and look for answers
-    if not answers:
-        lines = response.strip().split('\n')
+    if len(answers) == n_questions:
+        return answers
+
+    # Method 3: Numbered list (1. answer, 2. answer)
+    if not answers or len(answers) < n_questions:
+        answers = {}
+        for i in range(n_questions):
+            if i < n_questions - 1:
+                pattern = rf"(?:^|\n)\s*{i+1}[:\.\)]\s*(.+?)(?=(?:^|\n)\s*{i+2}[:\.\)]|$)"
+            else:
+                pattern = rf"(?:^|\n)\s*{i+1}[:\.\)]\s*(.+?)$"
+            match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+                first_line = content.split('\n')[0].strip()
+                answers[i] = first_line.rstrip('.,;:')
+
+    if len(answers) == n_questions:
+        return answers
+
+    # Method 4: Split by newline and assign to questions
+    if not answers or len(answers) < n_questions:
+        answers = {}
+        lines = [l.strip() for l in response.strip().split('\n') if l.strip()]
         for i, line in enumerate(lines[:n_questions]):
-            tag_match = re.search(r'<answer>(.*?)</answer>', line, re.DOTALL | re.IGNORECASE)
+            # Remove question prefix if present
+            clean = re.sub(r"^(?:Q\d+|[\d]+)[:\.\)]\s*", "", line, flags=re.IGNORECASE)
+            # Remove <answer> tags if present
+            tag_match = re.search(r'<answer>(.*?)</answer>', clean, re.DOTALL | re.IGNORECASE)
             if tag_match:
                 answers[i] = tag_match.group(1).strip()
             else:
-                clean = re.sub(r"^Q\d+[:\s]*", "", line.strip(), flags=re.IGNORECASE)
-                answers[i] = clean
+                answers[i] = clean.rstrip('.,;:')
 
     return answers
 

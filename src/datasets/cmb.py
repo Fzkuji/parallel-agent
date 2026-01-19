@@ -73,8 +73,13 @@ def load_cmb_groups(
         title = row.get("title", row.get("id", "CMB-Case"))
         qa_pairs = row.get("QA_pairs", [])
 
+        # Randomly sample number of questions between min_questions and max_questions
         if max_questions:
-            qa_pairs = qa_pairs[:max_questions]
+            actual_max = min(max_questions, len(qa_pairs))
+            actual_min = min(min_questions, actual_max)
+            num_questions = rng.randint(actual_min, actual_max)
+            rng.shuffle(qa_pairs)
+            qa_pairs = qa_pairs[:num_questions]
 
         questions = []
         for idx, qa in enumerate(qa_pairs):
@@ -238,10 +243,13 @@ def load_cmb_exam_subdomain_groups(
         medical_term = row.get("medical_term", "unknown")
         raw_questions = row.get("questions", [])
 
-        # Shuffle questions and limit per group
+        # Randomly sample number of questions between min_questions and max_questions
         rng.shuffle(raw_questions)
-        if max_questions and len(raw_questions) > max_questions:
-            raw_questions = raw_questions[:max_questions]
+        if max_questions:
+            actual_max = min(max_questions, len(raw_questions))
+            actual_min = min(min_questions, actual_max)
+            num_questions = rng.randint(actual_min, actual_max)
+            raw_questions = raw_questions[:num_questions]
 
         # Build items for multi-context format
         items = []
@@ -328,10 +336,13 @@ def load_cmb_exam_context_groups(
 
         raw_questions = row.get("questions", [])
 
-        # Shuffle questions and limit per group
+        # Randomly sample number of questions between min_questions and max_questions
         rng.shuffle(raw_questions)
-        if max_questions and len(raw_questions) > max_questions:
-            raw_questions = raw_questions[:max_questions]
+        if max_questions:
+            actual_max = min(max_questions, len(raw_questions))
+            actual_min = min(min_questions, actual_max)
+            num_questions = rng.randint(actual_min, actual_max)
+            raw_questions = raw_questions[:num_questions]
 
         questions = []
         for q_idx, q in enumerate(raw_questions):

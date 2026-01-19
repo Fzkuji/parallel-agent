@@ -9,8 +9,8 @@ Cross-batch 模块训练脚本 (支持 DDP 多卡并行)
                           cmb_clin, cmb_exam_context, cmb_exam_subdomain, cmb_exam_random
   --max-samples     训练样本数 (default: None, 使用全部训练集)
   --eval-samples    评估样本数/context数 (default: None, 使用全部验证集)
-  --min-questions   每个 context 最少问题数 (default: 3)
-  --max-questions   每个 context 最多问题数 (default: 5)
+  --min-questions   每个 context 最少问题数 (default: 1)
+  --max-questions   每个 context 最多问题数 (default: 5, 训练时每个 context 在 1-5 之间随机)
   --epochs          训练轮数 (default: 1)
   --batch-size      每卡 batch size (default: 8)
   --lr              学习率 (default: 1e-4)
@@ -137,8 +137,8 @@ def parse_args():
                         help='评估用的数据集 split (default: validation). Supports slice syntax like "train[50:]", "train[:100]".')
     parser.add_argument('--train-split', type=str, default='train',
                         help='训练用的数据集 split (default: train). Supports slice syntax like "train[50:]", "train[:100]".')
-    parser.add_argument('--min-questions', type=int, default=3,
-                        help='每个 context 最少问题数 (default: 3)')
+    parser.add_argument('--min-questions', type=int, default=1,
+                        help='每个 context 最少问题数 (default: 1)')
     parser.add_argument('--max-questions', type=int, default=5,
                         help='每个 context 最多问题数 (default: 5)')
     parser.add_argument('--squad-random-questions', action='store_true',

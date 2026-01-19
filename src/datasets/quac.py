@@ -73,9 +73,14 @@ def load_quac_groups(
         else:
             full_context = context or background
 
-        # Truncate questions if needed
+        # Randomly sample number of questions between min_questions and max_questions
         if max_questions:
-            questions_raw = questions_raw[:max_questions]
+            actual_max = min(max_questions, len(questions_raw))
+            actual_min = min(min_questions, actual_max)
+            num_questions = rng.randint(actual_min, actual_max)
+            # Shuffle and take first num_questions (keeping order for conversational context)
+            # Note: For QuAC we keep order since questions are conversational
+            questions_raw = questions_raw[:num_questions]
 
         questions = []
         for idx, question_text in enumerate(questions_raw):

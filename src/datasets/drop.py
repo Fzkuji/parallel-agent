@@ -101,9 +101,14 @@ def load_drop_groups(
         passage_text = passage_data["passage"]
         questions_data = passage_data["questions"]
 
-        # Truncate questions if needed
+        # Randomly sample number of questions between min_questions and max_questions
         if max_questions:
-            questions_data = questions_data[:max_questions]
+            actual_max = min(max_questions, len(questions_data))
+            actual_min = min(min_questions, actual_max)
+            num_questions = rng.randint(actual_min, actual_max)
+            # Shuffle questions within passage
+            rng.shuffle(questions_data)
+            questions_data = questions_data[:num_questions]
 
         # Create title from first 50 chars of passage
         title = passage_text[:50].replace("\n", " ").strip() + "..."
