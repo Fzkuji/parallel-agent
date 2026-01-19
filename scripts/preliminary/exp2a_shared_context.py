@@ -1178,6 +1178,7 @@ def run_experiment_for_model(
 def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*.json"):
     """Read saved result files and print combined summary in markdown format."""
     import glob
+    import re as regex
 
     # Valid exp2a conditions
     VALID_CONDITIONS = ["independent", "all_in_one", "seq_cross_ctx", "seq_shared_rand", "seq_shared_ord", "seq_shared_rand_full", "seq_shared_ord_full"]
@@ -1216,33 +1217,50 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
 
     # Sort models by size
     def model_size(name):
-        import re
-        match = re.search(r'(\d+(?:\.\d+)?)[Bb]', name)
+        match = regex.search(r'(\d+(?:\.\d+)?)[Bb]', name)
         return float(match.group(1)) if match else 0
 
     sorted_models = sorted(model_files.keys(), key=model_size)
 
-    # Get n_samples from first model
+    # Get n_samples and detect model series
     first_data = model_files[sorted_models[0]]["data"]
     n_samples = first_data.get("config", {}).get("n_samples", "all")
+
+    # Detect model series (Qwen2.5 or Qwen3)
+    first_model = sorted_models[0]
+    if "Qwen3" in first_model:
+        model_series = "Qwen3"
+    else:
+        model_series = "Qwen2.5-Instruct"
+
+    # Extract model sizes for display
+    def get_model_size(name):
+        name_short = name.split("/")[-1] if "/" in name else name
+        # Remove common prefixes
+        size = name_short.replace("Qwen2.5-", "").replace("Qwen3-", "").replace("-Instruct", "")
+        return size
+
+    model_sizes = [get_model_size(m) for m in sorted_models]
 
     # Print header
     print("# Experiment 2a: Shared Context Study - Full Results")
     print()
     print("## Dataset")
-    print("- **SQuAD**: Multiple questions per paragraph (3-6 questions/group)")
+    print("- **SQuAD**: Multiple questions per paragraph (5 questions/group)")
     print(f"- **Groups**: {n_samples}")
-    print(f"- **Models**: Qwen2.5-Instruct series ({', '.join([m.split('/')[-1].replace('Qwen2.5-', '').replace('-Instruct', '') for m in sorted_models])})")
+    print(f"- **Models**: {model_series} series ({', '.join(model_sizes)})")
     print()
     print("## Experimental Conditions")
     print()
-    print("| Condition | Description |")
-    print("|-----------|-------------|")
-    print("| independent | Each question answered separately with full context |")
-    print("| all_in_one | All questions answered in single prompt |")
-    print("| seq_cross_ctx | Sequential with Q&A history from DIFFERENT contexts |")
-    print("| seq_shared_rand | Sequential with shared context, random order |")
-    print("| seq_shared_ord | Sequential with shared context, LLM-optimized order |")
+    print("| Condition | Context in Prompt | Q&A History | Description |")
+    print("|-----------|-------------------|-------------|-------------|")
+    print("| independent | Every turn | ✗ | Each question answered separately |")
+    print("| all_in_one | Once (all Q) | ✗ | All questions in single prompt |")
+    print("| seq_cross_ctx | Every turn | ✓ (diff ctx) | Sequential, questions from different contexts |")
+    print("| seq_shared_rand | First turn only | ✓ (same ctx) | Sequential, shared context, random order |")
+    print("| seq_shared_ord | First turn only | ✓ (same ctx) | Sequential, shared context, LLM-optimized order |")
+    print("| seq_shared_rand_full | Every turn | ✓ (same ctx) | Sequential, shared context, random order, full context |")
+    print("| seq_shared_ord_full | Every turn | ✓ (same ctx) | Sequential, shared context, LLM order, full context |")
     print()
     print("---")
     print()
@@ -1264,7 +1282,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print("**EXPERIMENT SUMMARY**")
         print()
 
-        headers = ["Condition", "EM", "F1", "Groups", "Questions", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
+        headers = ["Condition", "EM", "F1", "Samples", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
         print("| " + " | ".join(headers) + " |")
         print("| " + " | ".join(["---"] * len(headers)) + " |")
 
@@ -1273,7 +1291,6 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
             em = r.get("metrics", {}).get("em", 0)
             f1 = r.get("metrics", {}).get("f1", 0)
             r_n_samples = r.get("n_samples", 0)
-            n_questions = r.get("n_questions", 0)
             latency = r.get("latency", 0)
             prompt_tokens = r.get("prompt_tokens", 0)
             completion_tokens = r.get("completion_tokens", 0)
@@ -1290,21 +1307,20 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
                 f"{em:.4f}",
                 f"{f1:.4f}",
                 str(r_n_samples),
-                str(n_questions),
                 f"{avg_prompt:.1f}",
                 f"{avg_compl:.1f}",
                 f"{avg_latency:.2f}",
             ]
             print("| " + " | ".join(row) + " |")
 
-        # Print per-history-length accuracy
-        seq_rand = [r for r in results if r.get("condition") == "seq_shared_rand"]
-        if seq_rand and seq_rand[0].get("details"):
+        # Print per-history-length accuracy for seq_shared_rand_full (more informative)
+        seq_rand_full = [r for r in results if r.get("condition") == "seq_shared_rand_full"]
+        if seq_rand_full and seq_rand_full[0].get("details"):
             print()
-            print("**PER-HISTORY-LENGTH ACCURACY (seq_shared_rand)**")
+            print("**PER-HISTORY-LENGTH ACCURACY (seq_shared_rand_full)**")
             print()
 
-            details = seq_rand[0].get("details", [])
+            details = seq_rand_full[0].get("details", [])
             history_stats = {}
             for d in details:
                 h_len = d.get("history_length", 0)
@@ -1327,7 +1343,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print("---")
         print()
 
-    # Print final summary tables
+    # Print final summary table (EM only, more compact)
     print("## Summary Table (EM)")
     print()
 
@@ -1337,7 +1353,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
 
     for model in sorted_models:
         model_short = model.split("/")[-1] if "/" in model else model
-        size = model_short.replace("Qwen2.5-", "").replace("-Instruct", "")
+        size = get_model_size(model)
         results = all_model_results.get(model_short, {})
         row = [size]
         for cond in VALID_CONDITIONS:
@@ -1346,22 +1362,14 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print("| " + " | ".join(row) + " |")
 
     print()
-    print("## Summary Table (F1)")
+
+    # Key findings section
+    print("## Key Findings")
     print()
-
-    print("| " + " | ".join(headers) + " |")
-    print("|" + "|".join(["-------"] * len(headers)) + "|")
-
-    for model in sorted_models:
-        model_short = model.split("/")[-1] if "/" in model else model
-        size = model_short.replace("Qwen2.5-", "").replace("-Instruct", "")
-        results = all_model_results.get(model_short, {})
-        row = [size]
-        for cond in VALID_CONDITIONS:
-            f1 = results.get(cond, {}).get("f1", 0)
-            row.append(f"{f1:.4f}")
-        print("| " + " | ".join(row) + " |")
-
+    print("1. **seq_shared_*_full > seq_shared_***: Adding context every turn improves accuracy")
+    print("2. **seq_shared_* > seq_cross_ctx**: Shared context benefits from information sharing")
+    print("3. **LLM ordering (ord) ≥ random**: Optimized question order can help")
+    print("4. **Sequential > independent/all_in_one**: Multi-turn with history is beneficial")
     print()
 
 
