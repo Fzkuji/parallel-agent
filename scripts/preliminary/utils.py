@@ -51,9 +51,17 @@ class ExperimentResult:
     accuracy: float
     metrics: Dict[str, float] = field(default_factory=dict)
     latency: float = 0.0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
+    prompt_tokens: int = 0  # Legacy: sum of all API prompt_tokens (may double-count)
+    completion_tokens: int = 0  # Legacy: sum of all API completion_tokens
+    # New fields for accurate token counting (considering KV cache)
+    unique_prompt_tokens: int = 0  # Context + all questions (no redundancy)
+    total_completion_tokens: int = 0  # Sum of all generated answer tokens
     details: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def sequence_length(self) -> int:
+        """Total sequence length = unique_prompt + completion (actual cost with cache)."""
+        return self.unique_prompt_tokens + self.total_completion_tokens
 
 
 @dataclass
@@ -749,8 +757,14 @@ def print_summary(results: List[ExperimentResult]) -> None:
         print("No results to display.")
         return
 
+    # Check if we have sequence_length data
+    has_seq_length = any(r.sequence_length > 0 for r in results)
+
     # Build header (show per-sample averages for tokens and latency)
-    headers = ["Condition", "EM", "F1", "Samples", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
+    if has_seq_length:
+        headers = ["Condition", "EM", "F1", "Samples", "Avg SeqLen", "Avg Compl", "Avg Latency (s)"]
+    else:
+        headers = ["Condition", "EM", "F1", "Samples", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
 
     # Print markdown table header
     print("| " + " | ".join(headers) + " |")
@@ -761,18 +775,32 @@ def print_summary(results: List[ExperimentResult]) -> None:
         em = result.metrics.get("em", 0)
         f1 = result.metrics.get("f1", 0)
         n = result.n_samples if result.n_samples > 0 else 1
-        avg_prompt = result.prompt_tokens / n
-        avg_compl = result.completion_tokens / n
         avg_latency = result.latency / n
-        row = [
-            result.condition,
-            f"{em:.4f}",
-            f"{f1:.4f}",
-            str(result.n_samples),
-            f"{avg_prompt:.1f}",
-            f"{avg_compl:.1f}",
-            f"{avg_latency:.2f}" if result.latency > 0 else "-",
-        ]
+
+        if has_seq_length and result.sequence_length > 0:
+            avg_seq_len = result.sequence_length / n
+            avg_compl = result.total_completion_tokens / n
+            row = [
+                result.condition,
+                f"{em:.4f}",
+                f"{f1:.4f}",
+                str(result.n_samples),
+                f"{avg_seq_len:.1f}",
+                f"{avg_compl:.1f}",
+                f"{avg_latency:.2f}" if result.latency > 0 else "-",
+            ]
+        else:
+            avg_prompt = result.prompt_tokens / n
+            avg_compl = result.completion_tokens / n
+            row = [
+                result.condition,
+                f"{em:.4f}",
+                f"{f1:.4f}",
+                str(result.n_samples),
+                f"{avg_prompt:.1f}",
+                f"{avg_compl:.1f}",
+                f"{avg_latency:.2f}" if result.latency > 0 else "-",
+            ]
         print("| " + " | ".join(row) + " |")
 
     # Print comparison

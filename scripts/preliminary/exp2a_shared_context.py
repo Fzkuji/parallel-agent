@@ -129,6 +129,9 @@ def run_independent(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # New: accurate token counting
+    unique_prompt_tokens = 0  # For independent: sum of all (context + question) since no cache reuse
+    sum_completion_tokens = 0  # Sum of all generated answers
 
     for group in tqdm(groups, desc="Independent"):
         context = group["context"]
@@ -147,6 +150,9 @@ Question: {question}"""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            # Independent: each request is separate, so we count all prompt tokens
+            unique_prompt_tokens += response.prompt_tokens
+            sum_completion_tokens += response.completion_tokens
 
             pred = _extract_answer(pred_raw)
             is_correct = compute_exact_match(pred, gold_answer) > 0
@@ -178,6 +184,8 @@ Question: {question}"""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -196,6 +204,9 @@ def run_all_in_one(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # New: accurate token counting
+    unique_prompt_tokens = 0  # For all_in_one: context + all questions in one request
+    sum_completion_tokens = 0  # All answers in one response
 
     for group in tqdm(groups, desc="All-in-One"):
         context = group["context"]
@@ -214,6 +225,9 @@ Questions:
         total_latency += response.latency
         total_prompt_tokens += response.prompt_tokens
         total_completion_tokens += response.completion_tokens
+        # All-in-one: single request per group, prompt = context + all questions
+        unique_prompt_tokens += response.prompt_tokens
+        sum_completion_tokens += response.completion_tokens
 
         # Parse answers
         answers = _parse_batch_answers(pred, len(questions))
@@ -253,6 +267,8 @@ Questions:
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -278,6 +294,12 @@ def run_seq_shared_rand(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # Accurate token counting:
+    # sequence_length = last_turn_prompt + last_turn_completion (per group, then sum)
+    # completion = sum of all completion_tokens
+    # unique_prompt = sequence_length - completion
+    total_sequence_length = 0  # Sum of (last_prompt + last_completion) for each group
+    sum_completion_tokens = 0  # Sum of all generated answers
 
     for group in tqdm(groups, desc="Seq.(Shared,Rand)"):
         context = group["context"]
@@ -288,6 +310,9 @@ def run_seq_shared_rand(
 
         # Initialize messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
 
         for i, q_item in enumerate(questions):
             question = q_item["question"]
@@ -310,6 +335,11 @@ Question: {question}"""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            sum_completion_tokens += response.completion_tokens
+
+            # Track last turn's tokens
+            last_prompt_tokens = response.prompt_tokens
+            last_completion_tokens = response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
@@ -333,8 +363,14 @@ Question: {question}"""
                 "history_length": i,  # Number of previous QA pairs
             })
 
+        # After processing all questions in this group, add to sequence_length
+        total_sequence_length += last_prompt_tokens + last_completion_tokens
+
     em = total_correct / total_questions if total_questions > 0 else 0
     f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    # unique_prompt = sequence_length - completion
+    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition="seq_shared_rand",
@@ -346,6 +382,8 @@ Question: {question}"""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -373,12 +411,19 @@ def run_seq_shared_ord(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # Accurate token counting:
+    # sequence_length = last_turn_prompt + last_turn_completion (per group, then sum)
+    # completion = sum of all completion_tokens
+    # unique_prompt = sequence_length - completion
+    # Note: ordering request is separate, adds to sequence_length directly
+    total_sequence_length = 0  # Sum of (last_prompt + last_completion) for each group + ordering
+    sum_completion_tokens = 0  # Sum of all generated answers (including ordering response)
 
     for group in tqdm(groups, desc="Seq.(Shared,Ord)"):
         context = group["context"]
         questions = group["questions"]
 
-        # Step 1: Ask LLM to determine optimal order
+        # Step 1: Ask LLM to determine optimal order (separate single-turn request)
         q_list = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(questions)])
 
         ordering_prompt = f"""Given the following passage and questions, determine the optimal order to answer them.
@@ -397,6 +442,9 @@ Optimal order:"""
         total_latency += order_meta.latency
         total_prompt_tokens += order_meta.prompt_tokens
         total_completion_tokens += order_meta.completion_tokens
+        # Ordering is a separate single-turn request: sequence_length = prompt + completion
+        total_sequence_length += order_meta.prompt_tokens + order_meta.completion_tokens
+        sum_completion_tokens += order_meta.completion_tokens
 
         # Parse order
         ordered_indices = _parse_order(order_response, len(questions))
@@ -405,6 +453,9 @@ Optimal order:"""
         # Step 2: Answer questions in determined order using multi-turn chat format
         # Initialize messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
 
         for i, q_item in enumerate(ordered_questions):
             question = q_item["question"]
@@ -427,6 +478,11 @@ Question: {question}"""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            sum_completion_tokens += response.completion_tokens
+
+            # Track last turn's tokens
+            last_prompt_tokens = response.prompt_tokens
+            last_completion_tokens = response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
@@ -451,8 +507,14 @@ Question: {question}"""
                 "llm_order": ordered_indices,
             })
 
+        # After processing all questions in this group, add to sequence_length
+        total_sequence_length += last_prompt_tokens + last_completion_tokens
+
     em = total_correct / total_questions if total_questions > 0 else 0
     f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    # unique_prompt = sequence_length - completion
+    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition="seq_shared_ord",
@@ -464,6 +526,8 @@ Question: {question}"""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -489,6 +553,12 @@ def run_seq_shared_rand_full(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # Accurate token counting:
+    # sequence_length = last_turn_prompt + last_turn_completion (per group, then sum)
+    # completion = sum of all completion_tokens
+    # unique_prompt = sequence_length - completion
+    total_sequence_length = 0  # Sum of (last_prompt + last_completion) for each group
+    sum_completion_tokens = 0  # Sum of all generated answers
 
     for group in tqdm(groups, desc="Seq.(Shared,Rand,Full)"):
         context = group["context"]
@@ -499,6 +569,9 @@ def run_seq_shared_rand_full(
 
         # Initialize messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
 
         for i, q_item in enumerate(questions):
             question = q_item["question"]
@@ -518,6 +591,11 @@ Question: {question}"""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            sum_completion_tokens += response.completion_tokens
+
+            # Track last turn's tokens
+            last_prompt_tokens = response.prompt_tokens
+            last_completion_tokens = response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
@@ -541,8 +619,14 @@ Question: {question}"""
                 "history_length": i,  # Number of previous QA pairs
             })
 
+        # After processing all questions in this group, add to sequence_length
+        total_sequence_length += last_prompt_tokens + last_completion_tokens
+
     em = total_correct / total_questions if total_questions > 0 else 0
     f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    # unique_prompt = sequence_length - completion
+    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition="seq_shared_rand_full",
@@ -554,6 +638,8 @@ Question: {question}"""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -581,12 +667,19 @@ def run_seq_shared_ord_full(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # Accurate token counting:
+    # sequence_length = last_turn_prompt + last_turn_completion (per group, then sum)
+    # completion = sum of all completion_tokens
+    # unique_prompt = sequence_length - completion
+    # Note: ordering request is separate, adds to sequence_length directly
+    total_sequence_length = 0  # Sum of (last_prompt + last_completion) for each group + ordering
+    sum_completion_tokens = 0  # Sum of all generated answers (including ordering response)
 
     for group in tqdm(groups, desc="Seq.(Shared,Ord,Full)"):
         context = group["context"]
         questions = group["questions"]
 
-        # Step 1: Ask LLM to determine optimal order
+        # Step 1: Ask LLM to determine optimal order (separate single-turn request)
         q_list = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(questions)])
 
         ordering_prompt = f"""Given the following passage and questions, determine the optimal order to answer them.
@@ -605,6 +698,9 @@ Optimal order:"""
         total_latency += order_meta.latency
         total_prompt_tokens += order_meta.prompt_tokens
         total_completion_tokens += order_meta.completion_tokens
+        # Ordering is a separate single-turn request: sequence_length = prompt + completion
+        total_sequence_length += order_meta.prompt_tokens + order_meta.completion_tokens
+        sum_completion_tokens += order_meta.completion_tokens
 
         # Parse order
         ordered_indices = _parse_order(order_response, len(questions))
@@ -613,6 +709,9 @@ Optimal order:"""
         # Step 2: Answer questions in determined order using multi-turn chat format
         # Initialize messages with system prompt
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
 
         for i, q_item in enumerate(ordered_questions):
             question = q_item["question"]
@@ -632,6 +731,11 @@ Question: {question}"""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            sum_completion_tokens += response.completion_tokens
+
+            # Track last turn's tokens
+            last_prompt_tokens = response.prompt_tokens
+            last_completion_tokens = response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
@@ -656,8 +760,14 @@ Question: {question}"""
                 "llm_order": ordered_indices,
             })
 
+        # After processing all questions in this group, add to sequence_length
+        total_sequence_length += last_prompt_tokens + last_completion_tokens
+
     em = total_correct / total_questions if total_questions > 0 else 0
     f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    # unique_prompt = sequence_length - completion
+    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition="seq_shared_ord_full",
@@ -669,6 +779,8 @@ Question: {question}"""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -698,6 +810,13 @@ def run_seq_cross_ctx(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    # Accurate token counting:
+    # sequence_length = last_turn_prompt + last_turn_completion (per batch, then sum)
+    # completion = sum of all completion_tokens
+    # unique_prompt = sequence_length - completion
+    # Note: Cross-ctx has DIFFERENT contexts per question, so less cache benefit
+    total_sequence_length = 0  # Sum of (last_prompt + last_completion) for each batch
+    sum_completion_tokens = 0  # Sum of all generated answers
 
     # Get the fixed group size (all groups should have the same size)
     group_size = groups[0]["n_questions"] if groups else 5
@@ -727,6 +846,9 @@ def run_seq_cross_ctx(
         # Initialize messages for this batch
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
+
         for i, qa_pair in enumerate(batch_pairs):
             context = qa_pair["context"]
             question = qa_pair["question"]
@@ -746,6 +868,11 @@ Question: {question}"""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
+            sum_completion_tokens += response.completion_tokens
+
+            # Track last turn's tokens
+            last_prompt_tokens = response.prompt_tokens
+            last_completion_tokens = response.completion_tokens
 
             pred = _extract_answer(pred_raw)
 
@@ -770,8 +897,14 @@ Question: {question}"""
                 "batch": batch_idx,
             })
 
+        # After processing all questions in this batch, add to sequence_length
+        total_sequence_length += last_prompt_tokens + last_completion_tokens
+
     em = total_correct / total_questions if total_questions > 0 else 0
     f1 = total_f1 / total_questions if total_questions > 0 else 0
+
+    # unique_prompt = sequence_length - completion
+    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition="seq_cross_ctx",
@@ -783,6 +916,8 @@ Question: {question}"""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=unique_prompt_tokens,
+        total_completion_tokens=sum_completion_tokens,
         details=details,
     )
 
@@ -908,6 +1043,8 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    total_unique_prompt_tokens = 0
+    total_sum_completion_tokens = 0
     all_details = []
 
     for r in results:
@@ -917,6 +1054,8 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         total_latency += r.latency
         total_prompt_tokens += r.prompt_tokens
         total_completion_tokens += r.completion_tokens
+        total_unique_prompt_tokens += r.unique_prompt_tokens
+        total_sum_completion_tokens += r.total_completion_tokens
         all_details.extend(r.details)
 
     em = total_correct / total_questions if total_questions > 0 else 0
@@ -932,6 +1071,8 @@ def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=total_unique_prompt_tokens,
+        total_completion_tokens=total_sum_completion_tokens,
         details=all_details,
     )
 
@@ -1025,6 +1166,8 @@ def worker_process(
             "latency": r.latency,
             "prompt_tokens": r.prompt_tokens,
             "completion_tokens": r.completion_tokens,
+            "unique_prompt_tokens": r.unique_prompt_tokens,
+            "total_completion_tokens": r.total_completion_tokens,
             "details": r.details,
         })
 
@@ -1113,6 +1256,8 @@ def run_experiment_for_model(
                         latency=r["latency"],
                         prompt_tokens=r["prompt_tokens"],
                         completion_tokens=r["completion_tokens"],
+                        unique_prompt_tokens=r.get("unique_prompt_tokens", 0),
+                        total_completion_tokens=r.get("total_completion_tokens", 0),
                         details=r["details"],
                     ))
                 os.remove(temp_file)
@@ -1282,7 +1427,13 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
         print("**EXPERIMENT SUMMARY**")
         print()
 
-        headers = ["Condition", "EM", "F1", "Samples", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
+        # Check if we have sequence_length data (new accurate token counting)
+        has_seq_length = any(r.get("unique_prompt_tokens", 0) > 0 for r in results)
+
+        if has_seq_length:
+            headers = ["Condition", "EM", "F1", "Samples", "Avg SeqLen", "Avg Compl", "Avg Latency (s)"]
+        else:
+            headers = ["Condition", "EM", "F1", "Samples", "Avg Prompt", "Avg Compl", "Avg Latency (s)"]
         print("| " + " | ".join(headers) + " |")
         print("| " + " | ".join(["---"] * len(headers)) + " |")
 
@@ -1292,25 +1443,43 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
             f1 = r.get("metrics", {}).get("f1", 0)
             r_n_samples = r.get("n_samples", 0)
             latency = r.get("latency", 0)
-            prompt_tokens = r.get("prompt_tokens", 0)
-            completion_tokens = r.get("completion_tokens", 0)
 
             n = r_n_samples if r_n_samples > 0 else 1
-            avg_prompt = prompt_tokens / n
-            avg_compl = completion_tokens / n
             avg_latency = latency / n
 
             all_model_results[model_short][condition] = {"em": em, "f1": f1}
 
-            row = [
-                condition,
-                f"{em:.4f}",
-                f"{f1:.4f}",
-                str(r_n_samples),
-                f"{avg_prompt:.1f}",
-                f"{avg_compl:.1f}",
-                f"{avg_latency:.2f}",
-            ]
+            if has_seq_length and r.get("unique_prompt_tokens", 0) > 0:
+                # Use new accurate token counting: sequence_length = unique_prompt + completion
+                unique_prompt = r.get("unique_prompt_tokens", 0)
+                total_compl = r.get("total_completion_tokens", 0)
+                seq_length = unique_prompt + total_compl
+                avg_seq_len = seq_length / n
+                avg_compl = total_compl / n
+                row = [
+                    condition,
+                    f"{em:.4f}",
+                    f"{f1:.4f}",
+                    str(r_n_samples),
+                    f"{avg_seq_len:.1f}",
+                    f"{avg_compl:.1f}",
+                    f"{avg_latency:.2f}",
+                ]
+            else:
+                # Fallback to legacy token counting
+                prompt_tokens = r.get("prompt_tokens", 0)
+                completion_tokens = r.get("completion_tokens", 0)
+                avg_prompt = prompt_tokens / n
+                avg_compl = completion_tokens / n
+                row = [
+                    condition,
+                    f"{em:.4f}",
+                    f"{f1:.4f}",
+                    str(r_n_samples),
+                    f"{avg_prompt:.1f}",
+                    f"{avg_compl:.1f}",
+                    f"{avg_latency:.2f}",
+                ]
             print("| " + " | ".join(row) + " |")
 
         # Print per-history-length accuracy for seq_shared_rand_full (more informative)
@@ -1431,6 +1600,8 @@ def load_results_from_file(filepath: str) -> List[ExperimentResult]:
             latency=r["latency"],
             prompt_tokens=r["prompt_tokens"],
             completion_tokens=r["completion_tokens"],
+            unique_prompt_tokens=r.get("unique_prompt_tokens", 0),
+            total_completion_tokens=r.get("total_completion_tokens", 0),
             details=r.get("details", []),
         ))
     return results
