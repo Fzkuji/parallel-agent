@@ -1373,6 +1373,69 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
     print()
 
 
+def check_existing_results(
+    model: str,
+    n_groups: int,
+    conditions: List[str],
+    output_dir: str,
+) -> Optional[str]:
+    """Check if results already exist for given model and conditions.
+
+    Returns:
+        Path to existing result file if found with all requested conditions, None otherwise.
+    """
+    import glob
+
+    # Build expected filename pattern
+    model_name = model.replace("/", "_").replace("\\", "_")
+    n_samples_str = "all" if n_groups == -1 else str(n_groups)
+    filename = f"exp2a_shared_context_{model_name}_n{n_samples_str}.json"
+    filepath = os.path.join(output_dir, filename)
+
+    if not os.path.exists(filepath):
+        return None
+
+    # Check if the file has all requested conditions
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        existing_conditions = set(r.get("condition", "") for r in data.get("results", []))
+        requested_conditions = set(conditions)
+
+        if requested_conditions.issubset(existing_conditions):
+            return filepath
+        else:
+            missing = requested_conditions - existing_conditions
+            logger.info(f"Existing results missing conditions: {missing}")
+            return None
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.warning(f"Error reading existing results: {e}")
+        return None
+
+
+def load_results_from_file(filepath: str) -> List[ExperimentResult]:
+    """Load experiment results from a JSON file."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    results = []
+    for r in data.get("results", []):
+        results.append(ExperimentResult(
+            condition=r["condition"],
+            dataset=r["dataset"],
+            n_samples=r["n_samples"],
+            n_questions=r["n_questions"],
+            accuracy=r["accuracy"],
+            metrics=r["metrics"],
+            latency=r["latency"],
+            prompt_tokens=r["prompt_tokens"],
+            completion_tokens=r["completion_tokens"],
+            details=r.get("details", []),
+        ))
+    return results
+
+
 def main():
     import torch
 
@@ -1423,6 +1486,10 @@ def main():
         "--enable-thinking", action="store_true",
         help="Enable thinking mode for Qwen3 models (default: disabled for faster inference)"
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-run experiments even if results already exist"
+    )
     args = parser.parse_args()
 
     # If --summarize, just read saved files and print summary
@@ -1442,18 +1509,53 @@ def main():
         num_gpus = 0
         logger.info("Using CPU or API mode")
 
-    # Load data (only once, shared across models)
-    all_groups = load_squad_groups(
-        n_groups=args.n_groups,
-        n_questions=args.n_questions,
-        seed=args.seed,
-    )
+    # Check which models need to be run
+    models_to_run = []
+    models_with_results = []
 
-    logger.info(f"Loaded {len(all_groups)} groups")
-
-    # Run for each model and collect results
-    all_model_results = {}
     for model in models:
+        if args.force:
+            models_to_run.append(model)
+        else:
+            existing_file = check_existing_results(
+                model=model,
+                n_groups=args.n_groups,
+                conditions=conditions,
+                output_dir=args.output_dir,
+            )
+            if existing_file:
+                logger.info(f"Found existing results for {model}: {existing_file}")
+                models_with_results.append((model, existing_file))
+            else:
+                models_to_run.append(model)
+
+    # Load data only if we need to run experiments
+    all_groups = None
+    if models_to_run:
+        all_groups = load_squad_groups(
+            n_groups=args.n_groups,
+            n_questions=args.n_questions,
+            seed=args.seed,
+        )
+        logger.info(f"Loaded {len(all_groups)} groups")
+
+    # Run experiments for models that need it
+    all_model_results = {}
+
+    # First, load existing results
+    for model, filepath in models_with_results:
+        logger.info(f"Loading existing results for {model}")
+        results = load_results_from_file(filepath)
+        # Filter to only requested conditions
+        results = [r for r in results if r.condition in conditions]
+        all_model_results[model] = results
+        print(f"\n{'='*60}")
+        print(f"Loaded existing results for: {model}")
+        print(f"{'='*60}\n")
+        print_summary(results)
+
+    # Then, run new experiments
+    for model in models_to_run:
         results = run_experiment_for_model(
             model=model,
             all_groups=all_groups,
@@ -1463,26 +1565,11 @@ def main():
         )
         all_model_results[model] = results
 
-    # Print final combined summary if multiple models
-    if len(models) > 1:
-        print("\n" + "=" * 80)
-        print("FINAL SUMMARY - ALL MODELS")
-        print("=" * 80 + "\n")
-
-        # Build combined table
-        headers = ["Model", "Condition", "EM", "F1", "Samples"]
-        print("| " + " | ".join(headers) + " |")
-        print("| " + " | ".join(["---"] * len(headers)) + " |")
-
-        for model, results in all_model_results.items():
-            model_short = model.split("/")[-1] if "/" in model else model
-            for r in results:
-                em = r.metrics.get("em", 0)
-                f1 = r.metrics.get("f1", 0)
-                row = [model_short, r.condition, f"{em:.4f}", f"{f1:.4f}", str(r.n_samples)]
-                print("| " + " | ".join(row) + " |")
-
-        print()
+    # Print final combined summary using summarize_from_files
+    print("\n" + "=" * 80)
+    print("FINAL SUMMARY - ALL MODELS")
+    print("=" * 80 + "\n")
+    summarize_from_files(args.output_dir)
 
 
 if __name__ == "__main__":
