@@ -1,25 +1,46 @@
 #!/usr/bin/env python3
-"""Experiment 2b: Related Domain (Semantic - Weak)
+"""Experiment 2b: Related Domain (Semantic Similarity - Weak Association)
 
 Dataset: MATH (7 mathematical domains with labels)
 
-Research Question: Do questions from the same domain benefit from being
-processed together?
+Research Question: Do questions from the same mathematical domain benefit from
+being processed together? This tests "weak" semantic association (same topic)
+vs. exp2a's "strong" association (shared context).
 
 Conditions:
-- Oracle: Group questions by mathematical domain
-- Method: Use encoder embeddings to cluster similar questions
-- Random: Mix questions from different domains randomly
+- Same Domain (Sequential): Questions grouped by domain, processed sequentially
+- Random Domain (Sequential): Questions randomly mixed across domains
+- Independent: Each question answered separately (baseline)
 
-Expected: Oracle >= Method > Random
+Key comparison: Same Domain vs Random Domain at similar sequence lengths.
+If Same Domain > Random Domain, semantic similarity helps even without shared context.
+
+Usage:
+    # Single GPU
+    python scripts/preliminary/exp2b_related_domain.py \
+        --model Qwen/Qwen3-8B \
+        --n-per-domain 20 \
+        --n-questions 5
+
+    # Multi-GPU (data parallel)
+    python scripts/preliminary/exp2b_related_domain.py \
+        --model Qwen/Qwen3-8B \
+        --n-per-domain 50 \
+        --n-gpus 4
 """
 
 from __future__ import annotations
+
+import os
+# Suppress vLLM verbose logging
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 
 import argparse
 import json
 import logging
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,12 +53,9 @@ from utils import (
     ExperimentConfig,
     ExperimentResult,
     LLMClient,
+    compute_exact_match,
     print_summary,
     save_results,
-    setup_distributed,
-    cleanup_distributed,
-    shard_data,
-    gather_results,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -54,23 +72,44 @@ MATH_DOMAINS = [
     "precalculus",
 ]
 
+# System prompts
+SYSTEM_PROMPT = """You are a helpful math tutor. Solve the problem step by step and give your final answer in \\boxed{}.
+Be concise but show key steps."""
+
+SYSTEM_PROMPT_MULTI = """You are a helpful math tutor. Solve each problem step by step.
+Format your response as:
+Problem 1: [solution] \\boxed{answer1}
+Problem 2: [solution] \\boxed{answer2}
+..."""
+
 
 def load_math_by_domain(
     n_per_domain: int = -1,
     seed: int = 42,
+    split: str = "test",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, List[int]]]:
     """Load MATH dataset grouped by domain.
+
+    Args:
+        n_per_domain: Number of questions to sample per domain (-1 for all)
+        seed: Random seed
+        split: Dataset split to use
 
     Returns:
         Tuple of (all_questions, domain_to_indices)
     """
-    logger.info("Loading MATH dataset...")
+    logger.info(f"Loading MATH dataset (split={split})...")
 
     # Load each domain separately
     domain_questions = defaultdict(list)
     for domain in MATH_DOMAINS:
         try:
-            dataset = load_dataset("EleutherAI/hendrycks_math", domain, split="test", trust_remote_code=True)
+            dataset = load_dataset(
+                "EleutherAI/hendrycks_math",
+                domain,
+                split=split,
+                trust_remote_code=True
+            )
             for item in dataset:
                 domain_questions[domain].append({
                     "problem": item["problem"],
@@ -101,31 +140,78 @@ def load_math_by_domain(
     for domain, indices in domain_to_indices.items():
         logger.info(f"  {domain}: {len(indices)} questions")
 
-    return all_questions, domain_to_indices
+    return all_questions, dict(domain_to_indices)
 
 
-def extract_answer(solution: str) -> str:
-    """Extract final answer from MATH solution (usually in \\boxed{})."""
-    import re
+def extract_boxed_answer(text: str) -> str:
+    """Extract answer from \\boxed{...} format."""
+    # Find all \boxed{...} patterns (handle nested braces)
+    matches = re.findall(r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}', text)
+    if matches:
+        return matches[-1].strip()  # Return last match (usually the final answer)
 
-    # Find \boxed{...}
-    match = re.search(r"\\boxed\{([^}]+)\}", solution)
+    # Fallback: look for "answer is" patterns
+    match = re.search(r'(?:answer|result)\s*(?:is|=)\s*[:\s]*([^\n.,]+)', text, re.IGNORECASE)
     if match:
-        return match.group(1)
+        return match.group(1).strip()
 
-    # Fallback: last line or number
-    lines = solution.strip().split("\n")
-    return lines[-1] if lines else ""
+    # Last fallback: return last line
+    lines = text.strip().split('\n')
+    return lines[-1].strip() if lines else ""
 
 
-def run_oracle(
+def normalize_answer(answer: str) -> str:
+    """Normalize math answer for comparison."""
+    # Remove common LaTeX formatting
+    answer = answer.strip()
+    answer = re.sub(r'\\text\{([^}]*)\}', r'\1', answer)
+    answer = re.sub(r'\\mathrm\{([^}]*)\}', r'\1', answer)
+    answer = re.sub(r'\\mathbf\{([^}]*)\}', r'\1', answer)
+    answer = re.sub(r'\$', '', answer)
+    answer = re.sub(r'\\,', '', answer)
+    answer = re.sub(r'\s+', ' ', answer).strip()
+    return answer.lower()
+
+
+def compare_math_answers(pred: str, gold: str) -> bool:
+    """Compare predicted and gold math answers."""
+    pred_norm = normalize_answer(pred)
+    gold_norm = normalize_answer(gold)
+
+    # Exact match after normalization
+    if pred_norm == gold_norm:
+        return True
+
+    # Try numeric comparison
+    try:
+        # Extract numbers
+        pred_nums = re.findall(r'-?\d+\.?\d*', pred_norm)
+        gold_nums = re.findall(r'-?\d+\.?\d*', gold_norm)
+
+        if pred_nums and gold_nums:
+            pred_val = float(pred_nums[-1])
+            gold_val = float(gold_nums[-1])
+            if abs(pred_val - gold_val) < 1e-6:
+                return True
+            # Also check relative error for larger numbers
+            if gold_val != 0 and abs((pred_val - gold_val) / gold_val) < 1e-4:
+                return True
+    except (ValueError, IndexError):
+        pass
+
+    # Check if gold is contained in pred (for symbolic answers)
+    if gold_norm in pred_norm:
+        return True
+
+    return False
+
+
+def run_independent(
     questions: List[Dict[str, Any]],
-    domain_to_indices: Dict[str, List[int]],
     client: LLMClient,
-    batch_size: int = 4,
 ) -> ExperimentResult:
-    """Oracle condition: Group questions by domain."""
-    logger.info("Running Oracle condition (domain grouping)...")
+    """Independent: Each question answered separately."""
+    logger.info("Running Independent condition...")
 
     total_correct = 0
     total_questions = 0
@@ -134,153 +220,180 @@ def run_oracle(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    for domain, indices in tqdm(domain_to_indices.items(), desc="Oracle (domains)"):
-        # Process in batches within domain
-        for i in range(0, len(indices), batch_size):
-            batch_indices = indices[i:i + batch_size]
+    for q in tqdm(questions, desc="Independent"):
+        problem = q["problem"]
+        gold_solution = q["solution"]
+        gold_answer = extract_boxed_answer(gold_solution)
 
-            for idx in batch_indices:
-                q = questions[idx]
-                problem = q["problem"]
-                gold_answer = extract_answer(q["solution"])
-
-                prompt = f"""Solve this math problem. Show your work and give the final answer.
-
-Problem:
+        prompt = f"""Problem:
 {problem}
 
-Solution:"""
+Solve step by step and give your final answer in \\boxed{{}}."""
 
-                pred, response = client.generate(prompt, max_tokens=512)
+        pred_raw, response = client.generate(prompt, max_tokens=512, system_prompt=SYSTEM_PROMPT)
+        total_latency += response.latency
+        total_prompt_tokens += response.prompt_tokens
+        total_completion_tokens += response.completion_tokens
+
+        pred_answer = extract_boxed_answer(pred_raw)
+        is_correct = compare_math_answers(pred_answer, gold_answer)
+        total_correct += int(is_correct)
+        total_questions += 1
+
+        details.append({
+            "domain": q["domain"],
+            "level": q["level"],
+            "problem": problem[:100] + "...",
+            "gold_answer": gold_answer,
+            "pred_answer": pred_answer,
+            "correct": is_correct,
+        })
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition="independent",
+        dataset="math",
+        n_samples=len(questions),
+        n_questions=total_questions,
+        accuracy=accuracy,
+        metrics={"accuracy": accuracy, "em": accuracy},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        details=details,
+    )
+
+
+def run_sequential_same_domain(
+    questions: List[Dict[str, Any]],
+    domain_to_indices: Dict[str, List[int]],
+    client: LLMClient,
+    n_questions: int = 5,
+    include_context: bool = True,
+) -> ExperimentResult:
+    """Sequential with questions grouped by domain.
+
+    Args:
+        questions: All questions
+        domain_to_indices: Mapping from domain to question indices
+        client: LLM client
+        n_questions: Number of questions per group
+        include_context: If True, include previous Q&A in context (sequential with history)
+    """
+    condition = f"seq_same_domain{'_full' if include_context else ''}"
+    logger.info(f"Running {condition} condition (n_questions={n_questions})...")
+
+    total_correct = 0
+    total_questions = 0
+    details = []
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+
+    # Process each domain
+    for domain, indices in tqdm(domain_to_indices.items(), desc=f"Same Domain"):
+        # Split into groups of n_questions
+        random.shuffle(indices)
+
+        for group_start in range(0, len(indices), n_questions):
+            group_indices = indices[group_start:group_start + n_questions]
+            if len(group_indices) < n_questions:
+                continue  # Skip incomplete groups
+
+            conversation_history = []
+
+            for turn_idx, q_idx in enumerate(group_indices):
+                q = questions[q_idx]
+                problem = q["problem"]
+                gold_solution = q["solution"]
+                gold_answer = extract_boxed_answer(gold_solution)
+
+                # Build prompt
+                if include_context and conversation_history:
+                    # Include previous Q&A
+                    history_text = "\n\n".join([
+                        f"Previous Problem {i+1}:\n{h['problem']}\nAnswer: {h['answer']}"
+                        for i, h in enumerate(conversation_history)
+                    ])
+                    prompt = f"""{history_text}
+
+Current Problem:
+{problem}
+
+Solve step by step and give your final answer in \\boxed{{}}."""
+                else:
+                    prompt = f"""Problem:
+{problem}
+
+Solve step by step and give your final answer in \\boxed{{}}."""
+
+                pred_raw, response = client.generate(prompt, max_tokens=512, system_prompt=SYSTEM_PROMPT)
                 total_latency += response.latency
                 total_prompt_tokens += response.prompt_tokens
                 total_completion_tokens += response.completion_tokens
 
-                # Extract and evaluate answer
-                pred_answer = extract_answer(pred) or pred.strip().split("\n")[-1]
-                is_correct = _compare_math_answers(pred_answer, gold_answer)
+                pred_answer = extract_boxed_answer(pred_raw)
+                is_correct = compare_math_answers(pred_answer, gold_answer)
                 total_correct += int(is_correct)
                 total_questions += 1
 
+                # Add to history
+                conversation_history.append({
+                    "problem": problem,
+                    "answer": pred_answer,
+                })
+
                 details.append({
                     "domain": domain,
+                    "level": q["level"],
+                    "turn": turn_idx,
                     "problem": problem[:100] + "...",
                     "gold_answer": gold_answer,
-                    "prediction": pred_answer,
+                    "pred_answer": pred_answer,
                     "correct": is_correct,
                 })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="oracle",
+        condition=condition,
         dataset="math",
         n_samples=len(questions),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"accuracy": accuracy},
+        metrics={"accuracy": accuracy, "em": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
         details=details,
     )
 
 
-def run_method(
+def run_sequential_random_domain(
     questions: List[Dict[str, Any]],
     client: LLMClient,
-    batch_size: int = 4,
-) -> ExperimentResult:
-    """Method condition: Use encoder embeddings to cluster similar questions."""
-    logger.info("Running Method condition (embedding clustering)...")
-
-    try:
-        from sentence_transformers import SentenceTransformer
-        from sklearn.cluster import KMeans
-    except ImportError:
-        logger.error("Please install sentence-transformers and scikit-learn")
-        raise
-
-    # Encode all questions
-    logger.info("Encoding questions with sentence transformer...")
-    encoder = SentenceTransformer("all-MiniLM-L6-v2")
-    texts = [q["problem"] for q in questions]
-    embeddings = encoder.encode(texts, show_progress_bar=True)
-
-    # Cluster into groups
-    n_clusters = len(questions) // batch_size
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(embeddings)
-
-    # Group by cluster
-    cluster_to_indices = defaultdict(list)
-    for idx, label in enumerate(cluster_labels):
-        cluster_to_indices[label].append(idx)
-
-    total_correct = 0
-    total_questions = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for cluster_id, indices in tqdm(cluster_to_indices.items(), desc="Method (clusters)"):
-        for idx in indices:
-            q = questions[idx]
-            problem = q["problem"]
-            gold_answer = extract_answer(q["solution"])
-
-            prompt = f"""Solve this math problem. Show your work and give the final answer.
-
-Problem:
-{problem}
-
-Solution:"""
-
-            pred, response = client.generate(prompt, max_tokens=512)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            pred_answer = extract_answer(pred) or pred.strip().split("\n")[-1]
-            is_correct = _compare_math_answers(pred_answer, gold_answer)
-            total_correct += int(is_correct)
-            total_questions += 1
-
-            details.append({
-                "cluster": int(cluster_id),
-                "domain": q["domain"],
-                "problem": problem[:100] + "...",
-                "gold_answer": gold_answer,
-                "prediction": pred_answer,
-                "correct": is_correct,
-            })
-
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
-
-    return ExperimentResult(
-        condition="method",
-        dataset="math",
-        n_samples=len(questions),
-        n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"accuracy": accuracy},
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        details=details,
-    )
-
-
-def run_random(
-    questions: List[Dict[str, Any]],
-    client: LLMClient,
-    batch_size: int = 4,
+    n_questions: int = 5,
+    include_context: bool = True,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Random condition: Mix questions from different domains."""
-    logger.info("Running Random condition...")
+    """Sequential with questions randomly mixed across domains.
 
+    Args:
+        questions: All questions
+        client: LLM client
+        n_questions: Number of questions per group
+        include_context: If True, include previous Q&A in context
+        seed: Random seed
+    """
+    condition = f"seq_random_domain{'_full' if include_context else ''}"
+    logger.info(f"Running {condition} condition (n_questions={n_questions})...")
+
+    # Shuffle all questions
     random.seed(seed)
     indices = list(range(len(questions)))
     random.shuffle(indices)
@@ -292,244 +405,403 @@ def run_random(
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
-    # Process in random batches
-    for i in tqdm(range(0, len(indices), batch_size), desc="Random"):
-        batch_indices = indices[i:i + batch_size]
+    # Process in groups
+    for group_start in tqdm(range(0, len(indices), n_questions), desc="Random Domain"):
+        group_indices = indices[group_start:group_start + n_questions]
+        if len(group_indices) < n_questions:
+            continue  # Skip incomplete groups
 
-        for idx in batch_indices:
-            q = questions[idx]
+        conversation_history = []
+
+        for turn_idx, q_idx in enumerate(group_indices):
+            q = questions[q_idx]
             problem = q["problem"]
-            gold_answer = extract_answer(q["solution"])
+            gold_solution = q["solution"]
+            gold_answer = extract_boxed_answer(gold_solution)
 
-            prompt = f"""Solve this math problem. Show your work and give the final answer.
+            # Build prompt
+            if include_context and conversation_history:
+                history_text = "\n\n".join([
+                    f"Previous Problem {i+1}:\n{h['problem']}\nAnswer: {h['answer']}"
+                    for i, h in enumerate(conversation_history)
+                ])
+                prompt = f"""{history_text}
 
-Problem:
+Current Problem:
 {problem}
 
-Solution:"""
+Solve step by step and give your final answer in \\boxed{{}}."""
+            else:
+                prompt = f"""Problem:
+{problem}
 
-            pred, response = client.generate(prompt, max_tokens=512)
+Solve step by step and give your final answer in \\boxed{{}}."""
+
+            pred_raw, response = client.generate(prompt, max_tokens=512, system_prompt=SYSTEM_PROMPT)
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
 
-            pred_answer = extract_answer(pred) or pred.strip().split("\n")[-1]
-            is_correct = _compare_math_answers(pred_answer, gold_answer)
+            pred_answer = extract_boxed_answer(pred_raw)
+            is_correct = compare_math_answers(pred_answer, gold_answer)
             total_correct += int(is_correct)
             total_questions += 1
 
+            conversation_history.append({
+                "problem": problem,
+                "answer": pred_answer,
+            })
+
             details.append({
                 "domain": q["domain"],
+                "level": q["level"],
+                "turn": turn_idx,
                 "problem": problem[:100] + "...",
                 "gold_answer": gold_answer,
-                "prediction": pred_answer,
+                "pred_answer": pred_answer,
                 "correct": is_correct,
             })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition="random",
+        condition=condition,
         dataset="math",
         n_samples=len(questions),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"accuracy": accuracy},
+        metrics={"accuracy": accuracy, "em": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
         details=details,
     )
 
 
-def _compare_math_answers(pred: str, gold: str) -> bool:
-    """Compare math answers (handles numeric and symbolic)."""
-    import re
-
-    # Normalize
-    pred = pred.strip().lower()
-    gold = gold.strip().lower()
-
-    # Exact match
-    if pred == gold:
-        return True
-
-    # Try numeric comparison
-    try:
-        pred_num = float(re.sub(r"[^\d.\-]", "", pred))
-        gold_num = float(re.sub(r"[^\d.\-]", "", gold))
-        if abs(pred_num - gold_num) < 1e-6:
-            return True
-    except (ValueError, TypeError):
-        pass
-
-    # Check containment
-    if gold in pred:
-        return True
-
-    return False
-
-
-def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
-    """Merge results from multiple ranks into one."""
-    if not results:
-        raise ValueError("No results to merge")
-    if len(results) == 1:
-        return results[0]
+def run_all_in_one_same_domain(
+    questions: List[Dict[str, Any]],
+    domain_to_indices: Dict[str, List[int]],
+    client: LLMClient,
+    n_questions: int = 5,
+) -> ExperimentResult:
+    """All-in-One: All questions from same domain in one prompt."""
+    logger.info(f"Running all_in_one_same_domain condition (n_questions={n_questions})...")
 
     total_correct = 0
     total_questions = 0
+    details = []
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
-    all_details = []
 
-    for r in results:
-        total_questions += r.n_questions
-        total_correct += int(r.accuracy * r.n_questions)
-        total_latency += r.latency
-        total_prompt_tokens += r.prompt_tokens
-        total_completion_tokens += r.completion_tokens
-        all_details.extend(r.details)
+    for domain, indices in tqdm(domain_to_indices.items(), desc="All-in-One Same Domain"):
+        random.shuffle(indices)
+
+        for group_start in range(0, len(indices), n_questions):
+            group_indices = indices[group_start:group_start + n_questions]
+            if len(group_indices) < n_questions:
+                continue
+
+            # Build multi-problem prompt
+            problems_text = "\n\n".join([
+                f"Problem {i+1}:\n{questions[idx]['problem']}"
+                for i, idx in enumerate(group_indices)
+            ])
+
+            prompt = f"""{problems_text}
+
+Solve each problem step by step. Give each final answer in \\boxed{{}}.
+Format: Problem 1: ... \\boxed{{answer1}}
+Problem 2: ... \\boxed{{answer2}}
+..."""
+
+            pred_raw, response = client.generate(prompt, max_tokens=2048, system_prompt=SYSTEM_PROMPT_MULTI)
+            total_latency += response.latency
+            total_prompt_tokens += response.prompt_tokens
+            total_completion_tokens += response.completion_tokens
+
+            # Extract answers for each problem
+            # Try to parse "Problem N:" format
+            pred_answers = []
+            for i in range(len(group_indices)):
+                pattern = rf'Problem\s*{i+1}[:\s].*?\\boxed\{{([^}}]+)\}}'
+                match = re.search(pattern, pred_raw, re.IGNORECASE | re.DOTALL)
+                if match:
+                    pred_answers.append(match.group(1).strip())
+                else:
+                    # Fallback: find all boxed answers
+                    all_boxed = re.findall(r'\\boxed\{([^}]+)\}', pred_raw)
+                    if i < len(all_boxed):
+                        pred_answers.append(all_boxed[i])
+                    else:
+                        pred_answers.append("")
+
+            # Evaluate each question
+            for i, q_idx in enumerate(group_indices):
+                q = questions[q_idx]
+                gold_answer = extract_boxed_answer(q["solution"])
+                pred_answer = pred_answers[i] if i < len(pred_answers) else ""
+
+                is_correct = compare_math_answers(pred_answer, gold_answer)
+                total_correct += int(is_correct)
+                total_questions += 1
+
+                details.append({
+                    "domain": domain,
+                    "level": q["level"],
+                    "problem": q["problem"][:100] + "...",
+                    "gold_answer": gold_answer,
+                    "pred_answer": pred_answer,
+                    "correct": is_correct,
+                })
 
     accuracy = total_correct / total_questions if total_questions > 0 else 0
 
     return ExperimentResult(
-        condition=results[0].condition,
-        dataset=results[0].dataset,
-        n_samples=sum(r.n_samples for r in results),
+        condition="all_in_one_same_domain",
+        dataset="math",
+        n_samples=len(questions),
         n_questions=total_questions,
         accuracy=accuracy,
-        metrics={"accuracy": accuracy},
+        metrics={"accuracy": accuracy, "em": accuracy},
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
-        details=all_details,
+        unique_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        details=details,
     )
 
 
-def _shard_questions_by_domain(
-    questions: List[Dict[str, Any]],
-    domain_to_indices: Dict[str, List[int]],
-    rank: int,
-    world_size: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, List[int]]]:
-    """Shard questions while preserving domain structure."""
-    # Shard questions list
-    local_questions = shard_data(questions, rank, world_size)
+def worker_process(rank: int, world_size: int, args, questions: List[Dict], domain_to_indices: Dict):
+    """Worker process for multi-GPU parallel inference."""
+    import torch
 
-    # Build new domain_to_indices for local shard
+    # Set CUDA device
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    torch.cuda.set_device(0)  # After setting CUDA_VISIBLE_DEVICES, device 0 is our assigned GPU
+
+    logger.info(f"Worker {rank}/{world_size} starting on GPU {rank}")
+
+    # Shard data
+    all_indices = list(range(len(questions)))
+    shard_size = len(all_indices) // world_size
+    start_idx = rank * shard_size
+    end_idx = start_idx + shard_size if rank < world_size - 1 else len(all_indices)
+    local_indices = all_indices[start_idx:end_idx]
+
+    local_questions = [questions[i] for i in local_indices]
+
+    # Build local domain_to_indices
     local_domain_to_indices = defaultdict(list)
-    for new_idx, q in enumerate(local_questions):
-        domain = q["domain"]
+    for new_idx, old_idx in enumerate(local_indices):
+        domain = questions[old_idx]["domain"]
         local_domain_to_indices[domain].append(new_idx)
 
-    return local_questions, dict(local_domain_to_indices)
+    logger.info(f"Worker {rank}: processing {len(local_questions)} questions")
+
+    # Initialize client
+    client = LLMClient(
+        model=args.model,
+        use_local=True,
+        use_vllm=True,
+        tensor_parallel_size=1,
+        enable_thinking=args.enable_thinking,
+    )
+
+    # Run conditions
+    conditions = [c.strip() for c in args.conditions.split(",")]
+    results = []
+
+    if "independent" in conditions:
+        results.append(run_independent(local_questions, client))
+
+    if "seq_same_domain" in conditions:
+        results.append(run_sequential_same_domain(
+            local_questions, dict(local_domain_to_indices), client,
+            n_questions=args.n_questions, include_context=False
+        ))
+
+    if "seq_same_domain_full" in conditions:
+        results.append(run_sequential_same_domain(
+            local_questions, dict(local_domain_to_indices), client,
+            n_questions=args.n_questions, include_context=True
+        ))
+
+    if "seq_random_domain" in conditions:
+        results.append(run_sequential_random_domain(
+            local_questions, client,
+            n_questions=args.n_questions, include_context=False, seed=args.seed + rank
+        ))
+
+    if "seq_random_domain_full" in conditions:
+        results.append(run_sequential_random_domain(
+            local_questions, client,
+            n_questions=args.n_questions, include_context=True, seed=args.seed + rank
+        ))
+
+    if "all_in_one_same_domain" in conditions:
+        results.append(run_all_in_one_same_domain(
+            local_questions, dict(local_domain_to_indices), client,
+            n_questions=args.n_questions
+        ))
+
+    return results
+
+
+def merge_results(all_results: List[List[ExperimentResult]]) -> List[ExperimentResult]:
+    """Merge results from multiple workers."""
+    if not all_results:
+        return []
+
+    # Group by condition
+    condition_results = defaultdict(list)
+    for worker_results in all_results:
+        for result in worker_results:
+            condition_results[result.condition].append(result)
+
+    # Merge each condition
+    merged = []
+    for condition, results in condition_results.items():
+        total_correct = sum(r.accuracy * r.n_questions for r in results)
+        total_questions = sum(r.n_questions for r in results)
+        total_latency = sum(r.latency for r in results)
+        total_prompt = sum(r.prompt_tokens for r in results)
+        total_completion = sum(r.completion_tokens for r in results)
+        all_details = []
+        for r in results:
+            all_details.extend(r.details)
+
+        accuracy = total_correct / total_questions if total_questions > 0 else 0
+
+        merged.append(ExperimentResult(
+            condition=condition,
+            dataset="math",
+            n_samples=sum(r.n_samples for r in results),
+            n_questions=total_questions,
+            accuracy=accuracy,
+            metrics={"accuracy": accuracy, "em": accuracy},
+            latency=total_latency,
+            prompt_tokens=total_prompt,
+            completion_tokens=total_completion,
+            unique_prompt_tokens=total_prompt,
+            total_completion_tokens=total_completion,
+            details=all_details,
+        ))
+
+    return merged
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Exp 2b: Related Domain - MATH"
-    )
-    parser.add_argument(
-        "--model", type=str, default="gpt-4o-mini",
-        help="Model to use for inference (e.g., gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct)"
-    )
-    parser.add_argument(
-        "--use-local", action="store_true",
-        help="Use local model instead of API"
-    )
-    parser.add_argument(
-        "--use-vllm", action="store_true",
-        help="Use vLLM for faster inference (requires --use-local)"
-    )
-    parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1,
-        help="Number of GPUs for tensor parallelism (vLLM only)"
-    )
-    parser.add_argument(
-        "--n-per-domain", type=int, default=-1,
-        help="Number of questions per domain (-1 for all)"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=4,
-        help="Batch size for processing"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed"
-    )
-    parser.add_argument(
-        "--conditions", type=str, default="oracle,method,random",
-        help="Comma-separated list of conditions to run"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="outputs/preliminary",
-        help="Output directory for results"
-    )
+    parser = argparse.ArgumentParser(description="Exp 2b: Related Domain - MATH")
+
+    # Model
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B",
+                        help="Model name (default: Qwen/Qwen3-8B)")
+    parser.add_argument("--enable-thinking", action="store_true",
+                        help="Enable thinking mode for Qwen3 models")
+
+    # Data
+    parser.add_argument("--n-per-domain", type=int, default=50,
+                        help="Questions per domain (-1 for all)")
+    parser.add_argument("--n-questions", type=int, default=5,
+                        help="Questions per group in sequential conditions")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+
+    # Conditions
+    parser.add_argument("--conditions", type=str,
+                        default="independent,seq_same_domain_full,seq_random_domain_full",
+                        help="Comma-separated conditions to run")
+
+    # Parallel
+    parser.add_argument("--n-gpus", type=int, default=1,
+                        help="Number of GPUs for data parallel")
+
+    # Output
+    parser.add_argument("--output-dir", type=str, default="outputs/preliminary",
+                        help="Output directory")
+
     args = parser.parse_args()
 
-    # Setup distributed (each GPU loads one model)
-    rank, world_size = setup_distributed()
-
-    # Configuration
-    config = ExperimentConfig(
-        exp_name="exp2b_related_domain",
-        dataset="math",
-        model=args.model,
-        n_samples=args.n_per_domain * len(MATH_DOMAINS),
-        seed=args.seed,
-        output_dir=args.output_dir,
-    )
-
-    # Load data (all ranks load the same data, then shard)
-    all_questions, all_domain_to_indices = load_math_by_domain(
+    # Load data
+    questions, domain_to_indices = load_math_by_domain(
         n_per_domain=args.n_per_domain,
         seed=args.seed,
     )
 
-    # Shard data across GPUs
-    questions, domain_to_indices = _shard_questions_by_domain(
-        all_questions, all_domain_to_indices, rank, world_size
-    )
-    logger.info(f"Rank {rank}/{world_size}: processing {len(questions)}/{len(all_questions)} questions")
+    if args.n_gpus > 1:
+        # Multi-GPU: use multiprocessing
+        import torch.multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
 
-    # Initialize LLM client (will use current GPU)
-    client = LLMClient(
+        with mp.Pool(args.n_gpus) as pool:
+            all_results = pool.starmap(
+                worker_process,
+                [(rank, args.n_gpus, args, questions, domain_to_indices) for rank in range(args.n_gpus)]
+            )
+
+        results = merge_results(all_results)
+    else:
+        # Single GPU
+        client = LLMClient(
+            model=args.model,
+            use_local=True,
+            use_vllm=True,
+            tensor_parallel_size=1,
+            enable_thinking=args.enable_thinking,
+        )
+
+        conditions = [c.strip() for c in args.conditions.split(",")]
+        results = []
+
+        if "independent" in conditions:
+            results.append(run_independent(questions, client))
+
+        if "seq_same_domain" in conditions:
+            results.append(run_sequential_same_domain(
+                questions, domain_to_indices, client,
+                n_questions=args.n_questions, include_context=False
+            ))
+
+        if "seq_same_domain_full" in conditions:
+            results.append(run_sequential_same_domain(
+                questions, domain_to_indices, client,
+                n_questions=args.n_questions, include_context=True
+            ))
+
+        if "seq_random_domain" in conditions:
+            results.append(run_sequential_random_domain(
+                questions, client,
+                n_questions=args.n_questions, include_context=False, seed=args.seed
+            ))
+
+        if "seq_random_domain_full" in conditions:
+            results.append(run_sequential_random_domain(
+                questions, client,
+                n_questions=args.n_questions, include_context=True, seed=args.seed
+            ))
+
+        if "all_in_one_same_domain" in conditions:
+            results.append(run_all_in_one_same_domain(
+                questions, domain_to_indices, client,
+                n_questions=args.n_questions
+            ))
+
+    # Print and save results
+    config = ExperimentConfig(
+        exp_name="exp2b_related_domain",
+        dataset="math",
         model=args.model,
-        use_local=args.use_local,
-        use_vllm=args.use_vllm,
-        tensor_parallel_size=args.tensor_parallel_size,
+        n_samples=len(questions),
+        seed=args.seed,
+        output_dir=args.output_dir,
     )
 
-    # Run conditions on local shard
-    conditions = [c.strip() for c in args.conditions.split(",")]
-    local_results = []
-
-    if "oracle" in conditions:
-        local_results.append(run_oracle(questions, domain_to_indices, client, batch_size=args.batch_size))
-
-    if "method" in conditions:
-        local_results.append(run_method(questions, client, batch_size=args.batch_size))
-
-    if "random" in conditions:
-        local_results.append(run_random(questions, client, batch_size=args.batch_size, seed=args.seed))
-
-    # Gather results from all GPUs
-    all_results_by_condition = {}
-    for result in local_results:
-        gathered = gather_results([result], world_size)
-        if rank == 0:
-            merged = _merge_results(gathered)
-            all_results_by_condition[result.condition] = merged
-
-    # Print and save results (only rank 0)
-    if rank == 0:
-        results = list(all_results_by_condition.values())
-        print_summary(results)
-        save_results(results, config)
-
-    cleanup_distributed()
+    print_summary(results)
+    save_results(results, config)
 
 
 if __name__ == "__main__":
