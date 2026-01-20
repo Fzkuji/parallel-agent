@@ -673,19 +673,33 @@ def run_experiment_for_model(
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-        # Shard data by domain
+        # Shard data by groups (not by domain) so each worker has all domains
+        # This is necessary for seq_cross_domain_full which needs all 7 domains per group
         domain_list = list(domain_to_indices.keys())
+        n_domains = len(domain_list)
+
+        # Calculate number of questions per domain and total groups
+        questions_per_domain = len(domain_to_indices[domain_list[0]])
+        n_groups = questions_per_domain  # Each group has one question from each domain
+
+        # Assign groups to workers
+        groups_per_worker = (n_groups + world_size - 1) // world_size
+
         shards = [defaultdict(list) for _ in range(world_size)]
         shard_questions = [[] for _ in range(world_size)]
 
-        for i, domain in enumerate(domain_list):
-            rank = i % world_size
-            indices = domain_to_indices[domain]
-            # Map indices to local question list
-            for idx in indices:
-                new_idx = len(shard_questions[rank])
-                shard_questions[rank].append(questions[idx])
-                shards[rank][domain].append(new_idx)
+        for rank in range(world_size):
+            start_group = rank * groups_per_worker
+            end_group = min((rank + 1) * groups_per_worker, n_groups)
+
+            # For each group assigned to this worker, add questions from all domains
+            for group_idx in range(start_group, end_group):
+                for domain in domain_list:
+                    if group_idx < len(domain_to_indices[domain]):
+                        orig_idx = domain_to_indices[domain][group_idx]
+                        new_idx = len(shard_questions[rank])
+                        shard_questions[rank].append(questions[orig_idx])
+                        shards[rank][domain].append(new_idx)
 
         # Start all workers
         processes = []
