@@ -7,27 +7,33 @@ Research Question: Do questions from the same mathematical domain benefit from
 being processed together? This tests "weak" semantic association (same topic)
 vs. exp2a's "strong" association (shared context).
 
+Design:
+- 7 domains in MATH dataset
+- Each domain samples 49 questions (7 × 49 = 343 total)
+- Each group processes 7 questions sequentially
+- Same Domain: all 7 questions from one domain
+- Cross Domain: 7 questions from 7 different domains (one per domain)
+
 Conditions:
 - Independent: Each question answered separately (baseline)
-- Seq. Same Domain (Full): Sequential with same-domain questions, with history
-- Seq. Random Domain (Full): Sequential with random domain mix, with history
-- All-in-One Same Domain: All questions from same domain in one prompt
+- Seq. Same Domain: 7 questions all from the same domain, with history
+- Seq. Cross Domain: 7 questions from 7 different domains, with history
 
-Key comparison: Same Domain vs Random Domain at similar sequence lengths.
-If Same Domain > Random Domain, semantic similarity helps even without shared context.
+Key comparison: Same Domain vs Cross Domain at same sequence lengths (7 questions).
+If Same Domain > Cross Domain, semantic similarity helps even without shared context.
 
 Usage:
     # Single GPU (auto-detect)
     python scripts/preliminary/exp2b_related_domain.py \
         --models Qwen/Qwen3-8B \
         --use-local --use-vllm \
-        --n-per-domain 50
+        --n-per-domain 49
 
     # Multi-model with auto GPU detection
     python scripts/preliminary/exp2b_related_domain.py \
         --models "Qwen/Qwen3-4B,Qwen/Qwen3-8B,Qwen/Qwen3-14B" \
         --use-local --use-vllm \
-        --n-per-domain 50
+        --n-per-domain 49
 """
 
 from __future__ import annotations
@@ -73,15 +79,9 @@ MATH_DOMAINS = [
     "precalculus",
 ]
 
-# System prompts
+# System prompt
 SYSTEM_PROMPT = """You are a helpful math tutor. Solve the problem step by step and give your final answer in \\boxed{}.
 Be concise but show key steps."""
-
-SYSTEM_PROMPT_MULTI = """You are a helpful math tutor. Solve each problem step by step.
-Format your response as:
-Problem 1: [solution] \\boxed{answer1}
-Problem 2: [solution] \\boxed{answer2}
-..."""
 
 
 def load_math_by_domain(
@@ -272,22 +272,24 @@ def run_sequential_same_domain(
     questions: List[Dict[str, Any]],
     domain_to_indices: Dict[str, List[int]],
     client: LLMClient,
-    n_questions: int = 5,
     include_context: bool = True,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Sequential with questions grouped by domain.
+    """Sequential with 7 questions all from the same domain.
+
+    Design: Each group has 7 questions from ONE domain.
+    With 7 domains and 49 questions each, we get 7 groups per domain = 49 total groups.
 
     Args:
         questions: All questions
         domain_to_indices: Mapping from domain to question indices
         client: LLM client
-        n_questions: Number of questions per group
-        include_context: If True, include previous Q&A in context (sequential with history)
+        include_context: If True, include previous Q&A in context
         seed: Random seed
     """
+    n_questions = 7  # Fixed: 7 questions per group (one per domain slot)
     condition = f"seq_same_domain{'_full' if include_context else ''}"
-    logger.info(f"Running {condition} condition (n_questions={n_questions})...")
+    logger.info(f"Running {condition} condition (n_questions={n_questions}, all same domain)...")
 
     random.seed(seed)
 
@@ -306,6 +308,7 @@ def run_sequential_same_domain(
         indices = indices.copy()
         random.shuffle(indices)
 
+        # Group into batches of 7
         for group_start in range(0, len(indices), n_questions):
             group_indices = indices[group_start:group_start + n_questions]
             if len(group_indices) < n_questions:
@@ -391,29 +394,42 @@ Solve step by step and give your final answer in \\boxed{{}}."""
     )
 
 
-def run_sequential_random_domain(
+def run_sequential_cross_domain(
     questions: List[Dict[str, Any]],
+    domain_to_indices: Dict[str, List[int]],
     client: LLMClient,
-    n_questions: int = 5,
     include_context: bool = True,
     seed: int = 42,
 ) -> ExperimentResult:
-    """Sequential with questions randomly mixed across domains.
+    """Sequential with 7 questions from 7 DIFFERENT domains (one per domain).
+
+    Design: Each group has exactly 7 questions, one from each domain.
+    This ensures maximum domain diversity within each group.
 
     Args:
         questions: All questions
+        domain_to_indices: Mapping from domain to question indices
         client: LLM client
-        n_questions: Number of questions per group
         include_context: If True, include previous Q&A in context
         seed: Random seed
     """
-    condition = f"seq_random_domain{'_full' if include_context else ''}"
-    logger.info(f"Running {condition} condition (n_questions={n_questions})...")
+    n_questions = 7  # Fixed: 7 questions per group (one per domain)
+    condition = f"seq_cross_domain{'_full' if include_context else ''}"
+    logger.info(f"Running {condition} condition (n_questions={n_questions}, all different domains)...")
 
-    # Shuffle all questions
     random.seed(seed)
-    indices = list(range(len(questions)))
-    random.shuffle(indices)
+    domains = list(domain_to_indices.keys())
+
+    # Shuffle indices within each domain
+    shuffled_indices = {}
+    for domain in domains:
+        indices = domain_to_indices[domain].copy()
+        random.shuffle(indices)
+        shuffled_indices[domain] = indices
+
+    # Find minimum number of questions per domain (should be 49)
+    min_per_domain = min(len(indices) for indices in shuffled_indices.values())
+    n_groups = min_per_domain  # 49 groups
 
     total_correct = 0
     total_questions = 0
@@ -424,17 +440,22 @@ def run_sequential_random_domain(
     total_sequence_length = 0
     sum_completion_tokens = 0
 
-    # Process in groups
-    for group_start in tqdm(range(0, len(indices), n_questions), desc="Random Domain"):
-        group_indices = indices[group_start:group_start + n_questions]
-        if len(group_indices) < n_questions:
-            continue  # Skip incomplete groups
+    # Process groups: each group has one question from each domain
+    for group_idx in tqdm(range(n_groups), desc="Cross Domain"):
+        # Collect one question from each domain for this group
+        group_question_indices = []
+        for domain in domains:
+            q_idx = shuffled_indices[domain][group_idx]
+            group_question_indices.append(q_idx)
+
+        # Shuffle the order within the group (so domains appear in random order)
+        random.shuffle(group_question_indices)
 
         conversation_history = []
         last_prompt_tokens = 0
         last_completion_tokens = 0
 
-        for turn_idx, q_idx in enumerate(group_indices):
+        for turn_idx, q_idx in enumerate(group_question_indices):
             q = questions[q_idx]
             problem = q["problem"]
             gold_solution = q["solution"]
@@ -480,6 +501,7 @@ Solve step by step and give your final answer in \\boxed{{}}."""
                 "domain": q["domain"],
                 "level": q["level"],
                 "turn": turn_idx,
+                "group_idx": group_idx,
                 "problem": problem[:100] + "...",
                 "gold_answer": gold_answer,
                 "pred_answer": pred_answer,
@@ -504,105 +526,6 @@ Solve step by step and give your final answer in \\boxed{{}}."""
         completion_tokens=total_completion_tokens,
         unique_prompt_tokens=unique_prompt_tokens,
         total_completion_tokens=sum_completion_tokens,
-        details=details,
-    )
-
-
-def run_all_in_one_same_domain(
-    questions: List[Dict[str, Any]],
-    domain_to_indices: Dict[str, List[int]],
-    client: LLMClient,
-    n_questions: int = 5,
-    seed: int = 42,
-) -> ExperimentResult:
-    """All-in-One: All questions from same domain in one prompt."""
-    logger.info(f"Running all_in_one_same_domain condition (n_questions={n_questions})...")
-
-    random.seed(seed)
-
-    total_correct = 0
-    total_questions = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-
-    for domain, indices in tqdm(domain_to_indices.items(), desc="All-in-One Same Domain"):
-        indices = indices.copy()
-        random.shuffle(indices)
-
-        for group_start in range(0, len(indices), n_questions):
-            group_indices = indices[group_start:group_start + n_questions]
-            if len(group_indices) < n_questions:
-                continue
-
-            # Build multi-problem prompt
-            problems_text = "\n\n".join([
-                f"Problem {i+1}:\n{questions[idx]['problem']}"
-                for i, idx in enumerate(group_indices)
-            ])
-
-            prompt = f"""{problems_text}
-
-Solve each problem step by step. Give each final answer in \\boxed{{}}.
-Format: Problem 1: ... \\boxed{{answer1}}
-Problem 2: ... \\boxed{{answer2}}
-..."""
-
-            pred_raw, response = client.generate(prompt, max_tokens=2048, system_prompt=SYSTEM_PROMPT_MULTI)
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-
-            # Extract answers for each problem
-            # Try to parse "Problem N:" format
-            pred_answers = []
-            for i in range(len(group_indices)):
-                pattern = rf'Problem\s*{i+1}[:\s].*?\\boxed\{{([^}}]+)\}}'
-                match = re.search(pattern, pred_raw, re.IGNORECASE | re.DOTALL)
-                if match:
-                    pred_answers.append(match.group(1).strip())
-                else:
-                    # Fallback: find all boxed answers
-                    all_boxed = re.findall(r'\\boxed\{([^}]+)\}', pred_raw)
-                    if i < len(all_boxed):
-                        pred_answers.append(all_boxed[i])
-                    else:
-                        pred_answers.append("")
-
-            # Evaluate each question
-            for i, q_idx in enumerate(group_indices):
-                q = questions[q_idx]
-                gold_answer = extract_boxed_answer(q["solution"])
-                pred_answer = pred_answers[i] if i < len(pred_answers) else ""
-
-                is_correct = compare_math_answers(pred_answer, gold_answer)
-                total_correct += int(is_correct)
-                total_questions += 1
-
-                details.append({
-                    "domain": domain,
-                    "level": q["level"],
-                    "problem": q["problem"][:100] + "...",
-                    "gold_answer": gold_answer,
-                    "pred_answer": pred_answer,
-                    "correct": is_correct,
-                })
-
-    accuracy = total_correct / total_questions if total_questions > 0 else 0
-
-    return ExperimentResult(
-        condition="all_in_one_same_domain",
-        dataset="math",
-        n_samples=len(questions),
-        n_questions=total_questions,
-        accuracy=accuracy,
-        metrics={"accuracy": accuracy, "em": accuracy},
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        unique_prompt_tokens=total_prompt_tokens,
-        total_completion_tokens=total_completion_tokens,
         details=details,
     )
 
@@ -660,7 +583,6 @@ def worker_process(
     questions: List[Dict[str, Any]],
     domain_to_indices: Dict[str, List[int]],
     conditions: List[str],
-    n_questions: int,
     seed: int,
     output_dir: str,
     enable_thinking: bool = False,
@@ -701,21 +623,14 @@ def worker_process(
         logger.info(f"[Worker {rank}] Running seq_same_domain_full...")
         results.append(run_sequential_same_domain(
             questions, domain_to_indices, client,
-            n_questions=n_questions, include_context=True, seed=seed + rank
+            include_context=True, seed=seed + rank
         ))
 
-    if "seq_random_domain_full" in conditions:
-        logger.info(f"[Worker {rank}] Running seq_random_domain_full...")
-        results.append(run_sequential_random_domain(
-            questions, client,
-            n_questions=n_questions, include_context=True, seed=seed + rank
-        ))
-
-    if "all_in_one_same_domain" in conditions:
-        logger.info(f"[Worker {rank}] Running all_in_one_same_domain...")
-        results.append(run_all_in_one_same_domain(
+    if "seq_cross_domain_full" in conditions:
+        logger.info(f"[Worker {rank}] Running seq_cross_domain_full...")
+        results.append(run_sequential_cross_domain(
             questions, domain_to_indices, client,
-            n_questions=n_questions, seed=seed + rank
+            include_context=True, seed=seed + rank
         ))
 
     # Save results to temp file
@@ -801,7 +716,7 @@ def run_experiment_for_model(
                 target=worker_process,
                 args=(rank, world_size, gpu_id, model, args.use_vllm,
                       shard_questions[rank], dict(shards[rank]), conditions,
-                      args.n_questions, args.seed, args.output_dir,
+                      args.seed, args.output_dir,
                       args.enable_thinking)
             )
             p.start()
@@ -868,19 +783,13 @@ def run_experiment_for_model(
         if "seq_same_domain_full" in conditions:
             final_results.append(run_sequential_same_domain(
                 questions, domain_to_indices, client,
-                n_questions=args.n_questions, include_context=True, seed=args.seed
+                include_context=True, seed=args.seed
             ))
 
-        if "seq_random_domain_full" in conditions:
-            final_results.append(run_sequential_random_domain(
-                questions, client,
-                n_questions=args.n_questions, include_context=True, seed=args.seed
-            ))
-
-        if "all_in_one_same_domain" in conditions:
-            final_results.append(run_all_in_one_same_domain(
+        if "seq_cross_domain_full" in conditions:
+            final_results.append(run_sequential_cross_domain(
                 questions, domain_to_indices, client,
-                n_questions=args.n_questions, seed=args.seed
+                include_context=True, seed=args.seed
             ))
 
     # Print and save results for this model
@@ -905,7 +814,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2b_related_domain_*
     import re as regex
 
     # Valid exp2b conditions
-    VALID_CONDITIONS = ["independent", "seq_same_domain_full", "seq_random_domain_full", "all_in_one_same_domain"]
+    VALID_CONDITIONS = ["independent", "seq_same_domain_full", "seq_cross_domain_full"]
 
     # Find all matching files
     file_pattern = os.path.join(output_dir, pattern)
@@ -981,9 +890,8 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2b_related_domain_*
     print("| Condition | Description |")
     print("|-----------|-------------|")
     print("| independent | Each question answered separately |")
-    print("| seq_same_domain_full | Sequential with same-domain questions, with history |")
-    print("| seq_random_domain_full | Sequential with random domain mix, with history |")
-    print("| all_in_one_same_domain | All questions from same domain in one prompt |")
+    print("| seq_same_domain_full | 7 questions all from same domain, with history |")
+    print("| seq_cross_domain_full | 7 questions from 7 different domains, with history |")
     print()
     print("---")
     print()
@@ -1025,7 +933,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2b_related_domain_*
             total_compl = r.get("total_completion_tokens", 0)
             if unique_prompt > 0:
                 seq_length = unique_prompt + total_compl
-                avg_seq_len = seq_length / (n_questions // 5) if n_questions > 0 else 0  # per group
+                avg_seq_len = seq_length / (n_questions // 7) if n_questions > 0 else 0  # per group (7 questions)
             else:
                 avg_seq_len = 0
 
@@ -1065,9 +973,9 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2b_related_domain_*
     # Key findings section
     print("## Key Findings")
     print()
-    print("1. **Same domain vs Random domain**: Compare seq_same_domain_full vs seq_random_domain_full")
-    print("2. **If same > random**: Semantic similarity helps even without shared context")
-    print("3. **All-in-one performance**: Batch processing within same domain")
+    print("1. **Same domain vs Cross domain**: Compare seq_same_domain_full vs seq_cross_domain_full")
+    print("2. **If same > cross**: Semantic similarity helps even without shared context")
+    print("3. **Both conditions**: Same sequence length (7 questions per group)")
     print()
 
 
@@ -1155,12 +1063,8 @@ def main():
         help="Number of GPUs for tensor parallelism (vLLM only, for single-GPU mode)"
     )
     parser.add_argument(
-        "--n-per-domain", type=int, default=50,
-        help="Questions per domain (-1 for all)"
-    )
-    parser.add_argument(
-        "--n-questions", type=int, default=5,
-        help="Questions per group in sequential conditions"
+        "--n-per-domain", type=int, default=49,
+        help="Questions per domain (default 49 for 7 groups of 7)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -1168,7 +1072,7 @@ def main():
     )
     parser.add_argument(
         "--conditions", type=str,
-        default="independent,seq_same_domain_full,seq_random_domain_full",
+        default="independent,seq_same_domain_full,seq_cross_domain_full",
         help="Comma-separated conditions to run"
     )
     parser.add_argument(
