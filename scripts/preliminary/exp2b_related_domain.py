@@ -299,8 +299,6 @@ def run_sequential_same_domain(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
-    total_sequence_length = 0
-    sum_completion_tokens = 0
 
     # Process each domain
     for domain, indices in tqdm(domain_to_indices.items(), desc=f"Same Domain"):
@@ -315,8 +313,6 @@ def run_sequential_same_domain(
                 continue  # Skip incomplete groups
 
             conversation_history = []
-            last_prompt_tokens = 0
-            last_completion_tokens = 0
 
             for turn_idx, q_idx in enumerate(group_indices):
                 q = questions[q_idx]
@@ -347,9 +343,6 @@ Solve step by step and give your final answer in \\boxed{{}}."""
                 total_latency += response.latency
                 total_prompt_tokens += response.prompt_tokens
                 total_completion_tokens += response.completion_tokens
-                sum_completion_tokens += response.completion_tokens
-                last_prompt_tokens = response.prompt_tokens
-                last_completion_tokens = response.completion_tokens
 
                 pred_answer = extract_boxed_answer(pred_raw)
                 is_correct = compare_math_answers(pred_answer, gold_answer)
@@ -372,11 +365,7 @@ Solve step by step and give your final answer in \\boxed{{}}."""
                     "correct": is_correct,
                 })
 
-            # Add last turn's sequence length
-            total_sequence_length += last_prompt_tokens + last_completion_tokens
-
     accuracy = total_correct / total_questions if total_questions > 0 else 0
-    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition=condition,
@@ -388,8 +377,8 @@ Solve step by step and give your final answer in \\boxed{{}}."""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
-        unique_prompt_tokens=unique_prompt_tokens,
-        total_completion_tokens=sum_completion_tokens,
+        unique_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
         details=details,
     )
 
@@ -437,8 +426,6 @@ def run_sequential_cross_domain(
     total_latency = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
-    total_sequence_length = 0
-    sum_completion_tokens = 0
 
     # Process groups: each group has one question from each domain
     for group_idx in tqdm(range(n_groups), desc="Cross Domain"):
@@ -452,8 +439,6 @@ def run_sequential_cross_domain(
         random.shuffle(group_question_indices)
 
         conversation_history = []
-        last_prompt_tokens = 0
-        last_completion_tokens = 0
 
         for turn_idx, q_idx in enumerate(group_question_indices):
             q = questions[q_idx]
@@ -483,9 +468,6 @@ Solve step by step and give your final answer in \\boxed{{}}."""
             total_latency += response.latency
             total_prompt_tokens += response.prompt_tokens
             total_completion_tokens += response.completion_tokens
-            sum_completion_tokens += response.completion_tokens
-            last_prompt_tokens = response.prompt_tokens
-            last_completion_tokens = response.completion_tokens
 
             pred_answer = extract_boxed_answer(pred_raw)
             is_correct = compare_math_answers(pred_answer, gold_answer)
@@ -508,11 +490,7 @@ Solve step by step and give your final answer in \\boxed{{}}."""
                 "correct": is_correct,
             })
 
-        # Add last turn's sequence length
-        total_sequence_length += last_prompt_tokens + last_completion_tokens
-
     accuracy = total_correct / total_questions if total_questions > 0 else 0
-    unique_prompt_tokens = total_sequence_length - sum_completion_tokens
 
     return ExperimentResult(
         condition=condition,
@@ -524,8 +502,8 @@ Solve step by step and give your final answer in \\boxed{{}}."""
         latency=total_latency,
         prompt_tokens=total_prompt_tokens,
         completion_tokens=total_completion_tokens,
-        unique_prompt_tokens=unique_prompt_tokens,
-        total_completion_tokens=sum_completion_tokens,
+        unique_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
         details=details,
     )
 
