@@ -1076,8 +1076,12 @@ def main():
         help="Comma-separated conditions to run"
     )
     parser.add_argument(
-        "--output-dir", type=str, default="outputs/preliminary",
+        "--output-dir", type=str, default="outputs",
         help="Output directory"
+    )
+    parser.add_argument(
+        "--n-gpus", type=int, default=7,
+        help="Number of GPUs to use (default 7, use first N GPUs)"
     )
     parser.add_argument(
         "--enable-thinking", action="store_true",
@@ -1095,8 +1099,9 @@ def main():
 
     # Detect number of GPUs
     if args.use_local and torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        logger.info(f"Detected {num_gpus} GPU(s)")
+        available_gpus = torch.cuda.device_count()
+        num_gpus = min(args.n_gpus, available_gpus)
+        logger.info(f"Using {num_gpus} GPU(s) (available: {available_gpus}, requested: {args.n_gpus})")
     else:
         num_gpus = 0
         logger.info("Using CPU or API mode")
