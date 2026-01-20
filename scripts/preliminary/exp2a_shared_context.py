@@ -272,102 +272,6 @@ Questions:
     )
 
 
-def run_batch(
-    groups: List[Dict[str, Any]],
-    client: LLMClient,
-) -> ExperimentResult:
-    """Batch: True batch inference - all questions processed in parallel batches.
-
-    Each question is a separate prompt (context + single question), but they are
-    processed in batches using vLLM's batch generation for efficiency.
-    This is different from all_in_one which puts all questions in a single prompt.
-    """
-    logger.info("Running Batch condition...")
-
-    total_correct = 0
-    total_f1 = 0.0
-    total_questions = 0
-    details = []
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    unique_prompt_tokens = 0
-    sum_completion_tokens = 0
-
-    # Collect all questions with their context
-    all_items = []
-    for group in groups:
-        context = group["context"]
-        for q_item in group["questions"]:
-            all_items.append({
-                "context": context,
-                "question": q_item["question"],
-                "gold_answer": q_item["answer"],
-            })
-
-    # Build all prompts
-    all_prompts = []
-    for item in all_items:
-        prompt = f"""Passage:
-{item["context"]}
-
-Question: {item["question"]}"""
-        all_prompts.append(prompt)
-
-    # Process in batches
-    batch_size = 32  # Adjust based on GPU memory
-    for i in tqdm(range(0, len(all_prompts), batch_size), desc="Batch"):
-        batch_prompts = all_prompts[i:i + batch_size]
-        batch_items = all_items[i:i + batch_size]
-
-        # Batch generate
-        results = client.generate_batch(batch_prompts, max_tokens=128, system_prompt=SYSTEM_PROMPT)
-
-        for (pred_raw, response), item in zip(results, batch_items):
-            total_latency += response.latency
-            total_prompt_tokens += response.prompt_tokens
-            total_completion_tokens += response.completion_tokens
-            unique_prompt_tokens += response.prompt_tokens
-            sum_completion_tokens += response.completion_tokens
-
-            pred = _extract_answer(pred_raw)
-            gold_answer = item["gold_answer"]
-
-            is_correct = compute_exact_match(pred, gold_answer) > 0
-            f1_score = compute_f1(pred, gold_answer)
-            total_correct += int(is_correct)
-            total_f1 += f1_score
-            total_questions += 1
-
-            details.append({
-                "context_id": id(item["context"]),
-                "question": item["question"],
-                "gold_answer": gold_answer,
-                "prediction": pred,
-                "prediction_raw": pred_raw,
-                "correct": is_correct,
-                "f1": f1_score,
-            })
-
-    em = total_correct / total_questions if total_questions > 0 else 0
-    f1 = total_f1 / total_questions if total_questions > 0 else 0
-
-    return ExperimentResult(
-        condition="batch",
-        dataset="squad",
-        n_samples=len(groups),
-        n_questions=total_questions,
-        accuracy=em,
-        metrics={"em": em, "f1": f1},
-        latency=total_latency,
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        unique_prompt_tokens=unique_prompt_tokens,
-        total_completion_tokens=sum_completion_tokens,
-        details=details,
-    )
-
-
 def run_seq_shared_rand(
     groups: List[Dict[str, Any]],
     client: LLMClient,
@@ -1238,10 +1142,6 @@ def worker_process(
         logger.info(f"[Worker {rank}] Running all_in_one...")
         results.append(run_all_in_one(groups, client))
 
-    if "batch" in conditions:
-        logger.info(f"[Worker {rank}] Running batch...")
-        results.append(run_batch(groups, client))
-
     if "seq_cross_ctx" in conditions:
         logger.info(f"[Worker {rank}] Running seq_cross_ctx...")
         results.append(run_seq_cross_ctx(groups, client, seed=seed))
@@ -1401,9 +1301,6 @@ def run_experiment_for_model(
         if "all_in_one" in conditions:
             final_results.append(run_all_in_one(all_groups, client))
 
-        if "batch" in conditions:
-            final_results.append(run_batch(all_groups, client))
-
         if "seq_cross_ctx" in conditions:
             final_results.append(run_seq_cross_ctx(all_groups, client, seed=args.seed))
 
@@ -1441,7 +1338,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
     import re as regex
 
     # Valid exp2a conditions
-    VALID_CONDITIONS = ["independent", "all_in_one", "batch", "seq_cross_ctx", "seq_shared_rand", "seq_shared_ord", "seq_shared_rand_full", "seq_shared_ord_full"]
+    VALID_CONDITIONS = ["independent", "all_in_one", "seq_cross_ctx", "seq_shared_rand", "seq_shared_ord", "seq_shared_rand_full", "seq_shared_ord_full"]
 
     # Find all matching files
     file_pattern = os.path.join(output_dir, pattern)
@@ -1516,7 +1413,6 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2a_shared_context_*
     print("|-----------|-------------------|-------------|-------------|")
     print("| independent | Every turn | ✗ | Each question answered separately |")
     print("| all_in_one | Once (all Q) | ✗ | All questions in single prompt |")
-    print("| batch | Once (parallel) | ✗ | True batch inference, each Q separate prompt |")
     print("| seq_cross_ctx | Every turn | ✓ (diff ctx) | Sequential, questions from different contexts |")
     print("| seq_shared_rand | First turn only | ✓ (same ctx) | Sequential, shared context, random order |")
     print("| seq_shared_ord | First turn only | ✓ (same ctx) | Sequential, shared context, LLM-optimized order |")
@@ -1758,8 +1654,8 @@ def main():
         help="Random seed"
     )
     parser.add_argument(
-        "--conditions", type=str, default="independent,all_in_one,batch,seq_cross_ctx,seq_shared_rand,seq_shared_ord,seq_shared_rand_full,seq_shared_ord_full",
-        help="Comma-separated list of conditions: independent,all_in_one,batch,seq_cross_ctx,seq_shared_rand,seq_shared_ord,seq_shared_rand_full,seq_shared_ord_full"
+        "--conditions", type=str, default="independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord,seq_shared_rand_full,seq_shared_ord_full",
+        help="Comma-separated list of conditions: independent,all_in_one,seq_cross_ctx,seq_shared_rand,seq_shared_ord,seq_shared_rand_full,seq_shared_ord_full"
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/preliminary",
