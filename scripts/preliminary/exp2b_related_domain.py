@@ -802,7 +802,7 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2b_related_domain_*
         print(f"No files found matching: {file_pattern}")
         return
 
-    # Load data, keep only the file with largest n_samples per model
+    # Load data, keep only the latest file per model (by timestamp)
     model_files = {}
     for filepath in files:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -818,8 +818,8 @@ def summarize_from_files(output_dir: str, pattern: str = "exp2b_related_domain_*
         if not has_valid:
             continue
 
-        # Keep the file with largest n_samples (or latest timestamp if same)
-        if model not in model_files or n_samples > model_files[model]["n_samples"]:
+        # Keep the latest file by timestamp
+        if model not in model_files or timestamp > model_files[model]["timestamp"]:
             model_files[model] = {"data": data, "n_samples": n_samples, "timestamp": timestamp}
 
     if not model_files:
