@@ -85,6 +85,7 @@ from src import (
     load_cmb_exam_random_groups,
     load_cmb_exam_subdomain_groups,
     load_cmb_exam_context_groups,
+    load_triviaqa_groups,
 )
 
 
@@ -130,7 +131,7 @@ def parse_args():
 
     # 数据集参数
     parser.add_argument('--dataset', type=str, default='squad',
-                        choices=['squad', 'hotpot', 'quac', 'drop',
+                        choices=['squad', 'hotpot', 'quac', 'drop', 'triviaqa',
                                  'cmb_clin', 'cmb_exam_context', 'cmb_exam_subdomain', 'cmb_exam_random'],
                         help='数据集 (default: squad)')
     parser.add_argument('--split', type=str, default='validation',
@@ -328,6 +329,15 @@ def load_eval_data(args):
                 "title": g["title"],
                 "questions": questions,
             })
+    elif dataset == "triviaqa":
+        # TriviaQA with random grouping
+        groups = load_triviaqa_groups(
+            split=split,
+            max_groups=max_contexts,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            seed=seed,
+        )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
@@ -447,6 +457,15 @@ def load_train_data(args):
                 "title": g["title"],
                 "questions": questions,
             })
+    elif dataset == "triviaqa":
+        # TriviaQA with random grouping (1-10 questions per group)
+        groups = load_triviaqa_groups(
+            split=train_split,
+            max_groups=max_contexts,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            seed=seed,
+        )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 

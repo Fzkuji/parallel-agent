@@ -9,6 +9,9 @@ from .cmb import load_cmb_groups, load_cmb_exam_random_groups, load_cmb_exam_sub
 from .quac import load_quac_groups
 from .quality import load_quality_groups
 from .drop import load_drop_groups
+from .triviaqa import load_triviaqa, load_triviaqa_groups
+from .mmlu import load_mmlu
+from .gsm8k import load_gsm8k
 from ..models import Question
 from ..text_utils import detect_aggregate_question
 
@@ -23,6 +26,10 @@ __all__ = [
     "load_quac_groups",
     "load_quality_groups",
     "load_drop_groups",
+    "load_triviaqa",
+    "load_triviaqa_groups",
+    "load_mmlu",
+    "load_gsm8k",
     "build_questions_from_group",
 ]
 

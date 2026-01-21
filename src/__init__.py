@@ -69,6 +69,7 @@ from .datasets import (
     load_quality_groups,
     load_squad_groups,
     load_squad_random_questions,
+    load_triviaqa_groups,
 )
 
 # Inference utilities
@@ -149,6 +150,7 @@ __all__ = [
     "load_cmb_exam_random_groups",
     "load_cmb_exam_subdomain_groups",
     "load_cmb_exam_context_groups",
+    "load_triviaqa_groups",
     "build_questions_from_group",
     # Inference utilities
     "DEFAULT_SYSTEM_PROMPT",
