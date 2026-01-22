@@ -903,16 +903,25 @@ class CrossBatchTrainer:
             if skip_batch:
                 # Create a dummy loss that requires grad for DDP sync
                 # This ensures all ranks execute the same number of backward passes
+                # Must include ALL DDP-wrapped modules to sync their gradients
                 if self.is_distributed:
-                    dummy_param = next(self.cross_batch_module.parameters())
-                    dummy_loss = dummy_param.sum() * 0.0
+                    dummy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                    # Add contributions from all trainable parameters
+                    for param in self.cross_batch_module.parameters():
+                        dummy_loss = dummy_loss + param.sum() * 0.0
+                    if self.train_lm_head and hasattr(self.model, 'lm_head'):
+                        for param in self.model.lm_head.parameters():
+                            dummy_loss = dummy_loss + param.sum() * 0.0
                     dummy_loss.backward()
                 continue
 
             loss.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.cross_batch_module.parameters(), 1.0)
+            # Gradient clipping for all trainable modules
+            params_to_clip = list(self.cross_batch_module.parameters())
+            if self.train_lm_head and hasattr(self.model, 'lm_head'):
+                params_to_clip.extend(self.model.lm_head.parameters())
+            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
 
             self.optimizer.step()
 
