@@ -9,6 +9,7 @@ from .trainer import (
     train_cross_batch_module,
 )
 from .eval import SquadEvaluator, run_comparison_eval
+from .utils import is_instruct_model, get_eos_token
 
 __all__ = [
     # Core modules
@@ -23,4 +24,7 @@ __all__ = [
     # Evaluation
     "SquadEvaluator",
     "run_comparison_eval",
+    # Utils
+    "is_instruct_model",
+    "get_eos_token",
 ]

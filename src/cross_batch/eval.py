@@ -13,6 +13,7 @@ from transformers import PreTrainedTokenizer
 from tqdm import tqdm
 
 from .generator import CrossBatchGenerator
+from .utils import is_instruct_model
 
 
 def normalize_answer(s: str) -> str:
@@ -194,17 +195,6 @@ def extract_answer(generated_text: str, prompt: str, use_chat_template: bool = F
     answer = first_line.rstrip('.,;:!?')
 
     return answer
-
-
-def is_instruct_model(model_name_or_tokenizer) -> bool:
-    """Check if a model is an instruct/chat model based on its name or tokenizer."""
-    if hasattr(model_name_or_tokenizer, 'name_or_path'):
-        name = model_name_or_tokenizer.name_or_path.lower()
-    else:
-        name = str(model_name_or_tokenizer).lower()
-
-    instruct_keywords = ['instruct', 'chat', 'it', 'rlhf', 'dpo', 'sft']
-    return any(kw in name for kw in instruct_keywords)
 
 
 class SquadEvaluator:

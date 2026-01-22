@@ -155,9 +155,6 @@ class CrossBatchGenerator:
         # Track which sequences have finished (on input_device to match attention_mask operations)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.input_device)
 
-        # Store cross-batch mixing weights for analysis
-        cross_batch_weights_history = []
-
         # Generation loop
         generated_ids = input_ids.clone()
         past_key_values = None
@@ -257,7 +254,6 @@ class CrossBatchGenerator:
         return {
             "sequences": generated_ids,
             "generated_tokens": generated_ids[:, input_ids.size(1):],
-            "cross_batch_weights": cross_batch_weights_history,
         }
 
     def generate_text(

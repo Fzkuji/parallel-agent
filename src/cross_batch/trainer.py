@@ -13,7 +13,6 @@ from typing import Optional, Dict, Any, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
@@ -23,23 +22,13 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from .attention import CrossBatchAttention, CrossBatchEmbeddingMixer
+from .utils import is_instruct_model, get_eos_token
 from src.prompts import build_single_prompt
 from src.inference import build_chat_prompt
 from src.models import Question
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def is_instruct_model(model_name_or_tokenizer) -> bool:
-    """Check if a model is an instruct/chat model based on its name or tokenizer."""
-    if hasattr(model_name_or_tokenizer, 'name_or_path'):
-        name = model_name_or_tokenizer.name_or_path.lower()
-    else:
-        name = str(model_name_or_tokenizer).lower()
-
-    instruct_keywords = ['instruct', 'chat', 'it', 'rlhf', 'dpo', 'sft']
-    return any(kw in name for kw in instruct_keywords)
 
 
 class SQuADDataset(Dataset):
@@ -65,10 +54,7 @@ class SQuADDataset(Dataset):
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
         # Get EOS token for chat models (e.g., <|im_end|> for Qwen)
-        eos_token = tokenizer.eos_token or ""
-        # For Qwen models, use <|im_end|> as the stop token
-        if hasattr(tokenizer, 'im_end_id') or '<|im_end|>' in tokenizer.get_vocab():
-            eos_token = "<|im_end|>"
+        eos_token = get_eos_token(tokenizer)
 
         self.examples = []
         for idx, item in enumerate(dataset):
@@ -126,10 +112,7 @@ class SQuADGroupedDataset(Dataset):
         self.context_groups = []
 
         # Get EOS token for chat models (e.g., <|im_end|> for Qwen)
-        eos_token = tokenizer.eos_token or ""
-        # For Qwen models, use <|im_end|> as the stop token
-        if hasattr(tokenizer, 'im_end_id') or '<|im_end|>' in tokenizer.get_vocab():
-            eos_token = "<|im_end|>"
+        eos_token = get_eos_token(tokenizer)
 
         for group_idx, group in enumerate(groups):
             context = group["context"]
