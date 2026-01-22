@@ -724,8 +724,12 @@ class CrossBatchTrainer:
         total_improvement = 0.0
         num_batches = 0
 
+        logger.info(f"[Rank {rank}] Creating tqdm progress bar...")
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0))
+        logger.info(f"[Rank {rank}] Starting iteration over batches...")
         for batch in pbar:
+            if num_batches == 0:
+                logger.info(f"[Rank {rank}] Got first batch!")
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
@@ -829,6 +833,7 @@ class CrossBatchTrainer:
             actual_batch_size = batch_size
 
         # Create dataloader
+        logger.info(f"[Rank {rank}] Creating DataLoader...")
         train_loader = DataLoader(
             train_dataset,
             batch_size=actual_batch_size,
@@ -837,9 +842,11 @@ class CrossBatchTrainer:
             collate_fn=actual_collate_fn,
             drop_last=True,  # Ensure we always have full batches for cross-batch
         )
+        logger.info(f"[Rank {rank}] DataLoader created, computing len()...")
 
         # Setup scheduler
         total_steps = len(train_loader) * num_epochs
+        logger.info(f"[Rank {rank}] DataLoader has {len(train_loader)} batches, total_steps={total_steps}")
         self.scheduler = CosineAnnealingLR(
             self.optimizer,
             T_max=total_steps,
@@ -854,16 +861,20 @@ class CrossBatchTrainer:
 
         best_improvement = float('-inf')
 
+        logger.info(f"[Rank {rank}] Starting epoch loop...")
         for epoch in range(1, num_epochs + 1):
             if sampler is not None:
                 sampler.set_epoch(epoch)
+                logger.info(f"[Rank {rank}] Set epoch {epoch} for sampler")
 
             if rank == 0:
                 logger.info(f"\n{'='*50}")
                 logger.info(f"Epoch {epoch}/{num_epochs}")
                 logger.info(f"{'='*50}")
 
+            logger.info(f"[Rank {rank}] Starting train_epoch {epoch}...")
             metrics = self.train_epoch(train_loader, epoch, rank=rank)
+            logger.info(f"[Rank {rank}] Completed train_epoch {epoch}")
 
             history["train_loss"].append(metrics["loss"])
             history["baseline_loss"].append(metrics["baseline_loss"])
