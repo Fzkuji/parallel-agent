@@ -1,18 +1,32 @@
 """
 Modified generation loop with cross-batch interaction.
+
+Supports three modes:
+1. Single layer: Apply cross-batch at one layer (default: last layer)
+2. Multi-layer: Apply SimpleCrossBatchGate at multiple layers
+3. Legacy: Original CrossBatchAttention/Mixer for backward compatibility
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from transformers import PreTrainedModel, PreTrainedTokenizer
-from .attention import CrossBatchAttention, CrossBatchEmbeddingMixer
+from .attention import (
+    CrossBatchAttention,
+    CrossBatchEmbeddingMixer,
+    SimpleCrossBatchGate,
+    MultiLayerCrossBatch,
+)
 
 
 class CrossBatchGenerator:
     """
     Generator that enables cross-batch interaction during token generation.
     Each new token's hidden state is influenced by hidden states from other samples.
+
+    Supports:
+    - Single layer mixing with CrossBatchAttention/EmbeddingMixer/SimpleCrossBatchGate
+    - Multi-layer mixing with MultiLayerCrossBatch
     """
 
     def __init__(
@@ -20,8 +34,8 @@ class CrossBatchGenerator:
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         cross_batch_module: Optional[nn.Module] = None,
-        mix_method: str = "attention",  # "attention" or "mixer"
-        mix_layer: int = -1,  # which layer's hidden state to mix (-1 for last)
+        mix_method: str = "attention",  # "attention", "mixer", "simple", or "multi_layer"
+        mix_layer: Union[int, List[int]] = -1,  # which layer(s) to mix
         device: str = "cuda",
     ):
         # Check if model uses device_map (distributed across GPUs)
@@ -48,23 +62,50 @@ class CrossBatchGenerator:
             self.input_device = device
 
         self.tokenizer = tokenizer
-        self.mix_layer = mix_layer
+        self.mix_method = mix_method
+
+        # Handle mix_layer - can be int or list
+        if isinstance(mix_layer, int):
+            self.mix_layers = [mix_layer]
+            self.is_multi_layer = False
+        else:
+            self.mix_layers = list(mix_layer)
+            self.is_multi_layer = len(self.mix_layers) > 1
+
+        # For backward compatibility
+        self.mix_layer = self.mix_layers[-1] if self.mix_layers else -1
 
         # Get hidden size and dtype from model config
         hidden_size = model.config.hidden_size
+        num_layers = model.config.num_hidden_layers
         model_dtype = next(model.parameters()).dtype
 
         # Initialize cross-batch module with matching dtype
         # Place on same device as lm_head (self.device)
         if cross_batch_module is not None:
             self.cross_batch_module = cross_batch_module.to(device=self.device, dtype=model_dtype)
+        elif mix_method == "multi_layer":
+            # Multi-layer with SimpleCrossBatchGate at each layer
+            self.cross_batch_module = MultiLayerCrossBatch(
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                layer_indices=self.mix_layers if self.mix_layers[0] != -1 else None,
+                temperature=1.0,
+            ).to(device=self.device, dtype=model_dtype)
+            self.is_multi_layer = True
+        elif mix_method == "simple":
+            # Single layer with SimpleCrossBatchGate
+            self.cross_batch_module = SimpleCrossBatchGate(
+                hidden_size=hidden_size,
+                temperature=1.0,
+            ).to(device=self.device, dtype=model_dtype)
         elif mix_method == "attention":
             self.cross_batch_module = CrossBatchAttention(
                 hidden_size=hidden_size,
                 num_heads=8,
                 temperature=1.0,
             ).to(device=self.device, dtype=model_dtype)
-        else:
+        else:  # "mixer"
             self.cross_batch_module = CrossBatchEmbeddingMixer(
                 hidden_size=hidden_size,
                 temperature=1.0,
@@ -177,24 +218,39 @@ class CrossBatchGenerator:
                 output_hidden_states=True,
             )
 
-            # Get hidden states from specified layer
-            hidden_states = outputs.hidden_states[self.mix_layer]
-            # Shape: [batch_size, seq_len, hidden_size]
-
-            # Get the last token's hidden state
-            last_hidden = hidden_states[:, -1, :]  # [batch_size, hidden_size]
-
             # Apply cross-batch interaction
-            # Note: last_hidden may be on a different device than cross_batch_module
-            # (e.g., when model is distributed across GPUs with device_map="auto")
             if enable_cross_batch and batch_size > 1:
-                # Move last_hidden to the device where cross_batch_module is located
-                last_hidden_for_csa = last_hidden.to(self.device)
                 valid_mask = (~finished).to(self.device)
-                mixed_hidden = self.cross_batch_module(
-                    last_hidden_for_csa,
-                    attention_mask=valid_mask,
-                )
+
+                if self.is_multi_layer and isinstance(self.cross_batch_module, MultiLayerCrossBatch):
+                    # Multi-layer mode: apply gate at each selected layer
+                    # Aggregate contributions from all layers
+                    accumulated_delta = None
+
+                    for layer_idx in self.cross_batch_module.layer_indices:
+                        # Handle negative indices
+                        actual_idx = layer_idx if layer_idx >= 0 else len(outputs.hidden_states) + layer_idx
+                        layer_hidden = outputs.hidden_states[actual_idx][:, -1, :].to(self.device)
+
+                        # Apply the layer-specific gate
+                        mixed = self.cross_batch_module(layer_idx, layer_hidden, valid_mask)
+                        delta = mixed - layer_hidden
+
+                        if accumulated_delta is None:
+                            accumulated_delta = delta
+                        else:
+                            accumulated_delta = accumulated_delta + delta
+
+                    # Average the deltas and add to final hidden state
+                    num_layers = len(self.cross_batch_module.layer_indices)
+                    final_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
+                    mixed_hidden = final_hidden + accumulated_delta / num_layers
+                else:
+                    # Single layer mode (backward compatible)
+                    hidden_states = outputs.hidden_states[self.mix_layer]
+                    last_hidden = hidden_states[:, -1, :].to(self.device)
+                    mixed_hidden = self.cross_batch_module(last_hidden, attention_mask=valid_mask)
+
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
             else:

@@ -56,7 +56,7 @@ from src.cross_batch.trainer import (
     CrossBatchTrainer,
     SQuADGroupedDataset,
 )
-from src.cross_batch.attention import CrossBatchAttention
+from src.cross_batch.attention import CrossBatchAttention, SimpleCrossBatchGate, MultiLayerCrossBatch
 from src.cross_batch.generator import CrossBatchGenerator
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
 from src import (
@@ -139,14 +139,21 @@ def parse_args():
                         help='强制重新训练，即使 checkpoint 已存在')
 
     # Cross-batch 模块参数
+    parser.add_argument('--module-type', type=str, default='simple',
+                        choices=['attention', 'simple', 'multi_layer'],
+                        help='Cross-batch 模块类型: attention (完整QKV), simple (只学gate), multi_layer (多层gate)')
+    parser.add_argument('--mix-layer', type=int, default=-1,
+                        help='单层模式使用的层 (-1=最后层, 正数=中间层, 如 16 表示第16层)')
+    parser.add_argument('--mix-layers', type=str, default=None,
+                        help='多层模式使用的层列表 (逗号分隔, 如 "8,12,16,20,24,28")')
     parser.add_argument('--self-only', action='store_true',
                         help='Ablation: CrossBatch 模块只关注自己（对角线 attention），禁用跨样本交互')
     parser.add_argument('--use-gate', action='store_true',
-                        help='使用 Question-Aware Gating 而非固定 scale')
+                        help='使用 Question-Aware Gating 而非固定 scale (仅 attention 模式)')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Top-k sparsification: 每个 query 只保留 top-k 个最相关的连接 (default: None, 不限制)')
-    parser.add_argument('--train-lm-head', action='store_true', default=True,
-                        help='同时训练 lm_head (default: True)')
+    parser.add_argument('--train-lm-head', action='store_true', default=False,
+                        help='同时训练 lm_head (default: False)')
     parser.add_argument('--no-train-lm-head', action='store_false', dest='train_lm_head',
                         help='不训练 lm_head，只训练 cross-batch 模块')
     return parser.parse_args()
@@ -488,9 +495,18 @@ def main():
     total_questions = sum(len(g["questions"]) for g in train_groups)
     print_rank0(f'训练数据集: {len(train_dataset)} 个 context, {total_questions} 个问题', rank)
 
+    # 解析多层配置
+    mix_layers = None
+    if args.mix_layers:
+        mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
+
     # 构建 checkpoint 路径
-    mode_suffix = 'crossbatch'
-    if args.use_gate:
+    mode_suffix = args.module_type
+    if args.module_type == 'multi_layer' and mix_layers:
+        mode_suffix += f'_L{len(mix_layers)}'
+    elif args.mix_layer != -1:
+        mode_suffix += f'_L{args.mix_layer}'
+    if args.use_gate and args.module_type == 'attention':
         mode_suffix += '_gate'
     if not args.train_lm_head:
         mode_suffix += '_frozen'
@@ -507,12 +523,40 @@ def main():
     print_rank0('-' * 40, rank)
 
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-    cross_batch_module = CrossBatchAttention(
-        hidden_size=model.config.hidden_size,
-        self_only=args.self_only,
-        use_gate=args.use_gate,
-        top_k=args.top_k,
-    )
+    hidden_size = model.config.hidden_size
+    num_layers = model.config.num_hidden_layers
+
+    # 创建 cross-batch 模块
+    if args.module_type == 'multi_layer':
+        # 多层模式: 每层一个 SimpleCrossBatchGate
+        layer_indices = mix_layers if mix_layers else list(range(num_layers // 2, num_layers))  # 默认后半层
+        cross_batch_module = MultiLayerCrossBatch(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            layer_indices=layer_indices,
+            top_k=args.top_k,
+        )
+        print_rank0(f'模块类型: MultiLayerCrossBatch, 层数: {len(layer_indices)}, 层: {layer_indices}', rank)
+    elif args.module_type == 'simple':
+        # 简单模式: 单层只学 gate
+        cross_batch_module = SimpleCrossBatchGate(
+            hidden_size=hidden_size,
+            top_k=args.top_k,
+        )
+        print_rank0(f'模块类型: SimpleCrossBatchGate, 使用层: {args.mix_layer}', rank)
+    else:  # 'attention'
+        # 完整 attention 模式
+        cross_batch_module = CrossBatchAttention(
+            hidden_size=hidden_size,
+            self_only=args.self_only,
+            use_gate=args.use_gate,
+            top_k=args.top_k,
+        )
+        print_rank0(f'模块类型: CrossBatchAttention, gate={args.use_gate}, 使用层: {args.mix_layer}', rank)
+
+    # 计算参数量
+    num_params = sum(p.numel() for p in cross_batch_module.parameters())
+    print_rank0(f'Cross-batch 模块参数量: {num_params:,}', rank)
 
     trainer = CrossBatchTrainer(
         model=model,
@@ -522,6 +566,7 @@ def main():
         learning_rate=args.lr,
         train_lm_head=args.train_lm_head,
         local_rank=local_rank if world_size > 1 else -1,
+        mix_layer=args.mix_layer,
     )
 
     history = trainer.train(
@@ -546,8 +591,12 @@ def main():
                 'model': args.model,
                 'dataset': args.dataset,
                 'hidden_size': model.config.hidden_size,
+                'num_layers': model.config.num_hidden_layers,
                 'train_samples': args.max_samples,
                 'epochs': args.epochs,
+                'module_type': args.module_type,
+                'mix_layer': args.mix_layer,
+                'mix_layers': mix_layers,
                 'use_gate': args.use_gate,
                 'top_k': args.top_k,
                 'train_lm_head': args.train_lm_head,
@@ -572,9 +621,13 @@ def main():
                 'epochs': args.epochs,
                 'batch_size': args.batch_size,
                 'world_size': world_size,
+                'module_type': args.module_type,
+                'mix_layer': args.mix_layer,
+                'mix_layers': mix_layers,
                 'use_gate': args.use_gate,
                 'top_k': args.top_k,
                 'train_lm_head': args.train_lm_head,
+                'num_params': num_params,
             },
             'training_history': history,
             'checkpoint': checkpoint_path,

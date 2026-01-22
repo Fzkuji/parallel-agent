@@ -1,6 +1,11 @@
 """Cross-batch generation module for information sharing between samples during generation."""
 
-from .attention import CrossBatchAttention, CrossBatchEmbeddingMixer
+from .attention import (
+    CrossBatchAttention,
+    CrossBatchEmbeddingMixer,
+    SimpleCrossBatchGate,
+    MultiLayerCrossBatch,
+)
 from .generator import CrossBatchGenerator
 from .trainer import (
     CrossBatchTrainer,
@@ -15,6 +20,8 @@ __all__ = [
     # Core modules
     "CrossBatchAttention",
     "CrossBatchEmbeddingMixer",
+    "SimpleCrossBatchGate",
+    "MultiLayerCrossBatch",
     "CrossBatchGenerator",
     # Training
     "CrossBatchTrainer",

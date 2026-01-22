@@ -21,7 +21,12 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 
-from .attention import CrossBatchAttention, CrossBatchEmbeddingMixer
+from .attention import (
+    CrossBatchAttention,
+    CrossBatchEmbeddingMixer,
+    SimpleCrossBatchGate,
+    MultiLayerCrossBatch,
+)
 from .utils import is_instruct_model, get_eos_token
 from src.prompts import build_single_prompt
 from src.inference import build_chat_prompt
@@ -282,7 +287,10 @@ class CrossBatchTrainer:
     Training objective: The cross-batch module should help each sample
     generate better answers by leveraging information from other samples.
 
-    Supports DDP (DistributedDataParallel) for multi-GPU training.
+    Supports:
+    - Single layer training with CrossBatchAttention/EmbeddingMixer/SimpleCrossBatchGate
+    - Multi-layer training with MultiLayerCrossBatch
+    - DDP (DistributedDataParallel) for multi-GPU training.
     """
 
     def __init__(
@@ -295,12 +303,17 @@ class CrossBatchTrainer:
         weight_decay: float = 0.01,
         train_lm_head: bool = True,
         local_rank: int = -1,
+        mix_layer: int = -1,  # Which layer to use for training (-1 = last)
     ):
         self.tokenizer = tokenizer
         self.device = device
         self.train_lm_head = train_lm_head
         self.local_rank = local_rank
         self.is_distributed = local_rank >= 0
+        self.mix_layer = mix_layer
+
+        # Check if we're using multi-layer module
+        self.is_multi_layer = isinstance(cross_batch_module, MultiLayerCrossBatch)
 
         self.model = model.to(device)
         self.base_model = _resolve_base_model(self.model)
@@ -383,6 +396,7 @@ class CrossBatchTrainer:
         self,
         hidden: torch.Tensor,
         context_ids: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         """Apply cross-batch attention separately for each context group.
 
@@ -390,11 +404,17 @@ class CrossBatchTrainer:
             hidden: [batch, hidden_size] hidden states
             context_ids: [batch] tensor indicating which context each sample belongs to
                         If None, apply cross-batch to all samples together
+            layer_idx: For MultiLayerCrossBatch, which layer's gate to use
 
         Returns:
             mixed_hidden: [batch, hidden_size] after per-context cross-batch attention
         """
+        # Get the actual module (unwrap DDP if needed)
+        module = self.cross_batch_module_unwrapped
+
         if context_ids is None:
+            if isinstance(module, MultiLayerCrossBatch) and layer_idx is not None:
+                return self.cross_batch_module.module.forward(layer_idx, hidden) if self.is_distributed else self.cross_batch_module(layer_idx, hidden)
             return self.cross_batch_module(hidden)
 
         batch_size = hidden.size(0)
@@ -410,10 +430,76 @@ class CrossBatchTrainer:
 
             # Always call cross_batch_module (it handles batch_size=1 correctly)
             # This is important for DDP - all ranks must call the module the same number of times
-            ctx_mixed = self.cross_batch_module(ctx_hidden)
+            if isinstance(module, MultiLayerCrossBatch) and layer_idx is not None:
+                if self.is_distributed:
+                    ctx_mixed = self.cross_batch_module.module.forward(layer_idx, ctx_hidden)
+                else:
+                    ctx_mixed = self.cross_batch_module(layer_idx, ctx_hidden)
+            else:
+                ctx_mixed = self.cross_batch_module(ctx_hidden)
+
             mixed_hidden[ctx_mask] = ctx_mixed
 
         return mixed_hidden
+
+    def _apply_multi_layer_cross_batch(
+        self,
+        hidden_states: tuple,
+        context_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply cross-batch gates at multiple layers and combine.
+
+        For MultiLayerCrossBatch: apply each layer's gate to its corresponding hidden state,
+        then average the deltas and add to the final hidden state.
+
+        Args:
+            hidden_states: Tuple of hidden states from all layers
+            context_ids: [batch] tensor indicating which context each sample belongs to
+
+        Returns:
+            combined_hidden: [batch, hidden_size] combined hidden state for logit prediction
+        """
+        module = self.cross_batch_module_unwrapped
+
+        if not isinstance(module, MultiLayerCrossBatch):
+            # Fallback: single layer
+            last_hidden = hidden_states[self.mix_layer]
+            if len(last_hidden.shape) == 3:
+                # Get last token position for batch
+                batch_size = last_hidden.size(0)
+                last_hidden = last_hidden[:, -1, :]  # Assume we want last position
+            return self._apply_cross_batch_per_context(last_hidden, context_ids)
+
+        # Multi-layer: apply gate at each layer and aggregate deltas
+        accumulated_delta = None
+        num_active_layers = 0
+
+        for layer_idx in module.layer_indices:
+            # Handle negative indices
+            actual_idx = layer_idx if layer_idx >= 0 else len(hidden_states) + layer_idx
+            layer_hidden = hidden_states[actual_idx]
+
+            if len(layer_hidden.shape) == 3:
+                layer_hidden = layer_hidden[:, -1, :]  # Last position
+
+            # Apply the layer-specific gate
+            mixed = self._apply_cross_batch_per_context(layer_hidden, context_ids, layer_idx=layer_idx)
+            delta = mixed - layer_hidden
+
+            if accumulated_delta is None:
+                accumulated_delta = delta
+            else:
+                accumulated_delta = accumulated_delta + delta
+            num_active_layers += 1
+
+        # Average the deltas and add to final hidden state
+        final_hidden = hidden_states[-1]
+        if len(final_hidden.shape) == 3:
+            final_hidden = final_hidden[:, -1, :]
+
+        if accumulated_delta is not None and num_active_layers > 0:
+            return final_hidden + accumulated_delta / num_active_layers
+        return final_hidden
 
     def compute_loss(
         self,
@@ -476,15 +562,23 @@ class CrossBatchTrainer:
                 past_key_values=None,
                 use_cache=True,
             )
-            # Get last token's hidden state from prompt
+            # Get last token's hidden state from the specified layer (or last layer)
             seq_lengths = current_mask.sum(dim=1) - 1
-            last_hidden = hidden_states[-1][torch.arange(batch_size, device=self.device), seq_lengths]
+            last_hidden = hidden_states[self.mix_layer][torch.arange(batch_size, device=self.device), seq_lengths]
+            # Store all hidden states for multi-layer training
+            all_last_hidden = tuple(
+                hs[torch.arange(batch_size, device=self.device), seq_lengths]
+                for hs in hidden_states
+            )
 
         # DDP safety: if the entire batch has zero answer tokens (e.g., due to truncation),
         # we still need to run a tiny forward/backward path through cross_batch_module so
         # all ranks participate in gradient synchronization.
         if max_answer_len <= 0:
-            mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+            if self.is_multi_layer:
+                mixed_hidden = self._apply_multi_layer_cross_batch(all_last_hidden, context_ids)
+            else:
+                mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
             dummy_loss = mixed_hidden.sum() * 0.0
             zero = torch.zeros((), device=self.device)
             return {
@@ -497,7 +591,10 @@ class CrossBatchTrainer:
         # Generate answer tokens one by one using KV cache
         for step in range(max_answer_len):
             # Apply cross-batch interaction (per-context if context_ids provided)
-            mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+            if self.is_multi_layer:
+                mixed_hidden = self._apply_multi_layer_cross_batch(all_last_hidden, context_ids)
+            else:
+                mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
             last_mixed_hidden_sum = mixed_hidden.sum()
 
             # Compute logits
@@ -563,8 +660,10 @@ class CrossBatchTrainer:
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                # Hidden state for the new token is at position 0 (since we only passed 1 token)
-                last_hidden = hidden_states[-1][:, -1, :]  # [batch, hidden]
+                # Hidden state for the new token is at position -1 (last position)
+                last_hidden = hidden_states[self.mix_layer][:, -1, :]  # [batch, hidden]
+                # Update all_last_hidden for multi-layer training
+                all_last_hidden = tuple(hs[:, -1, :] for hs in hidden_states)
 
         # Average loss over all tokens
         if num_tokens > 0:
@@ -574,7 +673,10 @@ class CrossBatchTrainer:
             # No supervised tokens contributed to the loss; create a zero loss that
             # still depends on the cross-batch module so DDP doesn't hang.
             if last_mixed_hidden_sum is None:
-                mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+                if self.is_multi_layer:
+                    mixed_hidden = self._apply_multi_layer_cross_batch(all_last_hidden, context_ids)
+                else:
+                    mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
                 last_mixed_hidden_sum = mixed_hidden.sum()
             avg_loss = last_mixed_hidden_sum * 0.0
             avg_baseline_loss = 0.0

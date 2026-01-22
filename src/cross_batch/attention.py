@@ -1,18 +1,18 @@
 """
 Cross-batch attention mechanism for sharing information between samples during generation.
 
-Two modes:
-1. Scale mode (default): H_out = H + scale * cross_batch_info
-   - Simple learnable scalar controls mixing
-2. Gate mode: H_out = H + gate(H, cross_batch_info) ⊙ cross_batch_info
-   - Question-aware gating with LayerNorm: gate = σ(MLP([LN(h); LN(a); LN(h)⊙LN(a)]))
-   - Per-dimension gate decides when to use cross-batch info
+Three variants:
+1. CrossBatchAttention: Full attention with learnable Q/K/V projections
+2. CrossBatchEmbeddingMixer: Similarity-based mixing with value projection
+3. SimpleCrossBatchGate: Minimal version - only learns a gate, uses raw cosine similarity
+   - Parameter efficient: only ~2*d parameters per layer
+   - Can be applied at multiple layers efficiently
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, List, Dict
 
 
 class CrossBatchAttention(nn.Module):
@@ -337,3 +337,172 @@ class CrossBatchEmbeddingMixer(nn.Module):
             output = hidden_states + scale * cross_batch_info
 
         return output
+
+
+class SimpleCrossBatchGate(nn.Module):
+    """
+    Minimal cross-batch module - only learns a gate, no Q/K/V projections.
+
+    Uses raw cosine similarity as attention weights (not learned).
+    Only learns a simple gate: g = σ(W_g @ [h; cross_info] + b_g)
+
+    Parameter count: 2 * hidden_size + 1 (for the gate linear layer)
+
+    Formula: H_out = H + gate * weighted_avg(H_others)
+    where weights = softmax(cosine_similarity(H, H_others))
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        temperature: float = 1.0,
+        top_k: int = None,
+    ):
+        """
+        Args:
+            hidden_size: Hidden dimension size
+            temperature: Softmax temperature for attention
+            top_k: If set, only keep top-k attention connections per query
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.temperature = temperature
+        self.top_k = top_k
+
+        # Only learn a simple gate: [h; cross_info] -> scalar gate
+        # This is extremely parameter efficient
+        self.gate = nn.Linear(hidden_size * 2, 1, bias=True)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize gate to output small values initially."""
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -3.0)  # sigmoid(-3) ≈ 0.047
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [batch_size, hidden_size]
+            attention_mask: [batch_size] bool mask for valid samples
+
+        Returns:
+            output = hidden_states + gate * cross_batch_info
+        """
+        batch_size = hidden_states.size(0)
+
+        if batch_size == 1:
+            # DDP gradient sync: ensure gate participates in computation
+            dummy = self.gate(torch.cat([hidden_states, hidden_states], dim=-1)).sum() * 0.0
+            return hidden_states + dummy
+
+        # Compute cosine similarity as attention weights (no learning)
+        normalized = F.normalize(hidden_states, p=2, dim=-1)
+        similarity = torch.mm(normalized, normalized.t()) / self.temperature
+
+        # Mask out self (diagonal)
+        eye_mask = torch.eye(batch_size, device=hidden_states.device, dtype=torch.bool)
+        similarity = similarity.masked_fill(eye_mask, float('-inf'))
+
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(0)
+            similarity = similarity.masked_fill(~mask, float('-inf'))
+
+        # Top-k sparsification
+        if self.top_k is not None and self.top_k < batch_size - 1:
+            top_k_values, _ = torch.topk(similarity, k=self.top_k, dim=-1)
+            threshold = top_k_values[:, -1:].expand_as(similarity)
+            similarity = similarity.masked_fill(similarity < threshold, float('-inf'))
+
+        weights = F.softmax(similarity, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+
+        # Weighted average of other samples (no projection)
+        cross_batch_info = torch.mm(weights, hidden_states)
+
+        # Simple gate: [h; cross_info] -> scalar
+        gate_input = torch.cat([hidden_states, cross_batch_info], dim=-1)
+        gate = torch.sigmoid(self.gate(gate_input))  # [batch, 1]
+
+        output = hidden_states + gate * cross_batch_info
+        return output
+
+
+class MultiLayerCrossBatch(nn.Module):
+    """
+    Applies SimpleCrossBatchGate at multiple layers.
+
+    Each layer has its own gate parameters, allowing the model to learn
+    different mixing strategies at different depths.
+
+    Total parameters: num_layers * (2 * hidden_size + 1)
+    For a 32-layer model with hidden_size=4096: 32 * 8193 ≈ 262K parameters
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        layer_indices: Optional[List[int]] = None,
+        temperature: float = 1.0,
+        top_k: int = None,
+    ):
+        """
+        Args:
+            hidden_size: Hidden dimension size
+            num_layers: Total number of layers in the model
+            layer_indices: Which layers to apply cross-batch (None = all layers)
+            temperature: Softmax temperature for attention
+            top_k: If set, only keep top-k attention connections per query
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        # If no specific layers specified, use all layers
+        if layer_indices is None:
+            self.layer_indices = list(range(num_layers))
+        else:
+            self.layer_indices = layer_indices
+
+        # Create a gate module for each selected layer
+        self.gates = nn.ModuleDict({
+            str(i): SimpleCrossBatchGate(
+                hidden_size=hidden_size,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            for i in self.layer_indices
+        })
+
+    def forward(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Apply cross-batch mixing for a specific layer.
+
+        Args:
+            layer_idx: Which layer's hidden states
+            hidden_states: [batch_size, hidden_size]
+            attention_mask: [batch_size] bool mask for valid samples
+
+        Returns:
+            Mixed hidden states if layer_idx in layer_indices, else unchanged
+        """
+        if layer_idx in self.layer_indices:
+            return self.gates[str(layer_idx)](hidden_states, attention_mask)
+        return hidden_states
+
+    def get_layer_gate(self, layer_idx: int) -> Optional[SimpleCrossBatchGate]:
+        """Get the gate module for a specific layer."""
+        if layer_idx in self.layer_indices:
+            return self.gates[str(layer_idx)]
+        return None
