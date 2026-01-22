@@ -492,7 +492,8 @@ def main():
         groups=train_groups,
         dataset_name=args.dataset,
     )
-    total_questions = sum(len(g["questions"]) for g in train_groups)
+    # Handle both SQuAD format (questions) and HotpotQA format (items)
+    total_questions = sum(len(g.get("questions", g.get("items", []))) for g in train_groups)
     print_rank0(f'训练数据集: {len(train_dataset)} 个 context, {total_questions} 个问题', rank)
 
     # 解析多层配置

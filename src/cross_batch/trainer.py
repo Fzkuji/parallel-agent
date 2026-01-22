@@ -98,10 +98,14 @@ class SQuADDataset(Dataset):
 
 
 class SQuADGroupedDataset(Dataset):
-    """SQuAD dataset grouped by context.
+    """Dataset grouped by context, supports both SQuAD and HotpotQA formats.
 
-    Each item is a list of examples from the same context.
+    Each item is a list of examples from the same context group.
     Use with batch_size=1 in DataLoader, each context becomes one batch.
+
+    Supported formats:
+    - SQuAD: {"context": "...", "questions": [{"text": "...", "references": [...]}, ...]}
+    - HotpotQA: {"items": [{"context": "...", "question": "...", "references": [...]}, ...], "title": "..."}
     """
 
     def __init__(
@@ -120,19 +124,37 @@ class SQuADGroupedDataset(Dataset):
         eos_token = get_eos_token(tokenizer)
 
         for group_idx, group in enumerate(groups):
-            context = group["context"]
-            questions = group["questions"]
             examples = []
-            for q_idx, q in enumerate(questions):
-                prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
-                raw_answer = q["references"][0] if q["references"] else ""
-                # Include EOS token so model learns to stop after answer
-                answer = f"<answer>{raw_answer}</answer>{eos_token}"
-                examples.append({
-                    "prompt": prompt,
-                    "answer": answer,
-                    "full_text": prompt + answer,
-                })
+
+            # Detect format: HotpotQA uses "items", SQuAD uses "context" + "questions"
+            if "items" in group:
+                # HotpotQA format: each item has its own context
+                for q_idx, item in enumerate(group["items"]):
+                    context = item.get("context", "")
+                    question_text = item.get("question", "")
+                    references = item.get("references", [])
+                    prompt = self._format_prompt(context, question_text, group_idx, q_idx)
+                    raw_answer = references[0] if references else ""
+                    answer = f"<answer>{raw_answer}</answer>{eos_token}"
+                    examples.append({
+                        "prompt": prompt,
+                        "answer": answer,
+                        "full_text": prompt + answer,
+                    })
+            else:
+                # SQuAD format: shared context for all questions
+                context = group["context"]
+                questions = group["questions"]
+                for q_idx, q in enumerate(questions):
+                    prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
+                    raw_answer = q["references"][0] if q["references"] else ""
+                    answer = f"<answer>{raw_answer}</answer>{eos_token}"
+                    examples.append({
+                        "prompt": prompt,
+                        "answer": answer,
+                        "full_text": prompt + answer,
+                    })
+
             self.context_groups.append(examples)
 
     def _format_prompt(self, context: str, question_text: str, group_idx: int, q_idx: int) -> str:
