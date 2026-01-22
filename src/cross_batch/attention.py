@@ -118,7 +118,13 @@ class CrossBatchAttention(nn.Module):
         batch_size = hidden_states.size(0)
 
         if batch_size == 1:
-            return hidden_states
+            # Still pass through parameters to maintain DDP gradient sync
+            # The output equals input, but parameters participate in the computation graph
+            dummy = self.out_proj(self.v_proj(hidden_states)).sum() * 0.0
+            if self.use_gate:
+                gate_input = torch.cat([hidden_states, hidden_states], dim=-1)
+                dummy = dummy + self.gate_net(gate_input).sum() * 0.0
+            return hidden_states + dummy
 
         # Compute Q, K, V
         q = self.q_proj(hidden_states).view(batch_size, self.num_heads, self.head_dim)
@@ -245,7 +251,12 @@ class CrossBatchEmbeddingMixer(nn.Module):
         batch_size = hidden_states.size(0)
 
         if batch_size == 1:
-            return hidden_states
+            # Still pass through parameters to maintain DDP gradient sync
+            dummy = self.value_proj(self.similarity_proj(hidden_states)).sum() * 0.0
+            if self.use_gate:
+                gate_input = torch.cat([hidden_states, hidden_states], dim=-1)
+                dummy = dummy + self.gate_net(gate_input).sum() * 0.0
+            return hidden_states + dummy
 
         # Compute similarity-based attention weights
         projected = self.similarity_proj(hidden_states)
