@@ -70,6 +70,9 @@ from .datasets import (
     load_squad_groups,
     load_squad_random_questions,
     load_triviaqa_groups,
+    load_similarity_grouped_triviaqa,
+    load_similarity_grouped_nq,
+    load_similarity_grouped_generic,
 )
 
 # Inference utilities

@@ -1,9 +1,12 @@
 """
 Cross-batch attention mechanism for sharing information between samples during generation.
 
-Simplified design: H_out = H + W @ cross_batch_info
-- Original hidden state H is preserved unchanged
-- Only learns what information to extract from other samples and add
+Two modes:
+1. Scale mode (default): H_out = H + scale * cross_batch_info
+   - Simple learnable scalar controls mixing
+2. Gate mode: H_out = H + gate(H, cross_batch_info) * cross_batch_info
+   - Question-aware gating: model decides when to use cross-batch info
+   - Gate is computed based on both original hidden state and cross-batch info
 """
 
 import torch
@@ -14,10 +17,13 @@ from typing import Optional
 
 class CrossBatchAttention(nn.Module):
     """
-    Simplified cross-batch attention: H_out = H + scale * W @ attention(H_others)
+    Cross-batch attention with optional question-aware gating.
+
+    Scale mode: H_out = H + scale * W @ attention(H_others)
+    Gate mode:  H_out = H + gate(H, info) * W @ attention(H_others)
 
     The original hidden state is preserved, we only ADD information from other samples.
-    This makes learning easier - only need to learn "what to add", not "how to reconstruct".
+    Gate mode allows the model to dynamically decide when cross-batch info is useful.
     """
 
     def __init__(
@@ -27,6 +33,8 @@ class CrossBatchAttention(nn.Module):
         dropout: float = 0.0,
         temperature: float = 1.0,
         self_only: bool = False,
+        use_gate: bool = False,
+        gate_hidden_size: int = None,
     ):
         """
         Args:
@@ -37,6 +45,8 @@ class CrossBatchAttention(nn.Module):
             self_only: If True, attention only attends to self (diagonal only).
                        This disables cross-batch interaction for ablation study.
                        The module still has the same parameters, but no cross-sample info flows.
+            use_gate: If True, use question-aware gating instead of scalar scale.
+            gate_hidden_size: Hidden size for gate MLP (default: hidden_size // 4)
         """
         super().__init__()
         self.hidden_size = hidden_size
@@ -44,6 +54,7 @@ class CrossBatchAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.temperature = temperature
         self.self_only = self_only
+        self.use_gate = use_gate
 
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
 
@@ -55,10 +66,33 @@ class CrossBatchAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
         self.dropout = nn.Dropout(dropout)
-        # Learnable scale for the additive term (start small)
-        self.scale = nn.Parameter(torch.tensor(-3.0))  # sigmoid(-3) ≈ 0.047
+
+        if use_gate:
+            # Question-aware gating network
+            # Input: concat(H, cross_batch_info) -> gate value per dimension
+            gate_hidden = gate_hidden_size or hidden_size // 4
+            self.gate_net = nn.Sequential(
+                nn.Linear(hidden_size * 2, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, hidden_size),
+                nn.Sigmoid(),
+            )
+            # Initialize gate to output small values initially
+            self._init_gate_weights()
+        else:
+            # Learnable scale for the additive term (start small)
+            self.scale = nn.Parameter(torch.tensor(-3.0))  # sigmoid(-3) ≈ 0.047
 
         self._init_weights()
+
+    def _init_gate_weights(self):
+        """Initialize gate network to output small values initially."""
+        # Initialize the final linear layer to output values near 0
+        # This ensures H_out ≈ H at the start of training
+        final_layer = self.gate_net[-2]  # Linear before Sigmoid
+        nn.init.zeros_(final_layer.weight)
+        # Bias initialized to -3 so sigmoid(-3) ≈ 0.047
+        nn.init.constant_(final_layer.bias, -3.0)
 
     def _init_weights(self):
         """Initialize weights - start with near-zero output."""
@@ -124,16 +158,26 @@ class CrossBatchAttention(nn.Module):
         cross_batch_output = cross_batch_output.reshape(batch_size, self.hidden_size)
         cross_batch_output = self.out_proj(cross_batch_output)
 
-        # ADDITIVE: H_out = H + scale * cross_batch_info
-        scale = torch.sigmoid(self.scale)
-        output = hidden_states + scale * cross_batch_output
+        if self.use_gate:
+            # Question-aware gating: gate(H, cross_batch_info) per dimension
+            # Gate decides how much cross-batch info to use based on both H and the info
+            gate_input = torch.cat([hidden_states, cross_batch_output], dim=-1)
+            gate = self.gate_net(gate_input)  # [batch, hidden_size]
+            output = hidden_states + gate * cross_batch_output
+        else:
+            # ADDITIVE: H_out = H + scale * cross_batch_info
+            scale = torch.sigmoid(self.scale)
+            output = hidden_states + scale * cross_batch_output
 
         return output
 
 
 class CrossBatchEmbeddingMixer(nn.Module):
     """
-    Simplified cross-batch mixer: H_out = H + scale * W @ weighted_sum(H_others)
+    Cross-batch mixer with optional question-aware gating.
+
+    Scale mode: H_out = H + scale * W @ weighted_sum(H_others)
+    Gate mode:  H_out = H + gate(H, info) * W @ weighted_sum(H_others)
 
     Uses similarity-based attention to gather info from other samples,
     then ADDS it to the original (not replaces).
@@ -144,20 +188,40 @@ class CrossBatchEmbeddingMixer(nn.Module):
         hidden_size: int,
         temperature: float = 1.0,
         mix_ratio: float = 0.1,  # ignored, kept for API compatibility
+        use_gate: bool = False,
+        gate_hidden_size: int = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.temperature = temperature
+        self.use_gate = use_gate
 
         # Project for computing similarity
         self.similarity_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         # Project for what to add from other samples
         self.value_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        # Learnable scale - start very small (sigmoid(-5) ≈ 0.007)
-        self.scale = nn.Parameter(torch.tensor(-5.0))
+        if use_gate:
+            # Question-aware gating network
+            gate_hidden = gate_hidden_size or hidden_size // 4
+            self.gate_net = nn.Sequential(
+                nn.Linear(hidden_size * 2, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, hidden_size),
+                nn.Sigmoid(),
+            )
+            self._init_gate_weights()
+        else:
+            # Learnable scale - start very small (sigmoid(-5) ≈ 0.007)
+            self.scale = nn.Parameter(torch.tensor(-5.0))
 
         self._init_weights()
+
+    def _init_gate_weights(self):
+        """Initialize gate network to output small values initially."""
+        final_layer = self.gate_net[-2]
+        nn.init.zeros_(final_layer.weight)
+        nn.init.constant_(final_layer.bias, -3.0)
 
     def _init_weights(self):
         """Initialize to near-zero output for stable training."""
@@ -203,8 +267,14 @@ class CrossBatchEmbeddingMixer(nn.Module):
         values = self.value_proj(hidden_states)
         cross_batch_info = torch.mm(weights, values)
 
-        # ADDITIVE: H_out = H + scale * cross_batch_info
-        scale = torch.sigmoid(self.scale)
-        output = hidden_states + scale * cross_batch_info
+        if self.use_gate:
+            # Question-aware gating
+            gate_input = torch.cat([hidden_states, cross_batch_info], dim=-1)
+            gate = self.gate_net(gate_input)
+            output = hidden_states + gate * cross_batch_info
+        else:
+            # ADDITIVE: H_out = H + scale * cross_batch_info
+            scale = torch.sigmoid(self.scale)
+            output = hidden_states + scale * cross_batch_info
 
         return output

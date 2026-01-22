@@ -86,6 +86,7 @@ from src import (
     load_cmb_exam_subdomain_groups,
     load_cmb_exam_context_groups,
     load_triviaqa_groups,
+    load_similarity_grouped_triviaqa,
 )
 
 
@@ -131,9 +132,9 @@ def parse_args():
 
     # 数据集参数
     parser.add_argument('--dataset', type=str, default='squad',
-                        choices=['squad', 'hotpot', 'quac', 'drop', 'triviaqa',
+                        choices=['squad', 'hotpot', 'quac', 'drop', 'triviaqa', 'triviaqa_sim',
                                  'cmb_clin', 'cmb_exam_context', 'cmb_exam_subdomain', 'cmb_exam_random'],
-                        help='数据集 (default: squad)')
+                        help='数据集 (default: squad). triviaqa_sim 使用相似度分组')
     parser.add_argument('--split', type=str, default='validation',
                         help='评估用的数据集 split (default: validation). Supports slice syntax like "train[50:]", "train[:100]".')
     parser.add_argument('--train-split', type=str, default='train',
@@ -144,6 +145,12 @@ def parse_args():
                         help='每个 context 最多问题数 (default: 5)')
     parser.add_argument('--squad-random-questions', action='store_true',
                         help='SQuAD: 随机采样问题而非按 context 分组')
+
+    # 相似度分组参数
+    parser.add_argument('--similarity-threshold', type=float, default=0.5,
+                        help='相似度分组的阈值 (default: 0.5)')
+    parser.add_argument('--embedding-model', type=str, default='sentence-transformers/all-MiniLM-L6-v2',
+                        help='相似度分组使用的 embedding 模型 (default: sentence-transformers/all-MiniLM-L6-v2)')
 
     # 训练参数
     parser.add_argument('--max-samples', type=int, default=None,
@@ -162,10 +169,14 @@ def parse_args():
                         help='随机种子 (default: 42)')
     parser.add_argument('--force', action='store_true',
                         help='强制重新训练，即使 checkpoint 已存在')
-    
-    # Cross-batch ablation
+
+    # Cross-batch 模块参数
     parser.add_argument('--self-only', action='store_true',
                         help='Ablation: CrossBatch 模块只关注自己（对角线 attention），禁用跨样本交互')
+    parser.add_argument('--use-gate', action='store_true',
+                        help='使用 Question-Aware Gating 而非固定 scale')
+    parser.add_argument('--freeze-base-model', action='store_true',
+                        help='冻结 base model，只训练 cross-batch 模块（不训练 lm_head）')
     return parser.parse_args()
 
 
@@ -338,13 +349,25 @@ def load_eval_data(args):
             max_questions=max_questions,
             seed=seed,
         )
+    elif dataset == "triviaqa_sim":
+        # TriviaQA with similarity-based grouping (use same for eval)
+        groups = load_similarity_grouped_triviaqa(
+            split=split,
+            max_groups=max_contexts,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            similarity_threshold=getattr(args, 'similarity_threshold', 0.5),
+            embedding_model=getattr(args, 'embedding_model', 'sentence-transformers/all-MiniLM-L6-v2'),
+            seed=seed,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
     return groups
 
 
-def load_train_data(args):
+def load_train_data(args, rank=0):
     """加载训练数据，返回统一格式的 groups（用于分组训练）"""
     dataset = args.dataset
     max_contexts = args.max_samples  # 训练时用 max_samples 控制数量
@@ -352,6 +375,10 @@ def load_train_data(args):
     max_questions = args.max_questions
     seed = args.seed
     train_split = getattr(args, 'train_split', 'train')  # Support slice syntax
+
+    # 只在 rank 0 打印相似度分组信息
+    if rank == 0 and dataset == "triviaqa_sim":
+        print(f"使用相似度分组 TriviaQA，阈值: {getattr(args, 'similarity_threshold', 0.5)}")
 
     if dataset == "squad":
         groups = load_squad_groups(
@@ -466,6 +493,18 @@ def load_train_data(args):
             max_questions=max_questions,
             seed=seed,
         )
+    elif dataset == "triviaqa_sim":
+        # TriviaQA with similarity-based grouping
+        groups = load_similarity_grouped_triviaqa(
+            split=train_split,
+            max_groups=max_contexts,
+            min_questions=min_questions,
+            max_questions=max_questions,
+            similarity_threshold=getattr(args, 'similarity_threshold', 0.5),
+            embedding_model=getattr(args, 'embedding_model', 'sentence-transformers/all-MiniLM-L6-v2'),
+            seed=seed,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
@@ -578,6 +617,10 @@ def main():
     print_rank0(f'数据集: {args.dataset}, 问题数: {args.min_questions}-{args.max_questions}', rank)
     print_rank0(f'样本数: {args.max_samples}, Epochs: {args.epochs}, Batch: {args.batch_size}', rank)
     print_rank0(f'World size: {world_size}, 总 batch size: {args.batch_size * world_size}', rank)
+    if args.use_gate:
+        print_rank0(f'Cross-batch 模块: Question-Aware Gating', rank)
+    if args.freeze_base_model:
+        print_rank0(f'冻结 base model，只训练 cross-batch 模块', rank)
     print_rank0('=' * 60, rank)
 
     # 加载 tokenizer
@@ -586,7 +629,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # 加载数据集 (按 context 分组)
-    train_groups = load_train_data(args)
+    train_groups = load_train_data(args, rank=rank)
     train_dataset = SQuADGroupedDataset(
         tokenizer=tokenizer,
         groups=train_groups,
@@ -650,23 +693,37 @@ def main():
         dist.barrier()
 
     # 2. Cross-Batch 训练 (lm_head + cross-batch module)
-    print_rank0('\n[2/4] Cross-Batch：训练 lm_head + cross-batch module', rank)
+    train_lm_head = not args.freeze_base_model
+    mode_suffix = 'crossbatch'
+    if args.use_gate:
+        mode_suffix += '_gate'
+    if args.freeze_base_model:
+        mode_suffix += '_frozen'
+
+    if train_lm_head:
+        print_rank0('\n[2/4] Cross-Batch：训练 lm_head + cross-batch module', rank)
+    else:
+        print_rank0('\n[2/4] Cross-Batch：只训练 cross-batch module（冻结 base model）', rank)
     print_rank0('-' * 40, rank)
 
-    crossbatch_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, 'crossbatch')
+    crossbatch_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, mode_suffix)
     if should_skip_training(crossbatch_checkpoint_path, args.force, rank):
         print_rank0('Checkpoint 已存在，跳过训练', rank)
         training_history['crossbatch'] = []
     else:
         model_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size, self_only=args.self_only)
+        cross_batch_module = CrossBatchAttention(
+            hidden_size=model_crossbatch.config.hidden_size,
+            self_only=args.self_only,
+            use_gate=args.use_gate,
+        )
         trainer_crossbatch = CrossBatchTrainer(
             model=model_crossbatch,
             tokenizer=tokenizer,
             cross_batch_module=cross_batch_module,
             device=device,
             learning_rate=args.lr,
-            train_lm_head=True,
+            train_lm_head=train_lm_head,
         )
 
         history_crossbatch = trainer_crossbatch.train(
@@ -686,15 +743,18 @@ def main():
         if is_main_process(rank):
             checkpoint = {
                 'cross_batch_module': cross_batch_module.state_dict(),
-                'lm_head': model_crossbatch.lm_head.state_dict(),
                 'config': {
                     'model': args.model,
                     'dataset': args.dataset,
                     'hidden_size': model_crossbatch.config.hidden_size,
                     'train_samples': args.max_samples,
                     'epochs': args.epochs,
+                    'use_gate': args.use_gate,
+                    'freeze_base_model': args.freeze_base_model,
                 },
             }
+            if train_lm_head:
+                checkpoint['lm_head'] = model_crossbatch.lm_head.state_dict()
             torch.save(checkpoint, crossbatch_checkpoint_path)
             print(f'Cross-Batch checkpoint 已保存到: {crossbatch_checkpoint_path}')
 
@@ -760,16 +820,24 @@ def main():
         dist.barrier()
 
     # 4. LoRA + lm_head + cross-batch 训练
+    lora_cb_mode_suffix = 'lora_crossbatch'
+    if args.use_gate:
+        lora_cb_mode_suffix += '_gate'
+
     print_rank0('\n[4/4] LoRA + lm_head + cross-batch：训练 LoRA + lm_head + cross-batch', rank)
     print_rank0('-' * 40, rank)
 
-    lora_crossbatch_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, 'lora_crossbatch')
+    lora_crossbatch_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, lora_cb_mode_suffix)
     if should_skip_training(lora_crossbatch_checkpoint_path, args.force, rank):
         print_rank0('Checkpoint 已存在，跳过训练', rank)
         training_history['lora_crossbatch'] = []
     else:
         model_lora_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size, self_only=args.self_only)
+        cross_batch_lora_cb = CrossBatchAttention(
+            hidden_size=model_lora_crossbatch.config.hidden_size,
+            self_only=args.self_only,
+            use_gate=args.use_gate,
+        )
         trainer_lora_crossbatch = LoRACrossBatchTrainer(
             model=model_lora_crossbatch,
             tokenizer=tokenizer,
@@ -803,6 +871,7 @@ def main():
                     'hidden_size': model_lora_crossbatch.config.hidden_size,
                     'train_samples': args.max_samples,
                     'epochs': args.epochs,
+                    'use_gate': args.use_gate,
                 },
             }, lora_crossbatch_checkpoint_path)
             print(f'LoRA + lm_head + cross-batch checkpoint 已保存到: {lora_crossbatch_checkpoint_path}')

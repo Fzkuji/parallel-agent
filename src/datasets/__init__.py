@@ -12,6 +12,11 @@ from .drop import load_drop_groups
 from .triviaqa import load_triviaqa, load_triviaqa_groups
 from .mmlu import load_mmlu
 from .gsm8k import load_gsm8k
+from .similarity_grouped import (
+    load_similarity_grouped_triviaqa,
+    load_similarity_grouped_nq,
+    load_similarity_grouped_generic,
+)
 from ..models import Question
 from ..text_utils import detect_aggregate_question
 
@@ -30,6 +35,9 @@ __all__ = [
     "load_triviaqa_groups",
     "load_mmlu",
     "load_gsm8k",
+    "load_similarity_grouped_triviaqa",
+    "load_similarity_grouped_nq",
+    "load_similarity_grouped_generic",
     "build_questions_from_group",
 ]
 

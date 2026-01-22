@@ -17,12 +17,18 @@ Usage:
         --checkpoint outputs/checkpoints/triviaqa/Qwen_Qwen2.5-0.5B-Instruct_crossbatch.pt \
         --n-groups 100
 
-    # Multi-GPU parallel
+    # Multi-GPU parallel (auto-detect GPUs)
     python scripts/preliminary/eval_cross_batch_strategies.py \
         --model Qwen/Qwen2.5-7B-Instruct \
         --checkpoint outputs/checkpoints/triviaqa/Qwen_Qwen2.5-7B-Instruct_crossbatch.pt \
-        --use-vllm \
         --n-groups 500
+
+    # Multi-GPU parallel with specific number of GPUs
+    python scripts/preliminary/eval_cross_batch_strategies.py \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --checkpoint outputs/checkpoints/triviaqa/Qwen_Qwen2.5-7B-Instruct_crossbatch.pt \
+        --n-groups 500 \
+        --n-gpus 4
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
 import argparse
 import json
 import logging
+import multiprocessing as mp
 import random
 import re
 import time
@@ -101,6 +108,8 @@ def parse_args():
                         help='Strategies to evaluate')
     parser.add_argument('--summarize', action='store_true',
                         help='Only summarize existing results, do not run experiments')
+    parser.add_argument('--n-gpus', type=int, default=None,
+                        help='Number of GPUs to use for parallel inference (default: auto-detect)')
     return parser.parse_args()
 
 
@@ -572,11 +581,21 @@ def run_cross_batch(
 
     # Load cross-batch module
     hidden_size = model.config.hidden_size
-    cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
 
+    # Check checkpoint for use_gate config
+    use_gate = False
     if checkpoint_path and os.path.exists(checkpoint_path):
         logger.info(f"Loading cross-batch checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Check if checkpoint was trained with gating
+        if 'config' in checkpoint:
+            use_gate = checkpoint['config'].get('use_gate', False)
+            if use_gate:
+                logger.info("Checkpoint uses Question-Aware Gating")
+
+    cross_batch_module = CrossBatchAttention(hidden_size=hidden_size, use_gate=use_gate)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
         if 'cross_batch_module' in checkpoint:
             cross_batch_module.load_state_dict(checkpoint['cross_batch_module'])
         if 'lm_head' in checkpoint:
@@ -676,6 +695,151 @@ def run_cross_batch(
     )
 
 
+def _merge_results(results: List[ExperimentResult]) -> ExperimentResult:
+    """Merge results from multiple ranks into one."""
+    if not results:
+        raise ValueError("No results to merge")
+    if len(results) == 1:
+        return results[0]
+
+    total_correct = 0
+    total_f1 = 0.0
+    total_lenient = 0.0
+    total_questions = 0
+    total_latency = 0.0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_unique_prompt_tokens = 0
+    total_sum_completion_tokens = 0
+    all_details = []
+
+    for r in results:
+        total_questions += r.n_questions
+        total_correct += int(r.metrics.get("em", 0) * r.n_questions)
+        total_f1 += r.metrics.get("f1", 0) * r.n_questions
+        total_lenient += r.metrics.get("lenient", 0) * r.n_questions
+        total_latency += r.latency
+        total_prompt_tokens += r.prompt_tokens
+        total_completion_tokens += r.completion_tokens
+        total_unique_prompt_tokens += r.unique_prompt_tokens
+        total_sum_completion_tokens += r.total_completion_tokens
+        all_details.extend(r.details)
+
+    em = total_correct / total_questions if total_questions > 0 else 0
+    f1 = total_f1 / total_questions if total_questions > 0 else 0
+    lenient = total_lenient / total_questions if total_questions > 0 else 0
+
+    return ExperimentResult(
+        condition=results[0].condition,
+        dataset=results[0].dataset,
+        n_samples=sum(r.n_samples for r in results),
+        n_questions=total_questions,
+        accuracy=em,
+        metrics={"em": em, "f1": f1, "lenient": lenient},
+        latency=total_latency,
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+        unique_prompt_tokens=total_unique_prompt_tokens,
+        total_completion_tokens=total_sum_completion_tokens,
+        details=all_details,
+    )
+
+
+def worker_process(
+    rank: int,
+    world_size: int,
+    gpu_id: int,
+    model: str,
+    use_vllm: bool,
+    groups: List[Dict[str, Any]],
+    strategies: List[str],
+    checkpoint_path: Optional[str],
+    seed: int,
+    output_dir: str,
+):
+    """Worker process that runs on a single GPU."""
+    # IMPORTANT: Set environment variables BEFORE importing anything CUDA-related
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["VLLM_USE_V1"] = "0"
+    os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
+    os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
+    os.environ["TQDM_DISABLE"] = "1"
+    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+    os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(groups)} groups")
+
+    results = []
+
+    # Run non-cross-batch strategies
+    non_cross_batch_strategies = [s for s in strategies if s != 'cross_batch']
+    if non_cross_batch_strategies:
+        client = LLMClient(
+            model=model,
+            use_local=True,
+            use_vllm=use_vllm,
+            tensor_parallel_size=1,
+        )
+
+        logger.info(f"[Worker {rank}] Model loaded, running strategies: {non_cross_batch_strategies}")
+
+        if 'independent' in non_cross_batch_strategies:
+            logger.info(f"[Worker {rank}] Running independent...")
+            results.append(run_independent(groups, client))
+
+        if 'all_in_one' in non_cross_batch_strategies:
+            logger.info(f"[Worker {rank}] Running all_in_one...")
+            results.append(run_all_in_one(groups, client))
+
+        if 'seq_shared_rand' in non_cross_batch_strategies:
+            logger.info(f"[Worker {rank}] Running seq_shared_rand...")
+            results.append(run_seq_shared_rand(groups, client, seed=seed + rank))
+
+        if 'seq_shared_rand_full' in non_cross_batch_strategies:
+            logger.info(f"[Worker {rank}] Running seq_shared_rand_full...")
+            results.append(run_seq_shared_rand_full(groups, client, seed=seed + rank))
+
+        # Clean up client to free GPU memory before loading cross-batch model
+        del client
+        torch.cuda.empty_cache()
+
+    # Run cross-batch strategy
+    if 'cross_batch' in strategies:
+        logger.info(f"[Worker {rank}] Running cross_batch...")
+        results.append(run_cross_batch(
+            groups=groups,
+            model_name=model,
+            checkpoint_path=checkpoint_path,
+            device="cuda:0",  # After CUDA_VISIBLE_DEVICES, device 0 is the assigned GPU
+        ))
+
+    logger.info(f"[Worker {rank}] Finished, saving results...")
+
+    # Save results to temp file
+    results_data = []
+    for r in results:
+        results_data.append({
+            "condition": r.condition,
+            "dataset": r.dataset,
+            "n_samples": r.n_samples,
+            "n_questions": r.n_questions,
+            "accuracy": r.accuracy,
+            "metrics": r.metrics,
+            "latency": r.latency,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "unique_prompt_tokens": r.unique_prompt_tokens,
+            "total_completion_tokens": r.total_completion_tokens,
+            "details": r.details,
+        })
+
+    temp_file = os.path.join(output_dir, f"temp_rank{rank}.json")
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(results_data, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"[Worker {rank}] Results saved to {temp_file}")
+
+
 def print_results_table(results: List[ExperimentResult]):
     """Print results in a nice table format."""
     print("\n" + "=" * 100)
@@ -719,6 +883,14 @@ def main():
         # TODO: Implement summarize_from_files for this script
         return
 
+    # Detect number of GPUs
+    if args.use_local and torch.cuda.is_available():
+        num_gpus = args.n_gpus if args.n_gpus else torch.cuda.device_count()
+        logger.info(f"Detected {torch.cuda.device_count()} GPU(s), using {num_gpus}")
+    else:
+        num_gpus = 1
+        logger.info("Using CPU or API mode")
+
     # Load SQuAD groups
     groups = load_squad_groups(
         n_groups=args.n_groups,
@@ -726,41 +898,118 @@ def main():
         seed=args.seed,
     )
 
-    results = []
+    # Ensure output directory exists
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Initialize LLM client for non-cross-batch strategies
-    if any(s in args.strategies for s in ['independent', 'all_in_one', 'seq_shared_rand', 'seq_shared_rand_full']):
-        client = LLMClient(
-            model=args.model,
-            use_local=args.use_local,
-            use_vllm=args.use_vllm,
-            tensor_parallel_size=args.tensor_parallel_size,
-        )
+    final_results = []
 
-        if 'independent' in args.strategies:
-            results.append(run_independent(groups, client))
+    if args.use_local and num_gpus > 1:
+        # Multi-GPU parallel mode with multiprocessing
+        gpus = list(range(num_gpus))
+        world_size = num_gpus
 
-        if 'all_in_one' in args.strategies:
-            results.append(run_all_in_one(groups, client))
+        logger.info(f"Parallel mode with {world_size} GPUs: {gpus}")
 
-        if 'seq_shared_rand' in args.strategies:
-            results.append(run_seq_shared_rand(groups, client, seed=args.seed))
+        # Shard data across workers
+        shards = [[] for _ in range(world_size)]
+        for i, g in enumerate(groups):
+            shards[i % world_size].append(g)
 
-        if 'seq_shared_rand_full' in args.strategies:
-            results.append(run_seq_shared_rand_full(groups, client, seed=args.seed))
+        for rank in range(world_size):
+            logger.info(f"  Worker {rank}: {len(shards[rank])} groups")
 
-    # Run cross-batch (uses different inference path)
-    if 'cross_batch' in args.strategies:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        results.append(run_cross_batch(
-            groups=groups,
-            model_name=args.model,
-            checkpoint_path=args.checkpoint,
-            device=device,
-        ))
+        # Spawn worker processes
+        mp.set_start_method('spawn', force=True)
+        processes = []
+
+        for rank in range(world_size):
+            gpu_id = gpus[rank]
+            p = mp.Process(
+                target=worker_process,
+                args=(rank, world_size, gpu_id, args.model, args.use_vllm,
+                      shards[rank], args.strategies, args.checkpoint,
+                      args.seed, args.output_dir)
+            )
+            p.start()
+            processes.append(p)
+            logger.info(f"Started worker {rank} on GPU {gpu_id} (PID: {p.pid})")
+
+        # Wait for all workers
+        for p in processes:
+            p.join()
+
+        logger.info("All workers finished, merging results...")
+
+        # Merge results from all workers
+        all_results_by_condition = {}
+        for rank in range(world_size):
+            temp_file = os.path.join(args.output_dir, f"temp_rank{rank}.json")
+            if os.path.exists(temp_file):
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    results_data = json.load(f)
+                for r in results_data:
+                    cond = r["condition"]
+                    if cond not in all_results_by_condition:
+                        all_results_by_condition[cond] = []
+                    all_results_by_condition[cond].append(ExperimentResult(
+                        condition=r["condition"],
+                        dataset=r["dataset"],
+                        n_samples=r["n_samples"],
+                        n_questions=r["n_questions"],
+                        accuracy=r["accuracy"],
+                        metrics=r["metrics"],
+                        latency=r["latency"],
+                        prompt_tokens=r["prompt_tokens"],
+                        completion_tokens=r["completion_tokens"],
+                        unique_prompt_tokens=r.get("unique_prompt_tokens", 0),
+                        total_completion_tokens=r.get("total_completion_tokens", 0),
+                        details=r["details"],
+                    ))
+                os.remove(temp_file)
+
+        # Merge results for each condition
+        for cond, results_list in all_results_by_condition.items():
+            merged = _merge_results(results_list)
+            final_results.append(merged)
+
+    else:
+        # Single process mode (API or single GPU)
+        if args.use_local and num_gpus == 1:
+            logger.info("Single GPU mode: using GPU 0")
+
+        # Initialize LLM client for non-cross-batch strategies
+        if any(s in args.strategies for s in ['independent', 'all_in_one', 'seq_shared_rand', 'seq_shared_rand_full']):
+            client = LLMClient(
+                model=args.model,
+                use_local=args.use_local,
+                use_vllm=args.use_vllm,
+                tensor_parallel_size=args.tensor_parallel_size,
+            )
+
+            if 'independent' in args.strategies:
+                final_results.append(run_independent(groups, client))
+
+            if 'all_in_one' in args.strategies:
+                final_results.append(run_all_in_one(groups, client))
+
+            if 'seq_shared_rand' in args.strategies:
+                final_results.append(run_seq_shared_rand(groups, client, seed=args.seed))
+
+            if 'seq_shared_rand_full' in args.strategies:
+                final_results.append(run_seq_shared_rand_full(groups, client, seed=args.seed))
+
+        # Run cross-batch (uses different inference path)
+        if 'cross_batch' in args.strategies:
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            final_results.append(run_cross_batch(
+                groups=groups,
+                model_name=args.model,
+                checkpoint_path=args.checkpoint,
+                device=device,
+            ))
 
     # Print and save results
-    print_results_table(results)
+    print_results_table(final_results)
 
     # Save to file
     config = ExperimentConfig(
@@ -771,7 +1020,7 @@ def main():
         seed=args.seed,
         output_dir=args.output_dir,
     )
-    save_results(results, config)
+    save_results(final_results, config)
 
     print(f"Results saved to {args.output_dir}")
 
