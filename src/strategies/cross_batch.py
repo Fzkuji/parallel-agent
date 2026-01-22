@@ -88,6 +88,7 @@ def run_cross_batch_strategy(
             num_layers = model.config.num_hidden_layers
 
             # Load checkpoint if provided (to get config)
+            checkpoint = None
             if checkpoint_path:
                 checkpoint = torch.load(checkpoint_path, map_location=device)
                 config = checkpoint.get("config", {})
@@ -96,12 +97,25 @@ def run_cross_batch_strategy(
                     mix_method = config["module_type"]
                 if "mix_layer" in config:
                     mix_layer = config["mix_layer"]
-                if "mix_layers" in config and config["mix_layers"]:
+                # Read mix_layers from config (even if None)
+                if "mix_layers" in config:
                     mix_layers = config["mix_layers"]
 
             # Create cross-batch module based on method
             if mix_method == "multi_layer":
-                layer_indices = mix_layers if mix_layers else list(range(num_layers // 2, num_layers))
+                # If loading from checkpoint and mix_layers not specified, infer from state_dict
+                if checkpoint is not None and mix_layers is None:
+                    state_dict = checkpoint["cross_batch_module"]
+                    # Extract layer indices from keys like "gates.0.gate.weight"
+                    layer_keys = [k for k in state_dict.keys() if k.startswith("gates.") and k.endswith(".gate.weight")]
+                    inferred_indices = sorted([int(k.split(".")[1]) for k in layer_keys])
+                    if inferred_indices:
+                        mix_layers = inferred_indices
+                        import logging
+                        logging.info(f"Inferred layer_indices from checkpoint: {mix_layers[:5]}{'...' if len(mix_layers) > 5 else ''}")
+
+                # Fallback to all layers if still None
+                layer_indices = mix_layers if mix_layers is not None else list(range(num_layers))
                 cross_batch_module = MultiLayerCrossBatch(
                     hidden_size=hidden_size,
                     num_layers=num_layers,
@@ -115,7 +129,7 @@ def run_cross_batch_strategy(
                 cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
 
             # Load checkpoint weights
-            if checkpoint_path:
+            if checkpoint is not None:
                 cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
                 if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
                     model.lm_head.load_state_dict(checkpoint["lm_head"])
@@ -308,6 +322,7 @@ def run_cross_batch_multi_strategy(
             num_layers = model.config.num_hidden_layers
 
             # Load checkpoint if provided (to get config)
+            checkpoint = None
             if checkpoint_path:
                 checkpoint = torch.load(checkpoint_path, map_location=device)
                 config = checkpoint.get("config", {})
@@ -316,12 +331,25 @@ def run_cross_batch_multi_strategy(
                     mix_method = config["module_type"]
                 if "mix_layer" in config:
                     mix_layer = config["mix_layer"]
-                if "mix_layers" in config and config["mix_layers"]:
+                # Read mix_layers from config (even if None)
+                if "mix_layers" in config:
                     mix_layers = config["mix_layers"]
 
             # Create cross-batch module based on method
             if mix_method == "multi_layer":
-                layer_indices = mix_layers if mix_layers else list(range(num_layers // 2, num_layers))
+                # If loading from checkpoint and mix_layers not specified, infer from state_dict
+                if checkpoint is not None and mix_layers is None:
+                    state_dict = checkpoint["cross_batch_module"]
+                    # Extract layer indices from keys like "gates.0.gate.weight"
+                    layer_keys = [k for k in state_dict.keys() if k.startswith("gates.") and k.endswith(".gate.weight")]
+                    inferred_indices = sorted([int(k.split(".")[1]) for k in layer_keys])
+                    if inferred_indices:
+                        mix_layers = inferred_indices
+                        import logging
+                        logging.info(f"Inferred layer_indices from checkpoint: {mix_layers[:5]}{'...' if len(mix_layers) > 5 else ''}")
+
+                # Fallback to all layers if still None
+                layer_indices = mix_layers if mix_layers is not None else list(range(num_layers))
                 cross_batch_module = MultiLayerCrossBatch(
                     hidden_size=hidden_size,
                     num_layers=num_layers,
@@ -335,7 +363,7 @@ def run_cross_batch_multi_strategy(
                 cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
 
             # Load checkpoint weights
-            if checkpoint_path:
+            if checkpoint is not None:
                 cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
                 if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
                     model.lm_head.load_state_dict(checkpoint["lm_head"])
