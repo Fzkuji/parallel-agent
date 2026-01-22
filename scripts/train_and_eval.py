@@ -31,6 +31,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.datasets.squad import load_squad_groups
+from src.datasets.hotpot import load_hotpot_groups
 from src.models import Question
 from src.strategies.sequential_batch import run_batch_multi_strategy
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
@@ -77,8 +78,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def squad_to_items(context_payload: dict) -> List[dict]:
-    """Convert SQuAD context format to items format for batch strategy."""
+def context_to_items(context_payload: dict) -> List[dict]:
+    """Convert context format to items format for batch strategy.
+
+    Supports both SQuAD and HotpotQA formats.
+    """
+    # HotpotQA format: already has items
+    if "items" in context_payload:
+        return context_payload["items"]
+
+    # SQuAD format: convert from shared context
     context = context_payload["context"]
     items = []
     for q in context_payload["questions"]:
@@ -102,7 +111,7 @@ def run_baseline_on_shard(
     shard_results = {"contexts": []}
 
     for idx, context_payload in enumerate(eval_contexts, start=1):
-        items = squad_to_items(context_payload)
+        items = context_to_items(context_payload)
         title = context_payload.get("title", f"context-{idx}")
 
         logging.info(f"Baseline: Processing {idx}/{len(eval_contexts)}: {title}")
@@ -233,7 +242,7 @@ def evaluate_checkpoint_on_shard(
     shard_results = {"contexts": []}
 
     for idx, context_payload in enumerate(eval_contexts, start=1):
-        items = squad_to_items(context_payload)
+        items = context_to_items(context_payload)
         title = context_payload.get("title", f"context-{idx}")
 
         logging.info(f"Epoch {epoch}: Evaluating {idx}/{len(eval_contexts)}: {title}")
@@ -397,13 +406,23 @@ def main():
     # Load evaluation data (all ranks load full dataset, then shard)
     if rank == 0:
         logging.info(f"Loading evaluation data: {args.eval_samples} samples")
-    eval_contexts = load_squad_groups(
-        split="validation",
-        min_questions=args.min_questions,
-        max_questions=args.max_questions,
-        max_contexts=args.eval_samples,
-        seed=args.seed,
-    )
+
+    if args.dataset == "hotpot":
+        eval_contexts = load_hotpot_groups(
+            split="validation",
+            max_contexts=args.eval_samples,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            seed=args.seed + 1000,  # Different seed for eval
+        )
+    else:  # squad
+        eval_contexts = load_squad_groups(
+            split="validation",
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.eval_samples,
+            seed=args.seed + 1000,  # Different seed for eval
+        )
 
     # Shard evaluation data across GPUs
     if world_size > 1:
@@ -433,18 +452,28 @@ def main():
         logging.info(f"  F1:  {baseline_results['aggregate_metrics']['f1']:.4f}")
         logging.info(f"  Latency: {baseline_results['aggregate_metrics']['avg_latency']:.2f}s")
 
-    # Training (only on rank 0)
+    # Training (all ranks participate)
     safe_model_name = args.model.replace('/', '_')
     checkpoint_base = Path(args.checkpoint_dir) / args.dataset / safe_model_name
     if rank == 0:
         checkpoint_base.mkdir(parents=True, exist_ok=True)
-
         logging.info("\n" + "=" * 60)
         logging.info("STEP 2: Training Cross-Batch Module")
         logging.info("=" * 60)
 
-        # Load training data
+    # All ranks load training data
+    if rank == 0:
         logging.info(f"Loading training data: {args.train_samples} samples")
+
+    if args.dataset == "hotpot":
+        train_groups = load_hotpot_groups(
+            split="train",
+            max_contexts=args.train_samples,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            seed=args.seed,
+        )
+    else:  # squad
         train_groups = load_squad_groups(
             split="train",
             min_questions=args.min_questions,
@@ -453,55 +482,65 @@ def main():
             seed=args.seed,
         )
 
-        # Create dataset
-        train_dataset = SQuADGroupedDataset(
-            tokenizer=tokenizer,
-            groups=train_groups,
-            dataset_name=args.dataset,
-        )
-        total_questions = sum(len(g.get("questions", [])) for g in train_groups)
+    # Shard training data across GPUs (for DDP)
+    if world_size > 1:
+        # Each rank gets a different shard
+        train_groups = train_groups[rank::world_size]
+        logging.info(f"Training on {len(train_groups)} contexts (shard {rank}/{world_size})")
+
+    # All ranks create dataset
+    train_dataset = SQuADGroupedDataset(
+        tokenizer=tokenizer,
+        groups=train_groups,
+        dataset_name=args.dataset,
+    )
+    total_questions = sum(len(g.get("questions", [])) for g in train_groups)
+    if rank == 0:
         logging.info(f"Training dataset: {len(train_dataset)} contexts, {total_questions} questions")
 
-        # Parse mix_layers
-        mix_layers = None
-        if args.mix_layers:
-            mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
+    # Parse mix_layers
+    mix_layers = None
+    if args.mix_layers:
+        mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
 
-        # Create cross-batch module
-        hidden_size = model.config.hidden_size
-        num_layers = model.config.num_hidden_layers
+    # All ranks create cross-batch module
+    hidden_size = model.config.hidden_size
+    num_layers = model.config.num_hidden_layers
 
-        if args.module_type == "multi_layer":
-            layer_indices = mix_layers if mix_layers else list(range(num_layers))
-            cross_batch_module = MultiLayerCrossBatch(
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                layer_indices=layer_indices,
-                temperature=1.0,
-            )
+    if args.module_type == "multi_layer":
+        layer_indices = mix_layers if mix_layers else list(range(num_layers))
+        cross_batch_module = MultiLayerCrossBatch(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            layer_indices=layer_indices,
+            temperature=1.0,
+        )
+        if rank == 0:
             logging.info(f"Using MultiLayerCrossBatch with {len(layer_indices)} layers: {layer_indices[:5]}...")
-        elif args.module_type == "simple":
-            cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size, temperature=1.0)
-        elif args.module_type == "attention":
-            cross_batch_module = CrossBatchAttention(hidden_size=hidden_size, num_heads=8, temperature=1.0)
-        else:  # mixer
-            cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size, temperature=1.0)
+    elif args.module_type == "simple":
+        cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size, temperature=1.0)
+    elif args.module_type == "attention":
+        cross_batch_module = CrossBatchAttention(hidden_size=hidden_size, num_heads=8, temperature=1.0)
+    else:  # mixer
+        cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size, temperature=1.0)
 
+    if rank == 0:
         num_params = sum(p.numel() for p in cross_batch_module.parameters())
         logging.info(f"Cross-batch module parameters: {num_params:,}")
 
-        # Create trainer
-        device = str(next(model.parameters()).device)
-        trainer = CrossBatchTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            cross_batch_module=cross_batch_module,
-            device=device,
-            learning_rate=args.lr,
-            train_lm_head=False,
-            local_rank=-1,
-            mix_layer=-1,
-        )
+    # Create trainer (all ranks)
+    device = str(next(model.parameters()).device)
+    local_rank = rank if world_size > 1 else -1
+    trainer = CrossBatchTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        cross_batch_module=cross_batch_module,
+        device=device,
+        learning_rate=args.lr,
+        train_lm_head=False,
+        local_rank=local_rank,  # Enable DDP wrapper
+        mix_layer=-1,
+    )
 
     # Results tracking
     all_results = {
@@ -516,26 +555,34 @@ def main():
             logging.info(f"\n{'=' * 60}")
             logging.info(f"Epoch {epoch}/{args.epochs}")
             logging.info("=" * 60)
-            logging.info("Training...")
 
-            # Train for one epoch
-            history = trainer.train(
-                train_dataset=train_dataset,
-                num_epochs=1,
-                batch_size=args.batch_size,
-                save_dir=None,
-                distributed=False,
-                rank=0,
-                world_size=1,
-                grouped=True,
-            )
+        logging.info("Training...")
 
+        # All ranks train for one epoch (DDP)
+        history = trainer.train(
+            train_dataset=train_dataset,
+            num_epochs=1,
+            batch_size=args.batch_size,
+            save_dir=None,
+            distributed=(world_size > 1),
+            rank=rank,
+            world_size=world_size,
+            grouped=True,
+        )
+
+        if rank == 0:
             logging.info(f"Training complete - Loss: {history['train_loss'][-1]:.4f}, Improvement: {history['improvement'][-1]:.4f}")
 
-            # Save checkpoint
+            # Save checkpoint (only rank 0)
             checkpoint_path = str(checkpoint_base / f"{args.module_type}_frozen_epoch{epoch}.pt")
+            # Get unwrapped module state dict (if DDP wrapped)
+            if hasattr(trainer, 'cross_batch_module_unwrapped'):
+                module_state = trainer.cross_batch_module_unwrapped.state_dict()
+            else:
+                module_state = cross_batch_module.state_dict()
+
             checkpoint = {
-                'cross_batch_module': cross_batch_module.state_dict(),
+                'cross_batch_module': module_state,
                 'config': {
                     'model': args.model,
                     'dataset': args.dataset,
