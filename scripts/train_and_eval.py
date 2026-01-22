@@ -27,7 +27,7 @@ from src.datasets.squad import load_squad_groups
 from src.models import Question, StrategyResult
 from src.strategies.sequential_batch import run_batch_multi_strategy
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
-from src.evaluation import print_answer_table, summarize_results
+from src.evaluation import evaluate_predictions
 from src.cross_batch import train_cross_batch_module
 
 
@@ -64,6 +64,21 @@ def parse_args():
     return parser.parse_args()
 
 
+def squad_to_items(context_payload: dict) -> List[dict]:
+    """Convert SQuAD context format to items format for batch strategy."""
+    context = context_payload["context"]
+    items = []
+    for q in context_payload["questions"]:
+        items.append({
+            "qid": q["qid"],
+            "question": q["text"],
+            "context": context,
+            "references": q["references"],
+            "answer_tokens": q.get("answer_tokens", 12),
+        })
+    return items
+
+
 def load_or_run_baseline(
     args,
     eval_contexts: List[Dict],
@@ -92,7 +107,7 @@ def load_or_run_baseline(
     total_generated_tokens = 0
 
     for idx, context_payload in enumerate(eval_contexts, start=1):
-        items = context_payload["items"]
+        items = squad_to_items(context_payload)
         title = context_payload.get("title", f"context-{idx}")
 
         logging.info(f"Baseline: Processing {idx}/{len(eval_contexts)}: {title}")
@@ -191,7 +206,7 @@ def evaluate_checkpoint(
         mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
 
     for idx, context_payload in enumerate(eval_contexts, start=1):
-        items = context_payload["items"]
+        items = squad_to_items(context_payload)
         title = context_payload.get("title", f"context-{idx}")
 
         logging.info(f"Epoch {epoch}: Evaluating {idx}/{len(eval_contexts)}: {title}")
