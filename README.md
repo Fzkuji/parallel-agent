@@ -311,27 +311,52 @@ The `collab_hidden` strategy uses cross-batch attention mechanisms that enable i
 | `lora_lmhead` | LoRA adapters + lm_head |
 | `lora_crossbatch` | LoRA + lm_head + cross-batch attention |
 
-### Training (DDP 8-GPU)
+### Training (DDP Multi-GPU)
+
+The training script supports DDP (DistributedDataParallel) for multi-GPU training. Use `torchrun` to launch:
 
 ```bash
-# Full training on SQuAD
+# Full training on SQuAD (8 GPUs)
 torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
     --batch-size 4 \
     --epochs 1
 
-# Quick test with limited data
+# Training with Question-Aware Gating (recommended for better cross-batch selection)
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --batch-size 4 \
+    --use-gate
+
+# Train only cross-batch module, freeze base model
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --batch-size 4 \
+    --use-gate \
+    --freeze-base-model
+
+# Train on TriviaQA with similarity-based grouping (semantic clustering)
+torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset triviaqa_sim \
+    --batch-size 4 \
+    --similarity-threshold 0.5
+
+# Quick test with limited data (single GPU)
 python scripts/train_cross_batch.py \
     --model Qwen/Qwen2.5-0.5B-Instruct \
     --max-samples 1000 \
     --eval-samples 100
 
-# Train on other datasets
+# Force re-training (overwrite existing checkpoints)
 torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
     --model Qwen/Qwen2.5-7B-Instruct \
-    --dataset hotpot \
-    --batch-size 4
+    --dataset squad \
+    --batch-size 4 \
+    --force
 ```
 
 Checkpoints are saved to `outputs/checkpoints/{dataset}/`:
@@ -345,15 +370,33 @@ Checkpoints are saved to `outputs/checkpoints/{dataset}/`:
 | Argument | Description |
 |----------|-------------|
 | `--model` | Model name (default: `Qwen/Qwen2.5-0.5B-Instruct`) |
-| `--dataset` | Dataset: `squad`, `hotpot`, `quac`, `drop`, `cmb_clin`, `cmb_exam_context`, `cmb_exam_subdomain`, `cmb_exam_random` |
+| `--dataset` | Dataset: `squad`, `hotpot`, `quac`, `drop`, `triviaqa`, `triviaqa_sim`, `cmb_clin`, `cmb_exam_context`, `cmb_exam_subdomain`, `cmb_exam_random` |
 | `--max-samples` | Training samples (default: all) |
 | `--eval-samples` | Evaluation contexts (default: all) |
-| `--min-questions` / `--max-questions` | Questions per context (default: 3-5) |
+| `--min-questions` / `--max-questions` | Questions per context (default: 1-5) |
 | `--epochs` | Training epochs (default: 1) |
 | `--batch-size` | Per-GPU batch size (default: 8) |
 | `--lr` | Learning rate (default: 1e-4) |
 | `--save-dir` | Checkpoint directory (default: `outputs/checkpoints`) |
 | `--force` | Force re-training even if checkpoint exists |
+| `--use-gate` | Use Question-Aware Gating instead of scalar scale |
+| `--freeze-base-model` | Freeze base model, only train cross-batch module |
+| `--similarity-threshold` | Threshold for similarity-based grouping (default: 0.5) |
+| `--embedding-model` | Sentence transformer for similarity grouping |
+
+### Cross-Batch Module Options
+
+| Mode | Description |
+|------|-------------|
+| **Scale mode** (default) | `H_out = H + scale * cross_batch_info` - Simple learnable scalar |
+| **Gate mode** (`--use-gate`) | `H_out = H + gate(H, info) * cross_batch_info` - Question-aware gating decides when to use cross-batch info |
+
+### Dataset Grouping Options
+
+| Dataset | Description |
+|---------|-------------|
+| `triviaqa` | TriviaQA with random grouping |
+| `triviaqa_sim` | TriviaQA with semantic similarity-based grouping (recommended for cross-batch training) |
 
 ### CMB Training Examples
 
