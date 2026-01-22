@@ -699,13 +699,10 @@ class CrossBatchTrainer:
             ctx_mask = context_ids == ctx_id
             ctx_hidden = hidden[ctx_mask]  # [num_questions_in_ctx, hidden_size]
 
-            # Skip if only 1 question (no cross-batch possible)
-            if ctx_hidden.size(0) < 2:
-                mixed_hidden[ctx_mask] = ctx_hidden
-            else:
-                # Apply cross-batch attention within this context
-                ctx_mixed = self.cross_batch_module(ctx_hidden)
-                mixed_hidden[ctx_mask] = ctx_mixed
+            # Always call cross_batch_module (it handles batch_size=1 correctly)
+            # This is important for DDP - all ranks must call the module the same number of times
+            ctx_mixed = self.cross_batch_module(ctx_hidden)
+            mixed_hidden[ctx_mask] = ctx_mixed
 
         return mixed_hidden
 
@@ -1512,10 +1509,8 @@ class LoRACrossBatchTrainer:
         for ctx_id in unique_contexts:
             ctx_mask = context_ids == ctx_id
             ctx_hidden = hidden[ctx_mask]
-            if ctx_hidden.size(0) < 2:
-                mixed_hidden[ctx_mask] = ctx_hidden
-            else:
-                mixed_hidden[ctx_mask] = self.cross_batch_module(ctx_hidden)
+            # Always call cross_batch_module (it handles batch_size=1 correctly for DDP)
+            mixed_hidden[ctx_mask] = self.cross_batch_module(ctx_hidden)
 
         return mixed_hidden
 
