@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.datasets.squad import load_squad_groups
 from src.models import Question, StrategyResult
-from src.strategies.batch import run_batch_multi_strategy
+from src.strategies.sequential_batch import run_batch_multi_strategy
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
 from src.evaluation import print_answer_table, summarize_results
 from src.cross_batch import train_cross_batch_module
