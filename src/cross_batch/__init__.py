@@ -4,8 +4,8 @@ from .attention import CrossBatchAttention, CrossBatchEmbeddingMixer
 from .generator import CrossBatchGenerator
 from .trainer import (
     CrossBatchTrainer,
-    LMHeadOnlyTrainer,
     SQuADDataset,
+    SQuADGroupedDataset,
     train_cross_batch_module,
 )
 from .eval import SquadEvaluator, run_comparison_eval
@@ -17,8 +17,8 @@ __all__ = [
     "CrossBatchGenerator",
     # Training
     "CrossBatchTrainer",
-    "LMHeadOnlyTrainer",
     "SQuADDataset",
+    "SQuADGroupedDataset",
     "train_cross_batch_module",
     # Evaluation
     "SquadEvaluator",
