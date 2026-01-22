@@ -447,7 +447,7 @@ class CrossBatchTrainer:
         module = self.cross_batch_module_unwrapped
 
         if context_ids is None:
-            if isinstance(module, MultiLayerCrossBatch) and layer_idx is not None:
+            if isinstance(module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)) and layer_idx is not None:
                 return self.cross_batch_module.module.forward(layer_idx, hidden) if self.is_distributed else self.cross_batch_module(layer_idx, hidden)
             return self.cross_batch_module(hidden)
 
@@ -464,7 +464,7 @@ class CrossBatchTrainer:
 
             # Always call cross_batch_module (it handles batch_size=1 correctly)
             # This is important for DDP - all ranks must call the module the same number of times
-            if isinstance(module, MultiLayerCrossBatch) and layer_idx is not None:
+            if isinstance(module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)) and layer_idx is not None:
                 if self.is_distributed:
                     ctx_mixed = self.cross_batch_module.module.forward(layer_idx, ctx_hidden)
                 else:
