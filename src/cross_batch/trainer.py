@@ -13,6 +13,8 @@ from typing import Optional, Dict, Any, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -297,6 +299,8 @@ class LMHeadOnlyTrainer:
 
     This is used as a fair baseline comparison to verify whether
     improvements come from cross-batch interaction or just lm_head finetuning.
+
+    Supports DDP (DistributedDataParallel) for multi-GPU training.
     """
 
     def __init__(
@@ -306,10 +310,13 @@ class LMHeadOnlyTrainer:
         device: str = "cuda",
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
+        local_rank: int = -1,
     ):
         self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
+        self.local_rank = local_rank
+        self.is_distributed = local_rank >= 0
         self.model_dtype = next(model.parameters()).dtype
         self.base_model = _resolve_base_model(self.model)
 
@@ -326,6 +333,16 @@ class LMHeadOnlyTrainer:
             logger.info("Training lm_head only (no cross-batch)")
         else:
             raise ValueError("Model does not have lm_head")
+
+        # Wrap lm_head with DDP if distributed
+        if self.is_distributed:
+            self._lm_head_ddp = DDP(
+                self.model.lm_head,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
+            logger.info(f"DDP enabled on local_rank {local_rank}")
 
         self.optimizer = AdamW(
             trainable_params,
@@ -548,6 +565,8 @@ class CrossBatchTrainer:
 
     Training objective: The cross-batch module should help each sample
     generate better answers by leveraging information from other samples.
+
+    Supports DDP (DistributedDataParallel) for multi-GPU training.
     """
 
     def __init__(
@@ -559,11 +578,15 @@ class CrossBatchTrainer:
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
         train_lm_head: bool = True,
+        local_rank: int = -1,
     ):
-        self.model = model.to(device)
         self.tokenizer = tokenizer
         self.device = device
         self.train_lm_head = train_lm_head
+        self.local_rank = local_rank
+        self.is_distributed = local_rank >= 0
+
+        self.model = model.to(device)
         self.base_model = _resolve_base_model(self.model)
 
         # Freeze the base model
@@ -591,6 +614,26 @@ class CrossBatchTrainer:
         else:
             logger.info("Training cross-batch module only")
 
+        # Wrap trainable modules with DDP if distributed
+        if self.is_distributed:
+            # Wrap cross_batch_module with DDP
+            self.cross_batch_module = DDP(
+                self.cross_batch_module,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
+            # If training lm_head, wrap it too
+            if train_lm_head and hasattr(self.model, 'lm_head'):
+                # Create a wrapper module for lm_head to use with DDP
+                self._lm_head_ddp = DDP(
+                    self.model.lm_head,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=False,
+                )
+            logger.info(f"DDP enabled on local_rank {local_rank}")
+
         # Optimizer for trainable parameters
         self.optimizer = AdamW(
             trainable_params,
@@ -601,6 +644,13 @@ class CrossBatchTrainer:
         self.scheduler = None
         self.best_cross_batch_state = None
         self.best_lm_head_state = None
+
+    @property
+    def cross_batch_module_unwrapped(self) -> nn.Module:
+        """Get the unwrapped cross_batch_module (without DDP wrapper)."""
+        if self.is_distributed and hasattr(self.cross_batch_module, 'module'):
+            return self.cross_batch_module.module
+        return self.cross_batch_module
 
     def _hidden_to_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Convert hidden states to logits."""
@@ -970,10 +1020,10 @@ class CrossBatchTrainer:
                            f"Baseline: {metrics['baseline_loss']:.4f}, "
                            f"Improvement: {metrics['improvement']:.4f}")
 
-            # Save best model
+            # Save best model (use unwrapped module for state_dict)
             if metrics["improvement"] > best_improvement:
                 best_improvement = metrics["improvement"]
-                self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module)
+                self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module_unwrapped)
                 if self.train_lm_head and hasattr(self.model, 'lm_head'):
                     self.best_lm_head_state = _clone_state_dict(self.model.lm_head)
                 if save_dir and rank == 0:
@@ -986,9 +1036,9 @@ class CrossBatchTrainer:
             if save_dir and rank == 0 and epoch % 5 == 0:
                 self.save_checkpoint(os.path.join(save_dir, f"checkpoint_epoch{epoch}.pt"))
 
-        # Restore best states for subsequent evaluation
+        # Restore best states for subsequent evaluation (use unwrapped module)
         if self.best_cross_batch_state is not None:
-            self.cross_batch_module.load_state_dict(self.best_cross_batch_state)
+            self.cross_batch_module_unwrapped.load_state_dict(self.best_cross_batch_state)
         if self.best_lm_head_state is not None and hasattr(self.model, 'lm_head'):
             self.model.lm_head.load_state_dict(self.best_lm_head_state)
 
@@ -1004,8 +1054,9 @@ class CrossBatchTrainer:
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint (only trained modules, not full model)."""
+        # Use unwrapped module for state_dict to avoid DDP prefix issues
         save_dict = {
-            "cross_batch_module": self.cross_batch_module.state_dict(),
+            "cross_batch_module": self.cross_batch_module_unwrapped.state_dict(),
         }
         # Also save lm_head if it was trained
         if self.train_lm_head and hasattr(self.model, 'lm_head'):
@@ -1017,7 +1068,8 @@ class CrossBatchTrainer:
     def load_checkpoint(self, path: str):
         """Load model checkpoint (only trained modules)."""
         checkpoint = torch.load(path, map_location=self.device)
-        self.cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
+        # Load to unwrapped module
+        self.cross_batch_module_unwrapped.load_state_dict(checkpoint["cross_batch_module"])
         loaded_modules = ["cross_batch_module"]
         if "lm_head" in checkpoint and hasattr(self.model, 'lm_head'):
             self.model.lm_head.load_state_dict(checkpoint["lm_head"])
@@ -1349,6 +1401,8 @@ class LoRACrossBatchTrainer:
     - LoRA adapters on the base model
     - lm_head (output projection)
     - cross_batch_module (cross-batch attention)
+
+    Supports DDP (DistributedDataParallel) for multi-GPU training.
     """
 
     def __init__(
@@ -1362,9 +1416,12 @@ class LoRACrossBatchTrainer:
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
+        local_rank: int = -1,
     ):
         self.tokenizer = tokenizer
         self.device = device
+        self.local_rank = local_rank
+        self.is_distributed = local_rank >= 0
         self.model_dtype = next(model.parameters()).dtype
 
         # Configure and apply LoRA
@@ -1400,6 +1457,16 @@ class LoRACrossBatchTrainer:
         # Cross-batch module parameters
         trainable_params.extend(self.cross_batch_module.parameters())
 
+        # Wrap with DDP if distributed
+        if self.is_distributed:
+            self.cross_batch_module = DDP(
+                self.cross_batch_module,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
+            logger.info(f"DDP enabled on local_rank {local_rank}")
+
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_count = sum(p.numel() for p in trainable_params)
         logger.info(f"Training LoRA + lm_head + cross-batch")
@@ -1414,6 +1481,13 @@ class LoRACrossBatchTrainer:
         self.best_lora_state = None
         self.best_lm_head_state = None
         self.best_cross_batch_state = None
+
+    @property
+    def cross_batch_module_unwrapped(self) -> nn.Module:
+        """Get the unwrapped cross_batch_module (without DDP wrapper)."""
+        if self.is_distributed and hasattr(self.cross_batch_module, 'module'):
+            return self.cross_batch_module.module
+        return self.cross_batch_module
 
     def _apply_cross_batch_per_context(
         self,
@@ -1622,9 +1696,10 @@ class LoRACrossBatchTrainer:
                 self.best_lora_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items() if 'lora' in k.lower()}
                 if self.lm_head is not None:
                     self.best_lm_head_state = _clone_state_dict(self.lm_head)
-                self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module)
+                # Use unwrapped module for state_dict
+                self.best_cross_batch_state = _clone_state_dict(self.cross_batch_module_unwrapped)
 
-        # Restore best state
+        # Restore best state (use unwrapped module)
         if self.best_lora_state is not None:
             current_state = self.model.state_dict()
             current_state.update({k: v.to(self.device) for k, v in self.best_lora_state.items()})
@@ -1632,7 +1707,7 @@ class LoRACrossBatchTrainer:
         if self.best_lm_head_state is not None and self.lm_head is not None:
             self.lm_head.load_state_dict(self.best_lm_head_state)
         if self.best_cross_batch_state is not None:
-            self.cross_batch_module.load_state_dict(self.best_cross_batch_state)
+            self.cross_batch_module_unwrapped.load_state_dict(self.best_cross_batch_state)
 
         return history
 

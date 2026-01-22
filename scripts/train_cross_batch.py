@@ -655,6 +655,7 @@ def main():
             tokenizer=tokenizer,
             device=device,
             learning_rate=args.lr,
+            local_rank=local_rank if world_size > 1 else -1,
         )
 
         history_baseline = trainer_baseline.train(
@@ -724,6 +725,7 @@ def main():
             device=device,
             learning_rate=args.lr,
             train_lm_head=train_lm_head,
+            local_rank=local_rank if world_size > 1 else -1,
         )
 
         history_crossbatch = trainer_crossbatch.train(
@@ -739,10 +741,10 @@ def main():
         print_rank0(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}', rank)
         training_history['crossbatch'] = history_crossbatch['train_loss']
 
-        # 保存 checkpoint
+        # 保存 checkpoint (使用 unwrapped module)
         if is_main_process(rank):
             checkpoint = {
-                'cross_batch_module': cross_batch_module.state_dict(),
+                'cross_batch_module': trainer_crossbatch.cross_batch_module_unwrapped.state_dict(),
                 'config': {
                     'model': args.model,
                     'dataset': args.dataset,
@@ -844,6 +846,7 @@ def main():
             cross_batch_module=cross_batch_lora_cb,
             device=device,
             learning_rate=args.lr,
+            local_rank=local_rank if world_size > 1 else -1,
         )
 
         history_lora_crossbatch = trainer_lora_crossbatch.train(
@@ -858,13 +861,13 @@ def main():
         print_rank0(f'LoRA + lm_head + cross-batch 最终 Loss: {history_lora_crossbatch["train_loss"][-1]:.4f}', rank)
         training_history['lora_crossbatch'] = history_lora_crossbatch['train_loss']
 
-        # 保存 checkpoint
+        # 保存 checkpoint (使用 unwrapped module)
         if is_main_process(rank):
             lora_state = {k: v for k, v in trainer_lora_crossbatch.model.state_dict().items() if 'lora' in k.lower()}
             torch.save({
                 'lora': lora_state,
                 'lm_head': trainer_lora_crossbatch.lm_head.state_dict(),
-                'cross_batch_module': cross_batch_lora_cb.state_dict(),
+                'cross_batch_module': trainer_lora_crossbatch.cross_batch_module_unwrapped.state_dict(),
                 'config': {
                     'model': args.model,
                     'dataset': args.dataset,
