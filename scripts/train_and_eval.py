@@ -158,9 +158,14 @@ def load_or_run_baseline(
     # All ranks run baseline on their shard
     logging.info("Running baseline on shard...")
     shard_results = run_baseline_on_shard(args, eval_contexts, tokenizer, model)
+    logging.info(f"Baseline shard complete: {len(shard_results['contexts'])} contexts")
 
     # Gather results
     if world_size > 1 and dist.is_initialized():
+        # Barrier to ensure all ranks finished before gathering
+        logging.info("Waiting for all ranks to finish baseline...")
+        dist.barrier()
+        logging.info("All ranks ready, gathering results...")
         all_shards = [None for _ in range(world_size)]
         dist.all_gather_object(all_shards, shard_results)
 
@@ -294,9 +299,14 @@ def evaluate_checkpoint(
         model,
         epoch,
     )
+    logging.info(f"Epoch {epoch} evaluation shard complete: {len(shard_results['contexts'])} contexts")
 
     # Gather results
     if world_size > 1 and dist.is_initialized():
+        # Barrier to ensure all ranks finished before gathering
+        logging.info("Waiting for all ranks to finish evaluation...")
+        dist.barrier()
+        logging.info("All ranks ready, gathering results...")
         all_shards = [None for _ in range(world_size)]
         dist.all_gather_object(all_shards, shard_results)
 
@@ -379,7 +389,9 @@ def main():
 
         if not dist.is_initialized():
             backend = "nccl" if torch.cuda.is_available() else "gloo"
-            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+            # Increase timeout to 30 minutes for large evaluations
+            timeout = torch.distributed.timedelta(minutes=30)
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size, timeout=timeout)
 
     # Load model and tokenizer
     if rank == 0:
@@ -494,9 +506,10 @@ def main():
         groups=train_groups,
         dataset_name=args.dataset,
     )
-    total_questions = sum(len(g.get("questions", [])) for g in train_groups)
+    # Count questions (handle both SQuAD and HotpotQA formats)
+    total_questions = sum(len(g.get("questions", g.get("items", []))) for g in train_groups)
     if rank == 0:
-        logging.info(f"Training dataset: {len(train_dataset)} contexts, {total_questions} questions")
+        logging.info(f"Training dataset: {len(train_dataset)} contexts, {total_questions} questions (per rank)")
 
     # Parse mix_layers
     mix_layers = None
