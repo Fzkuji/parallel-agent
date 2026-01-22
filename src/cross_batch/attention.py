@@ -126,14 +126,22 @@ class CrossBatchAttention(nn.Module):
         batch_size = hidden_states.size(0)
 
         if batch_size == 1:
-            # Still pass through parameters to maintain DDP gradient sync
+            # Still pass through ALL parameters to maintain DDP gradient sync
             # The output equals input, but parameters participate in the computation graph
-            dummy = self.out_proj(self.v_proj(hidden_states)).sum() * 0.0
+            # Must include q_proj, k_proj, v_proj, out_proj and gate components
+            dummy = (
+                self.q_proj(hidden_states).sum() * 0.0 +
+                self.k_proj(hidden_states).sum() * 0.0 +
+                self.out_proj(self.v_proj(hidden_states)).sum() * 0.0
+            )
             if self.use_gate:
                 ln_h = self.ln_h(hidden_states)
                 ln_a = self.ln_a(hidden_states)
                 gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
                 dummy = dummy + self.gate_net(gate_input).sum() * 0.0
+            else:
+                # Include scale parameter
+                dummy = dummy + self.scale * 0.0
             return hidden_states + dummy
 
         # Compute Q, K, V
@@ -278,13 +286,16 @@ class CrossBatchEmbeddingMixer(nn.Module):
         batch_size = hidden_states.size(0)
 
         if batch_size == 1:
-            # Still pass through parameters to maintain DDP gradient sync
+            # Still pass through ALL parameters to maintain DDP gradient sync
             dummy = self.value_proj(self.similarity_proj(hidden_states)).sum() * 0.0
             if self.use_gate:
                 ln_h = self.ln_h(hidden_states)
                 ln_a = self.ln_a(hidden_states)
                 gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
                 dummy = dummy + self.gate_net(gate_input).sum() * 0.0
+            else:
+                # Include scale parameter
+                dummy = dummy + self.scale * 0.0
             return hidden_states + dummy
 
         # Compute similarity-based attention weights
