@@ -495,7 +495,7 @@ class CrossBatchTrainer:
         """
         module = self.cross_batch_module_unwrapped
 
-        if not isinstance(module, MultiLayerCrossBatch):
+        if not isinstance(module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)):
             # Fallback: single layer
             last_hidden = hidden_states[self.mix_layer]
             if len(last_hidden.shape) == 3:
