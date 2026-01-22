@@ -40,6 +40,7 @@ from src.cross_batch import (
     SQuADGroupedDataset,
     SimpleCrossBatchGate,
     MultiLayerCrossBatch,
+    MultiLayerCrossBatchAttention,
     CrossBatchAttention,
     CrossBatchEmbeddingMixer,
 )
@@ -60,7 +61,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size (contexts per batch)")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--module-type", type=str, default="multi_layer", choices=["simple", "multi_layer", "attention", "mixer"], help="Cross-batch module type")
+    parser.add_argument("--module-type", type=str, default="multi_layer", choices=["simple", "multi_layer", "multi_layer_attention", "attention", "mixer"], help="Cross-batch module type")
     parser.add_argument("--mix-layers", type=str, default=None, help="Comma-separated layer indices for multi_layer mode (None = all layers)")
 
     # Inference
@@ -530,6 +531,18 @@ def main():
         )
         if rank == 0:
             logging.info(f"Using MultiLayerCrossBatch with {len(layer_indices)} layers: {layer_indices[:5]}...")
+    elif args.module_type == "multi_layer_attention":
+        layer_indices = mix_layers if mix_layers else list(range(num_layers))
+        cross_batch_module = MultiLayerCrossBatchAttention(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            layer_indices=layer_indices,
+            num_heads=8,
+            temperature=1.0,
+            use_gate=True,
+        )
+        if rank == 0:
+            logging.info(f"Using MultiLayerCrossBatchAttention with {len(layer_indices)} layers: {layer_indices[:5]}...")
     elif args.module_type == "simple":
         cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size, temperature=1.0)
     elif args.module_type == "attention":

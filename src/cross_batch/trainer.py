@@ -26,6 +26,7 @@ from .attention import (
     CrossBatchEmbeddingMixer,
     SimpleCrossBatchGate,
     MultiLayerCrossBatch,
+    MultiLayerCrossBatchAttention,
 )
 from .utils import is_instruct_model, get_eos_token
 from src.prompts import build_single_prompt
@@ -324,25 +325,30 @@ class CrossBatchTrainer:
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
         train_lm_head: bool = True,
+        train_lora: bool = False,  # Whether to train LoRA parameters
         local_rank: int = -1,
         mix_layer: int = -1,  # Which layer to use for training (-1 = last)
     ):
         self.tokenizer = tokenizer
         self.device = device
         self.train_lm_head = train_lm_head
+        self.train_lora = train_lora
         self.local_rank = local_rank
         self.is_distributed = local_rank >= 0
         self.mix_layer = mix_layer
 
         # Check if we're using multi-layer module
-        self.is_multi_layer = isinstance(cross_batch_module, MultiLayerCrossBatch)
+        self.is_multi_layer = isinstance(cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention))
 
         self.model = model.to(device)
         self.base_model = _resolve_base_model(self.model)
 
-        # Freeze the base model
-        for param in self.model.parameters():
-            param.requires_grad = False
+        # Freeze the base model (but keep LoRA params trainable if enabled)
+        for name, param in self.model.named_parameters():
+            if train_lora and 'lora' in name.lower():
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
         self.model.eval()
 
         # Get model dtype
@@ -355,6 +361,12 @@ class CrossBatchTrainer:
         # Collect trainable parameters
         trainable_params = list(self.cross_batch_module.parameters())
 
+        # Optionally train LoRA parameters
+        if train_lora:
+            lora_params = [p for n, p in self.model.named_parameters() if 'lora' in n.lower() and p.requires_grad]
+            trainable_params.extend(lora_params)
+            logger.info(f"Training cross-batch module + LoRA ({len(lora_params)} LoRA tensors)")
+
         # Optionally train lm_head together
         if train_lm_head and hasattr(self.model, 'lm_head'):
             # Unfreeze lm_head (keep same dtype as model)
@@ -362,7 +374,7 @@ class CrossBatchTrainer:
                 param.requires_grad = True
             trainable_params.extend(self.model.lm_head.parameters())
             logger.info("Training cross-batch module + lm_head")
-        else:
+        elif not train_lora:
             logger.info("Training cross-batch module only")
 
         # Wrap trainable modules with DDP if distributed

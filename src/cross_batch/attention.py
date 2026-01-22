@@ -376,9 +376,9 @@ class SimpleCrossBatchGate(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize gate to output small values initially."""
+        """Initialize gate to very small values (conservative start)."""
         nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, -3.0)  # sigmoid(-3) ≈ 0.047
+        nn.init.constant_(self.gate.bias, -10.0)  # sigmoid(-10) ≈ 0.00005 (nearly 0%)
 
     def forward(
         self,
@@ -505,4 +505,85 @@ class MultiLayerCrossBatch(nn.Module):
         """Get the gate module for a specific layer."""
         if layer_idx in self.layer_indices:
             return self.gates[str(layer_idx)]
+        return None
+
+
+class MultiLayerCrossBatchAttention(nn.Module):
+    """
+    Applies CrossBatchAttention at multiple layers (with learnable Q/K/V).
+
+    Each layer has its own attention module, allowing the model to learn
+    different cross-batch interaction patterns at different depths.
+
+    Total parameters per layer: 4*d^2 (Q/K/V/out projections) + scale or gate params
+    For a 7B model (hidden_size=3584) with 14 layers: ~14 * 4 * 3584^2 ≈ 720M parameters
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        layer_indices: Optional[List[int]] = None,
+        num_heads: int = 8,
+        temperature: float = 1.0,
+        use_gate: bool = True,
+        top_k: int = None,
+    ):
+        """
+        Args:
+            hidden_size: Hidden dimension size
+            num_layers: Total number of layers in the model
+            layer_indices: Which layers to apply cross-batch (None = all layers)
+            num_heads: Number of attention heads
+            temperature: Softmax temperature for attention
+            use_gate: Whether to use question-aware gating
+            top_k: If set, only keep top-k attention connections per query
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        # If no specific layers specified, use all layers
+        if layer_indices is None:
+            self.layer_indices = list(range(num_layers))
+        else:
+            self.layer_indices = layer_indices
+
+        # Create a full attention module for each selected layer
+        self.attentions = nn.ModuleDict({
+            str(i): CrossBatchAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                temperature=temperature,
+                use_gate=use_gate,
+                top_k=top_k,
+            )
+            for i in self.layer_indices
+        })
+
+    def forward(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Apply cross-batch attention for a specific layer.
+
+        Args:
+            layer_idx: Which layer's hidden states
+            hidden_states: [batch_size, hidden_size]
+            attention_mask: [batch_size] bool mask for valid samples
+
+        Returns:
+            Mixed hidden states if layer_idx in layer_indices, else unchanged
+        """
+        if layer_idx in self.layer_indices:
+            return self.attentions[str(layer_idx)](hidden_states, attention_mask)
+        return hidden_states
+
+    def get_layer_attention(self, layer_idx: int) -> Optional[CrossBatchAttention]:
+        """Get the attention module for a specific layer."""
+        if layer_idx in self.layer_indices:
+            return self.attentions[str(layer_idx)]
         return None

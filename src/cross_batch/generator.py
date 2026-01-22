@@ -16,6 +16,7 @@ from .attention import (
     CrossBatchEmbeddingMixer,
     SimpleCrossBatchGate,
     MultiLayerCrossBatch,
+    MultiLayerCrossBatchAttention,
 )
 
 
@@ -91,6 +92,17 @@ class CrossBatchGenerator:
                 num_layers=num_layers,
                 layer_indices=self.mix_layers if self.mix_layers[0] != -1 else None,
                 temperature=1.0,
+            ).to(device=self.device, dtype=model_dtype)
+            self.is_multi_layer = True
+        elif mix_method == "multi_layer_attention":
+            # Multi-layer with full CrossBatchAttention at each layer
+            self.cross_batch_module = MultiLayerCrossBatchAttention(
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                layer_indices=self.mix_layers if self.mix_layers[0] != -1 else None,
+                num_heads=8,
+                temperature=1.0,
+                use_gate=True,  # Default to using gate
             ).to(device=self.device, dtype=model_dtype)
             self.is_multi_layer = True
         elif mix_method == "simple":
@@ -222,8 +234,8 @@ class CrossBatchGenerator:
             if enable_cross_batch and batch_size > 1:
                 valid_mask = (~finished).to(self.device)
 
-                if self.is_multi_layer and isinstance(self.cross_batch_module, MultiLayerCrossBatch):
-                    # Multi-layer mode: apply gate at each selected layer
+                if self.is_multi_layer and isinstance(self.cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)):
+                    # Multi-layer mode: apply cross-batch module at each selected layer
                     # Aggregate contributions from all layers
                     accumulated_delta = None
 
@@ -232,7 +244,7 @@ class CrossBatchGenerator:
                         actual_idx = layer_idx if layer_idx >= 0 else len(outputs.hidden_states) + layer_idx
                         layer_hidden = outputs.hidden_states[actual_idx][:, -1, :].to(self.device)
 
-                        # Apply the layer-specific gate
+                        # Apply the layer-specific module (gate or attention)
                         mixed = self.cross_batch_module(layer_idx, layer_hidden, valid_mask)
                         delta = mixed - layer_hidden
 

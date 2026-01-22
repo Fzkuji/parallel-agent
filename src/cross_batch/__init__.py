@@ -5,6 +5,7 @@ from .attention import (
     CrossBatchEmbeddingMixer,
     SimpleCrossBatchGate,
     MultiLayerCrossBatch,
+    MultiLayerCrossBatchAttention,
 )
 from .generator import CrossBatchGenerator
 from .trainer import (
@@ -22,6 +23,7 @@ __all__ = [
     "CrossBatchEmbeddingMixer",
     "SimpleCrossBatchGate",
     "MultiLayerCrossBatch",
+    "MultiLayerCrossBatchAttention",
     "CrossBatchGenerator",
     # Training
     "CrossBatchTrainer",

@@ -636,8 +636,8 @@ def parse_args() -> argparse.Namespace:
         "--collab-hidden-mix-method",
         type=str,
         default="attention",
-        choices=["attention", "mixer", "simple", "multi_layer"],
-        help="Collab hidden mixing method: attention (full QKV), mixer, simple (gate only), multi_layer.",
+        choices=["attention", "mixer", "simple", "multi_layer", "multi_layer_attention"],
+        help="Collab hidden mixing method: attention (single-layer QKV), mixer, simple (gate only), multi_layer (multi-layer gates), multi_layer_attention (multi-layer QKV).",
     )
     parser.add_argument(
         "--collab-hidden-mix-layer",

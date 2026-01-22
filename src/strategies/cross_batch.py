@@ -62,7 +62,7 @@ def run_cross_batch_strategy(
     import torch
     from src.cross_batch import (
         CrossBatchGenerator, CrossBatchAttention, CrossBatchEmbeddingMixer,
-        SimpleCrossBatchGate, MultiLayerCrossBatch,
+        SimpleCrossBatchGate, MultiLayerCrossBatch, MultiLayerCrossBatchAttention,
     )
 
     question_lookup = {q.qid: q for q in questions}
@@ -120,6 +120,25 @@ def run_cross_batch_strategy(
                     hidden_size=hidden_size,
                     num_layers=num_layers,
                     layer_indices=layer_indices,
+                )
+            elif mix_method == "multi_layer_attention":
+                # Multi-layer with full attention at each layer
+                if checkpoint is not None and mix_layers is None:
+                    state_dict = checkpoint["cross_batch_module"]
+                    # Extract layer indices from keys like "attentions.0.q_proj.weight"
+                    layer_keys = [k for k in state_dict.keys() if k.startswith("attentions.") and k.endswith(".q_proj.weight")]
+                    inferred_indices = sorted([int(k.split(".")[1]) for k in layer_keys])
+                    if inferred_indices:
+                        mix_layers = inferred_indices
+                        import logging
+                        logging.info(f"Inferred layer_indices from checkpoint: {mix_layers[:5]}{'...' if len(mix_layers) > 5 else ''}")
+
+                layer_indices = mix_layers if mix_layers is not None else list(range(num_layers))
+                cross_batch_module = MultiLayerCrossBatchAttention(
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    layer_indices=layer_indices,
+                    use_gate=True,
                 )
             elif mix_method == "simple":
                 cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size)
@@ -286,7 +305,7 @@ def run_cross_batch_multi_strategy(
     import torch
     from src.cross_batch import (
         CrossBatchGenerator, CrossBatchAttention, CrossBatchEmbeddingMixer,
-        SimpleCrossBatchGate, MultiLayerCrossBatch,
+        SimpleCrossBatchGate, MultiLayerCrossBatch, MultiLayerCrossBatchAttention,
     )
 
     question_lookup = {
@@ -354,6 +373,25 @@ def run_cross_batch_multi_strategy(
                     hidden_size=hidden_size,
                     num_layers=num_layers,
                     layer_indices=layer_indices,
+                )
+            elif mix_method == "multi_layer_attention":
+                # Multi-layer with full attention at each layer
+                if checkpoint is not None and mix_layers is None:
+                    state_dict = checkpoint["cross_batch_module"]
+                    # Extract layer indices from keys like "attentions.0.q_proj.weight"
+                    layer_keys = [k for k in state_dict.keys() if k.startswith("attentions.") and k.endswith(".q_proj.weight")]
+                    inferred_indices = sorted([int(k.split(".")[1]) for k in layer_keys])
+                    if inferred_indices:
+                        mix_layers = inferred_indices
+                        import logging
+                        logging.info(f"Inferred layer_indices from checkpoint: {mix_layers[:5]}{'...' if len(mix_layers) > 5 else ''}")
+
+                layer_indices = mix_layers if mix_layers is not None else list(range(num_layers))
+                cross_batch_module = MultiLayerCrossBatchAttention(
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    layer_indices=layer_indices,
+                    use_gate=True,
                 )
             elif mix_method == "simple":
                 cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size)

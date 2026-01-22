@@ -56,7 +56,12 @@ from src.cross_batch.trainer import (
     CrossBatchTrainer,
     SQuADGroupedDataset,
 )
-from src.cross_batch.attention import CrossBatchAttention, SimpleCrossBatchGate, MultiLayerCrossBatch
+from src.cross_batch.attention import (
+    CrossBatchAttention,
+    SimpleCrossBatchGate,
+    MultiLayerCrossBatch,
+    MultiLayerCrossBatchAttention,
+)
 from src.cross_batch.generator import CrossBatchGenerator
 from src.strategies.cross_batch import run_cross_batch_multi_strategy
 from src import (
@@ -140,8 +145,8 @@ def parse_args():
 
     # Cross-batch 模块参数
     parser.add_argument('--module-type', type=str, default='simple',
-                        choices=['attention', 'simple', 'multi_layer'],
-                        help='Cross-batch 模块类型: attention (完整QKV), simple (只学gate), multi_layer (多层gate)')
+                        choices=['attention', 'simple', 'multi_layer', 'multi_layer_attention'],
+                        help='Cross-batch 模块类型: attention (单层完整QKV), simple (单层只学gate), multi_layer (多层gate), multi_layer_attention (多层完整QKV)')
     parser.add_argument('--mix-layer', type=int, default=-1,
                         help='单层模式使用的层 (-1=最后层, 正数=中间层, 如 16 表示第16层)')
     parser.add_argument('--mix-layers', type=str, default=None,
@@ -156,6 +161,18 @@ def parse_args():
                         help='同时训练 lm_head (default: False)')
     parser.add_argument('--no-train-lm-head', action='store_false', dest='train_lm_head',
                         help='不训练 lm_head，只训练 cross-batch 模块')
+
+    # LoRA 参数
+    parser.add_argument('--use-lora', action='store_true', default=False,
+                        help='使用 LoRA 微调模型')
+    parser.add_argument('--lora-r', type=int, default=16,
+                        help='LoRA rank (default: 16)')
+    parser.add_argument('--lora-alpha', type=int, default=32,
+                        help='LoRA alpha (default: 32)')
+    parser.add_argument('--lora-dropout', type=float, default=0.05,
+                        help='LoRA dropout (default: 0.05)')
+    parser.add_argument('--lora-target-modules', type=str, default='q_proj,k_proj,v_proj,o_proj',
+                        help='LoRA target modules (逗号分隔, default: q_proj,k_proj,v_proj,o_proj)')
     return parser.parse_args()
 
 
@@ -511,6 +528,8 @@ def main():
         mode_suffix += '_gate'
     if not args.train_lm_head:
         mode_suffix += '_frozen'
+    if args.use_lora:
+        mode_suffix += '_lora'
 
     checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, mode_suffix)
 
@@ -527,6 +546,29 @@ def main():
     hidden_size = model.config.hidden_size
     num_layers = model.config.num_hidden_layers
 
+    # 应用 LoRA (如果启用)
+    lora_model = None
+    if args.use_lora:
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            target_modules = [m.strip() for m in args.lora_target_modules.split(',')]
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=target_modules,
+                bias="none",
+            )
+            lora_model = get_peft_model(model, lora_config)
+            lora_model.print_trainable_parameters()
+            print_rank0(f'LoRA 配置: r={args.lora_r}, alpha={args.lora_alpha}, target_modules={target_modules}', rank)
+            # 使用 LoRA 包装的模型进行训练
+            model = lora_model
+        except ImportError:
+            print_rank0('警告: peft 未安装，无法使用 LoRA。安装: pip install peft', rank)
+            args.use_lora = False
+
     # 创建 cross-batch 模块
     if args.module_type == 'multi_layer':
         # 多层模式: 每层一个 SimpleCrossBatchGate
@@ -538,6 +580,17 @@ def main():
             top_k=args.top_k,
         )
         print_rank0(f'模块类型: MultiLayerCrossBatch, 层数: {len(layer_indices)}, 层: {layer_indices}', rank)
+    elif args.module_type == 'multi_layer_attention':
+        # 多层 attention 模式: 每层一个完整的 CrossBatchAttention
+        layer_indices = mix_layers if mix_layers else list(range(num_layers // 2, num_layers))  # 默认后半层
+        cross_batch_module = MultiLayerCrossBatchAttention(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            layer_indices=layer_indices,
+            use_gate=args.use_gate,
+            top_k=args.top_k,
+        )
+        print_rank0(f'模块类型: MultiLayerCrossBatchAttention, 层数: {len(layer_indices)}, 层: {layer_indices}, gate={args.use_gate}', rank)
     elif args.module_type == 'simple':
         # 简单模式: 单层只学 gate
         cross_batch_module = SimpleCrossBatchGate(
@@ -546,7 +599,7 @@ def main():
         )
         print_rank0(f'模块类型: SimpleCrossBatchGate, 使用层: {args.mix_layer}', rank)
     else:  # 'attention'
-        # 完整 attention 模式
+        # 完整 attention 模式 (单层)
         cross_batch_module = CrossBatchAttention(
             hidden_size=hidden_size,
             self_only=args.self_only,
@@ -566,6 +619,7 @@ def main():
         device=device,
         learning_rate=args.lr,
         train_lm_head=args.train_lm_head,
+        train_lora=args.use_lora,
         local_rank=local_rank if world_size > 1 else -1,
         mix_layer=args.mix_layer,
     )
@@ -586,13 +640,15 @@ def main():
 
     # 保存 checkpoint
     if is_main_process(rank):
+        # 获取 base model 的 config (LoRA model 可能没有直接的 config)
+        base_model = model.base_model if hasattr(model, 'base_model') else model
         checkpoint = {
             'cross_batch_module': trainer.cross_batch_module_unwrapped.state_dict(),
             'config': {
                 'model': args.model,
                 'dataset': args.dataset,
-                'hidden_size': model.config.hidden_size,
-                'num_layers': model.config.num_hidden_layers,
+                'hidden_size': hidden_size,
+                'num_layers': num_layers,
                 'train_samples': args.max_samples,
                 'epochs': args.epochs,
                 'module_type': args.module_type,
@@ -601,10 +657,22 @@ def main():
                 'use_gate': args.use_gate,
                 'top_k': args.top_k,
                 'train_lm_head': args.train_lm_head,
+                'use_lora': args.use_lora,
+                'lora_r': args.lora_r if args.use_lora else None,
+                'lora_alpha': args.lora_alpha if args.use_lora else None,
+                'lora_target_modules': args.lora_target_modules if args.use_lora else None,
             },
         }
         if args.train_lm_head:
-            checkpoint['lm_head'] = model.lm_head.state_dict()
+            # 获取 lm_head (可能在 base_model 里)
+            lm_head = base_model.lm_head if hasattr(base_model, 'lm_head') else model.lm_head
+            checkpoint['lm_head'] = lm_head.state_dict()
+        # 保存 LoRA 权重
+        if args.use_lora and lora_model is not None:
+            # 只保存 LoRA adapter 参数
+            lora_state_dict = {k: v for k, v in model.state_dict().items() if 'lora' in k.lower()}
+            checkpoint['lora'] = lora_state_dict
+            print_rank0(f'保存 LoRA 参数: {len(lora_state_dict)} 个张量', rank)
         torch.save(checkpoint, checkpoint_path)
         print(f'Checkpoint 已保存到: {checkpoint_path}')
 
