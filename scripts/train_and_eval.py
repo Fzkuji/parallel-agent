@@ -58,7 +58,7 @@ def parse_args():
     # Training
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size (contexts per batch)")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--module-type", type=str, default="multi_layer", choices=["simple", "multi_layer", "attention", "mixer"], help="Cross-batch module type")
     parser.add_argument("--mix-layers", type=str, default=None, help="Comma-separated layer indices for multi_layer mode (None = all layers)")
 
@@ -386,10 +386,11 @@ def main():
     else:
         device_map = "auto"
 
+    # Use bfloat16 for better numerical stability during training
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map=device_map,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
     )
     model.eval()
 
