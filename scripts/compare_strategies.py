@@ -636,14 +636,20 @@ def parse_args() -> argparse.Namespace:
         "--collab-hidden-mix-method",
         type=str,
         default="attention",
-        choices=["attention", "mixer"],
-        help="Collab hidden mixing method (attention or mixer).",
+        choices=["attention", "mixer", "simple", "multi_layer"],
+        help="Collab hidden mixing method: attention (full QKV), mixer, simple (gate only), multi_layer.",
     )
     parser.add_argument(
         "--collab-hidden-mix-layer",
         type=int,
         default=-1,
         help="Which layer's hidden state to mix (-1 for last layer).",
+    )
+    parser.add_argument(
+        "--collab-hidden-mix-layers",
+        type=str,
+        default=None,
+        help="Comma-separated layer indices for multi_layer mode (e.g., '8,12,16,20,24,28').",
     )
     # Batch finetuned (baseline) checkpoint
     parser.add_argument(
@@ -831,6 +837,10 @@ def run_all_strategies(
                     api_client=api_client,
                 ))
         if "collab_hidden" in selected_strategies:
+            # Parse mix_layers if provided
+            mix_layers = None
+            if args.collab_hidden_mix_layers:
+                mix_layers = [int(x.strip()) for x in args.collab_hidden_mix_layers.split(',')]
             results.append(run_cross_batch_multi_strategy(
                 items,
                 tokenizer,
@@ -840,6 +850,7 @@ def run_all_strategies(
                 dataset=effective_dataset,
                 mix_method=args.collab_hidden_mix_method,
                 mix_layer=args.collab_hidden_mix_layer,
+                mix_layers=mix_layers,
                 checkpoint_path=args.collab_hidden_checkpoint,
                 enable_cross_batch=True,
             ))
@@ -1013,6 +1024,10 @@ def run_all_strategies(
             api_client=api_client,
         ))
     if "collab_hidden" in selected_strategies:
+        # Parse mix_layers if provided
+        mix_layers = None
+        if args.collab_hidden_mix_layers:
+            mix_layers = [int(x.strip()) for x in args.collab_hidden_mix_layers.split(',')]
         results.append(run_cross_batch_strategy(
             background,
             questions,
@@ -1023,6 +1038,7 @@ def run_all_strategies(
             dataset=effective_dataset,
             mix_method=args.collab_hidden_mix_method,
             mix_layer=args.collab_hidden_mix_layer,
+            mix_layers=mix_layers,
             checkpoint_path=args.collab_hidden_checkpoint,
             enable_cross_batch=True,
         ))

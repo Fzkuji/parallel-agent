@@ -28,6 +28,7 @@ def run_cross_batch_strategy(
     cross_batch_generator: Optional["CrossBatchGenerator"] = None,
     mix_method: str = "attention",
     mix_layer: int = -1,
+    mix_layers: Optional[List[int]] = None,
     checkpoint_path: Optional[str] = None,
     enable_cross_batch: bool = True,
     cross_batch_module: Optional["torch.nn.Module"] = None,
@@ -48,8 +49,9 @@ def run_cross_batch_strategy(
         max_new_tokens: Maximum tokens to generate per question
         dataset: Dataset name for formatting
         cross_batch_generator: Pre-initialized CrossBatchGenerator (optional)
-        mix_method: Cross-batch mixing method ("attention" or "mixer")
+        mix_method: Cross-batch mixing method ("attention", "mixer", "simple", "multi_layer")
         mix_layer: Which layer's hidden state to mix (-1 for last)
+        mix_layers: List of layer indices for multi_layer mode
         checkpoint_path: Path to trained cross-batch module checkpoint
         enable_cross_batch: Whether to enable cross-batch interaction
         cross_batch_module: Pre-initialized cross-batch module (optional, overrides checkpoint)
@@ -58,7 +60,10 @@ def run_cross_batch_strategy(
         StrategyResult with answers and metrics
     """
     import torch
-    from src.cross_batch import CrossBatchGenerator, CrossBatchAttention, CrossBatchEmbeddingMixer
+    from src.cross_batch import (
+        CrossBatchGenerator, CrossBatchAttention, CrossBatchEmbeddingMixer,
+        SimpleCrossBatchGate, MultiLayerCrossBatch,
+    )
 
     question_lookup = {q.qid: q for q in questions}
     answer_records: Dict[str, Tuple[str, bool]] = {}
@@ -80,24 +85,50 @@ def run_cross_batch_strategy(
 
         # Use provided cross_batch_module or create new one
         if cross_batch_module is None:
-            # Create cross-batch module
-            if mix_method == "attention":
-                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
-            else:
-                cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
+            num_layers = model.config.num_hidden_layers
 
-            # Load checkpoint if provided
+            # Load checkpoint if provided (to get config)
             if checkpoint_path:
                 checkpoint = torch.load(checkpoint_path, map_location=device)
+                config = checkpoint.get("config", {})
+                # Use checkpoint config if available
+                if "module_type" in config:
+                    mix_method = config["module_type"]
+                if "mix_layer" in config:
+                    mix_layer = config["mix_layer"]
+                if "mix_layers" in config and config["mix_layers"]:
+                    mix_layers = config["mix_layers"]
+
+            # Create cross-batch module based on method
+            if mix_method == "multi_layer":
+                layer_indices = mix_layers if mix_layers else list(range(num_layers // 2, num_layers))
+                cross_batch_module = MultiLayerCrossBatch(
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    layer_indices=layer_indices,
+                )
+            elif mix_method == "simple":
+                cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size)
+            elif mix_method == "attention":
+                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
+            else:  # mixer
+                cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
+
+            # Load checkpoint weights
+            if checkpoint_path:
                 cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
                 if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
                     model.lm_head.load_state_dict(checkpoint["lm_head"])
+
+        # Determine effective mix_layer for generator
+        effective_mix_layer = mix_layers if mix_layers else mix_layer
 
         cross_batch_generator = CrossBatchGenerator(
             model=model,
             tokenizer=tokenizer,
             cross_batch_module=cross_batch_module,
-            mix_layer=mix_layer,
+            mix_method=mix_method,
+            mix_layer=effective_mix_layer,
             device=device,
         )
 
@@ -209,6 +240,7 @@ def run_cross_batch_multi_strategy(
     cross_batch_generator: Optional["CrossBatchGenerator"] = None,
     mix_method: str = "attention",
     mix_layer: int = -1,
+    mix_layers: Optional[List[int]] = None,
     checkpoint_path: Optional[str] = None,
     enable_cross_batch: bool = True,
     cross_batch_module: Optional["torch.nn.Module"] = None,
@@ -227,8 +259,9 @@ def run_cross_batch_multi_strategy(
         strategy_name: Name for the strategy result
         dataset: Dataset name for formatting
         cross_batch_generator: Pre-initialized CrossBatchGenerator (optional)
-        mix_method: Cross-batch mixing method ("attention" or "mixer")
+        mix_method: Cross-batch mixing method ("attention", "mixer", "simple", "multi_layer")
         mix_layer: Which layer's hidden state to mix (-1 for last)
+        mix_layers: List of layer indices for multi_layer mode
         checkpoint_path: Path to trained cross-batch module checkpoint
         enable_cross_batch: Whether to enable cross-batch interaction
         cross_batch_module: Pre-initialized cross-batch module (optional, overrides checkpoint)
@@ -237,7 +270,10 @@ def run_cross_batch_multi_strategy(
         StrategyResult with answers and metrics
     """
     import torch
-    from src.cross_batch import CrossBatchGenerator, CrossBatchAttention, CrossBatchEmbeddingMixer
+    from src.cross_batch import (
+        CrossBatchGenerator, CrossBatchAttention, CrossBatchEmbeddingMixer,
+        SimpleCrossBatchGate, MultiLayerCrossBatch,
+    )
 
     question_lookup = {
         item["qid"]: Question(
@@ -269,24 +305,50 @@ def run_cross_batch_multi_strategy(
 
         # Use provided cross_batch_module or create new one
         if cross_batch_module is None:
-            # Create cross-batch module
-            if mix_method == "attention":
-                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
-            else:
-                cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
+            num_layers = model.config.num_hidden_layers
 
-            # Load checkpoint if provided
+            # Load checkpoint if provided (to get config)
             if checkpoint_path:
                 checkpoint = torch.load(checkpoint_path, map_location=device)
+                config = checkpoint.get("config", {})
+                # Use checkpoint config if available
+                if "module_type" in config:
+                    mix_method = config["module_type"]
+                if "mix_layer" in config:
+                    mix_layer = config["mix_layer"]
+                if "mix_layers" in config and config["mix_layers"]:
+                    mix_layers = config["mix_layers"]
+
+            # Create cross-batch module based on method
+            if mix_method == "multi_layer":
+                layer_indices = mix_layers if mix_layers else list(range(num_layers // 2, num_layers))
+                cross_batch_module = MultiLayerCrossBatch(
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    layer_indices=layer_indices,
+                )
+            elif mix_method == "simple":
+                cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size)
+            elif mix_method == "attention":
+                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
+            else:  # mixer
+                cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size)
+
+            # Load checkpoint weights
+            if checkpoint_path:
                 cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
                 if "lm_head" in checkpoint and hasattr(model, 'lm_head'):
                     model.lm_head.load_state_dict(checkpoint["lm_head"])
+
+        # Determine effective mix_layer for generator
+        effective_mix_layer = mix_layers if mix_layers else mix_layer
 
         cross_batch_generator = CrossBatchGenerator(
             model=model,
             tokenizer=tokenizer,
             cross_batch_module=cross_batch_module,
-            mix_layer=mix_layer,
+            mix_method=mix_method,
+            mix_layer=effective_mix_layer,
             device=device,
         )
 
