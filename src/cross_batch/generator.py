@@ -188,12 +188,14 @@ class CrossBatchGenerator:
             last_hidden = hidden_states[:, -1, :]  # [batch_size, hidden_size]
 
             # Apply cross-batch interaction
-            # Note: last_hidden is on the device of the last transformer layer (self.device for distributed models)
+            # Note: last_hidden may be on a different device than cross_batch_module
+            # (e.g., when model is distributed across GPUs with device_map="auto")
             if enable_cross_batch and batch_size > 1:
-                # Move valid_mask to the same device as last_hidden
-                valid_mask = (~finished).to(last_hidden.device)
+                # Move last_hidden to the device where cross_batch_module is located
+                last_hidden_for_csa = last_hidden.to(self.device)
+                valid_mask = (~finished).to(self.device)
                 mixed_hidden = self.cross_batch_module(
-                    last_hidden,
+                    last_hidden_for_csa,
                     attention_mask=valid_mask,
                 )
                 # Project back to logits using the model's output projection
