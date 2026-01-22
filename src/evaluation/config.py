@@ -63,6 +63,12 @@ DATASET_METRICS: Dict[str, Dict[str, MetricFunc]] = {
         "f1": compute_f1,
         "lenient_acc": compute_contains,
     },
+    # TriviaQA: Open-domain short-form factual QA
+    "triviaqa": {
+        "strict_acc": compute_em,
+        "f1": compute_f1,
+        "lenient_acc": compute_contains,
+    },
     # CMB-Exam: Multiple-choice medical exam questions (all variants use accuracy)
     "cmb_exam": {
         "acc": compute_choice_accuracy,
