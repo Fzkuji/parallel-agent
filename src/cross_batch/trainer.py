@@ -449,7 +449,14 @@ class LMHeadOnlyTrainer:
             loss = loss_dict["loss"]
 
             # Skip if no valid tokens (loss doesn't require grad)
-            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+            skip_batch = loss_dict["num_tokens"] == 0 or not loss.requires_grad
+
+            if skip_batch:
+                # Dummy backward for DDP sync
+                if self.is_distributed:
+                    dummy_param = next(self.model.lm_head.parameters())
+                    dummy_loss = dummy_param.sum() * 0.0
+                    dummy_loss.backward()
                 continue
 
             loss.backward()
@@ -876,24 +883,30 @@ class CrossBatchTrainer:
             if context_ids is not None:
                 context_ids = context_ids.to(self.device)
 
-            # Skip batches with only 1 sample (no cross-batch possible)
-            if input_ids.size(0) < 2:
-                continue
-
             self.optimizer.zero_grad()
 
-            loss_dict = self.compute_loss(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                labels_attention_mask=labels_attention_mask,
-                context_ids=context_ids,
-            )
+            # Check if batch is valid for cross-batch (need at least 2 samples)
+            # In DDP, we must still do forward/backward to keep ranks in sync
+            skip_batch = input_ids.size(0) < 2
 
-            loss = loss_dict["loss"]
+            if not skip_batch:
+                loss_dict = self.compute_loss(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    labels_attention_mask=labels_attention_mask,
+                    context_ids=context_ids,
+                )
+                loss = loss_dict["loss"]
+                skip_batch = loss_dict["num_tokens"] == 0 or not loss.requires_grad
 
-            # Skip if no valid tokens (loss doesn't require grad)
-            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+            if skip_batch:
+                # Create a dummy loss that requires grad for DDP sync
+                # This ensures all ranks execute the same number of backward passes
+                if self.is_distributed:
+                    dummy_param = next(self.cross_batch_module.parameters())
+                    dummy_loss = dummy_param.sum() * 0.0
+                    dummy_loss.backward()
                 continue
 
             loss.backward()
@@ -1609,14 +1622,22 @@ class LoRACrossBatchTrainer:
             if context_ids is not None:
                 context_ids = context_ids.to(self.device)
 
-            if input_ids.size(0) < 2:
-                continue
-
             self.optimizer.zero_grad()
-            loss_dict = self.compute_loss(input_ids, attention_mask, labels, labels_attention_mask, context_ids)
-            loss = loss_dict["loss"]
 
-            if loss_dict["num_tokens"] == 0 or not loss.requires_grad:
+            # Check if batch is valid for cross-batch
+            skip_batch = input_ids.size(0) < 2
+
+            if not skip_batch:
+                loss_dict = self.compute_loss(input_ids, attention_mask, labels, labels_attention_mask, context_ids)
+                loss = loss_dict["loss"]
+                skip_batch = loss_dict["num_tokens"] == 0 or not loss.requires_grad
+
+            if skip_batch:
+                # Dummy backward for DDP sync
+                if self.is_distributed:
+                    dummy_param = next(self.cross_batch_module.parameters())
+                    dummy_loss = dummy_param.sum() * 0.0
+                    dummy_loss.backward()
                 continue
 
             loss.backward()
