@@ -595,43 +595,16 @@ def main():
     total_questions = sum(len(g["questions"]) for g in train_groups)
     print_rank0(f'训练数据集: {len(train_dataset)} 个 context, {total_questions} 个问题', rank)
 
-    if is_main_process(rank):
-        os.makedirs('outputs/inference_results', exist_ok=True)
-    all_results = {}
+    training_history = {}
 
-    # 1. 评估原始模型 (所有卡并行评估)
-    print_rank0('\n[1/6] 评估原始模型 (未微调)', rank)
-    print_rank0('-' * 40, rank)
-    model_original = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-    cross_batch_original = CrossBatchAttention(hidden_size=model_original.config.hidden_size, self_only=args.self_only)
-
-    metrics_original = evaluate_with_strategy(
-        model_original, tokenizer, cross_batch_original, device, args,
-        enable_cross_batch=False, strategy_name="original",
-        rank=rank, world_size=world_size
-    )
-    all_results['original'] = metrics_original
-    print_rank0(f'原始模型 - {format_metrics(metrics_original, args.dataset)}', rank)
-
-    del model_original, cross_batch_original
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    if world_size > 1:
-        dist.barrier()
-
-    # 2. Baseline 训练 + 测试
-    print_rank0('\n[2/6] Baseline：训练后立刻评估 (只训练 lm_head)', rank)
+    # 1. Baseline 训练 (只训练 lm_head)
+    print_rank0('\n[1/4] Baseline：只训练 lm_head', rank)
     print_rank0('-' * 40, rank)
 
     baseline_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, 'baseline')
     if should_skip_training(baseline_checkpoint_path, args.force, rank):
-        # 加载已有 checkpoint 进行评估
-        model_baseline = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        checkpoint = torch.load(baseline_checkpoint_path, map_location=device)
-        model_baseline.lm_head.load_state_dict(checkpoint['lm_head'])
-        history_baseline = {'train_loss': [0.0]}  # placeholder
-        print_rank0('已加载 Baseline checkpoint', rank)
+        print_rank0('Checkpoint 已存在，跳过训练', rank)
+        training_history['baseline'] = []
     else:
         model_baseline = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
         trainer_baseline = LMHeadOnlyTrainer(
@@ -641,7 +614,6 @@ def main():
             learning_rate=args.lr,
         )
 
-        # DDP 训练 (按 context 分组，每个 context 一个 batch)
         history_baseline = trainer_baseline.train(
             train_dataset=train_dataset,
             num_epochs=args.epochs,
@@ -653,9 +625,9 @@ def main():
             grouped=True,
         )
         print_rank0(f'Baseline 最终 Loss: {history_baseline["train_loss"][-1]:.4f}', rank)
-        del trainer_baseline
+        training_history['baseline'] = history_baseline['train_loss']
 
-        # 保存 baseline lm_head checkpoint
+        # 保存 checkpoint
         if is_main_process(rank):
             baseline_checkpoint = {
                 'lm_head': model_baseline.lm_head.state_dict(),
@@ -668,41 +640,23 @@ def main():
                 },
             }
             torch.save(baseline_checkpoint, baseline_checkpoint_path)
-            print(f'\nBaseline checkpoint 已保存到: {baseline_checkpoint_path}')
+            print(f'Baseline checkpoint 已保存到: {baseline_checkpoint_path}')
 
-    # 所有卡并行评估
-    cross_batch_baseline = CrossBatchAttention(hidden_size=model_baseline.config.hidden_size, self_only=args.self_only)
-    metrics_baseline = evaluate_with_strategy(
-        model_baseline, tokenizer, cross_batch_baseline, device, args,
-        enable_cross_batch=False, strategy_name="baseline",
-        rank=rank, world_size=world_size
-    )
-    all_results['baseline'] = metrics_baseline
-    print_rank0(f'Baseline - {format_metrics(metrics_baseline, args.dataset)}', rank)
-    del cross_batch_baseline
-
-    del model_baseline
-    gc.collect()
-    torch.cuda.empty_cache()
+        del model_baseline, trainer_baseline
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if world_size > 1:
         dist.barrier()
 
-    # 3. Cross-Batch 训练 + 测试
-    print_rank0('\n[3/6] Cross-Batch：训练后立刻评估 (lm_head + cross-batch)', rank)
+    # 2. Cross-Batch 训练 (lm_head + cross-batch module)
+    print_rank0('\n[2/4] Cross-Batch：训练 lm_head + cross-batch module', rank)
     print_rank0('-' * 40, rank)
 
     crossbatch_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, 'crossbatch')
     if should_skip_training(crossbatch_checkpoint_path, args.force, rank):
-        # 加载已有 checkpoint 进行评估
-        model_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size, self_only=args.self_only)
-        checkpoint = torch.load(crossbatch_checkpoint_path, map_location=device)
-        cross_batch_module.load_state_dict(checkpoint['cross_batch_module'])
-        if 'lm_head' in checkpoint:
-            model_crossbatch.lm_head.load_state_dict(checkpoint['lm_head'])
-        history_crossbatch = {'train_loss': [0.0]}  # placeholder
-        print_rank0('已加载 Cross-Batch checkpoint', rank)
+        print_rank0('Checkpoint 已存在，跳过训练', rank)
+        training_history['crossbatch'] = []
     else:
         model_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
         cross_batch_module = CrossBatchAttention(hidden_size=model_crossbatch.config.hidden_size, self_only=args.self_only)
@@ -726,9 +680,9 @@ def main():
             grouped=True,
         )
         print_rank0(f'Cross-Batch 最终 Loss: {history_crossbatch["train_loss"][-1]:.4f}', rank)
-        del trainer_crossbatch
+        training_history['crossbatch'] = history_crossbatch['train_loss']
 
-        # 只在 rank 0 上保存 checkpoint
+        # 保存 checkpoint
         if is_main_process(rank):
             checkpoint = {
                 'cross_batch_module': cross_batch_module.state_dict(),
@@ -742,49 +696,23 @@ def main():
                 },
             }
             torch.save(checkpoint, crossbatch_checkpoint_path)
-            print(f'\nCross-Batch checkpoint 已保存到: {crossbatch_checkpoint_path}')
+            print(f'Cross-Batch checkpoint 已保存到: {crossbatch_checkpoint_path}')
 
-    # 所有卡并行评估
-    metrics_crossbatch = evaluate_with_strategy(
-        model_crossbatch, tokenizer, cross_batch_module, device, args,
-        enable_cross_batch=True, strategy_name="crossbatch",
-        rank=rank, world_size=world_size
-    )
-    all_results['crossbatch'] = metrics_crossbatch
-    print_rank0(f'Cross-Batch - {format_metrics(metrics_crossbatch, args.dataset)}', rank)
-
-    del model_crossbatch, cross_batch_module
-    gc.collect()
-    torch.cuda.empty_cache()
+        del model_crossbatch, cross_batch_module, trainer_crossbatch
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if world_size > 1:
         dist.barrier()
 
-    # 4. LoRA + lm_head 训练 + 测试
-    print_rank0('\n[4/5] LoRA + lm_head：训练后立刻评估 (LoRA + lm_head)', rank)
+    # 3. LoRA + lm_head 训练
+    print_rank0('\n[3/4] LoRA + lm_head：训练 LoRA + lm_head', rank)
     print_rank0('-' * 40, rank)
 
     lora_lmhead_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, 'lora_lmhead')
     if should_skip_training(lora_lmhead_checkpoint_path, args.force, rank):
-        # 加载已有 checkpoint 进行评估
-        model_lora_lmhead = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        checkpoint = torch.load(lora_lmhead_checkpoint_path, map_location=device)
-        if 'lm_head' in checkpoint:
-            model_lora_lmhead.lm_head.load_state_dict(checkpoint['lm_head'])
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=16, lora_alpha=32, lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-        )
-        model_lora_lmhead = get_peft_model(model_lora_lmhead, lora_config)
-        if 'lora' in checkpoint:
-            current_state = model_lora_lmhead.state_dict()
-            current_state.update(checkpoint['lora'])
-            model_lora_lmhead.load_state_dict(current_state)
-        history_lora_lmhead = {'train_loss': [0.0]}  # placeholder
-        print_rank0('已加载 LoRA + lm_head checkpoint', rank)
-        eval_model_lmhead = model_lora_lmhead.base_model
+        print_rank0('Checkpoint 已存在，跳过训练', rank)
+        training_history['lora_lmhead'] = []
     else:
         model_lora_lmhead = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
         trainer_lora_lmhead = LoRATrainer(
@@ -792,7 +720,7 @@ def main():
             tokenizer=tokenizer,
             device=device,
             learning_rate=args.lr,
-            train_lm_head=True,  # 训练 LoRA + lm_head
+            train_lm_head=True,
         )
 
         history_lora_lmhead = trainer_lora_lmhead.train(
@@ -806,8 +734,9 @@ def main():
             grouped=True,
         )
         print_rank0(f'LoRA + lm_head 最终 Loss: {history_lora_lmhead["train_loss"][-1]:.4f}', rank)
+        training_history['lora_lmhead'] = history_lora_lmhead['train_loss']
 
-        # 保存 LoRA + lm_head checkpoint
+        # 保存 checkpoint
         if is_main_process(rank):
             lora_state = {k: v for k, v in trainer_lora_lmhead.model.state_dict().items() if 'lora' in k.lower()}
             torch.save({
@@ -821,56 +750,23 @@ def main():
                     'epochs': args.epochs,
                 },
             }, lora_lmhead_checkpoint_path)
-            print(f'\nLoRA + lm_head checkpoint 已保存到: {lora_lmhead_checkpoint_path}')
+            print(f'LoRA + lm_head checkpoint 已保存到: {lora_lmhead_checkpoint_path}')
 
-        eval_model_lmhead = trainer_lora_lmhead.model.base_model
-        del trainer_lora_lmhead
-
-    # 评估
-    cross_batch_lora_lmhead = CrossBatchAttention(hidden_size=model_lora_lmhead.config.hidden_size, self_only=args.self_only)
-    metrics_lora_lmhead = evaluate_with_strategy(
-        eval_model_lmhead, tokenizer, cross_batch_lora_lmhead, device, args,
-        enable_cross_batch=False, strategy_name="lora_lmhead",
-        rank=rank, world_size=world_size
-    )
-    all_results['lora_lmhead'] = metrics_lora_lmhead
-    print_rank0(f'LoRA + lm_head - {format_metrics(metrics_lora_lmhead, args.dataset)}', rank)
-
-    del model_lora_lmhead, cross_batch_lora_lmhead
-    gc.collect()
-    torch.cuda.empty_cache()
+        del model_lora_lmhead, trainer_lora_lmhead
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if world_size > 1:
         dist.barrier()
 
-    # 5. LoRA + lm_head + cross-batch 训练 + 测试
-    print_rank0('\n[5/5] LoRA + lm_head + cross-batch：训练后立刻评估', rank)
+    # 4. LoRA + lm_head + cross-batch 训练
+    print_rank0('\n[4/4] LoRA + lm_head + cross-batch：训练 LoRA + lm_head + cross-batch', rank)
     print_rank0('-' * 40, rank)
 
     lora_crossbatch_checkpoint_path = get_checkpoint_path(args.save_dir, args.dataset, args.model, 'lora_crossbatch')
     if should_skip_training(lora_crossbatch_checkpoint_path, args.force, rank):
-        # 加载已有 checkpoint 进行评估
-        model_lora_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
-        cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size, self_only=args.self_only)
-        checkpoint = torch.load(lora_crossbatch_checkpoint_path, map_location=device)
-        if 'lm_head' in checkpoint:
-            model_lora_crossbatch.lm_head.load_state_dict(checkpoint['lm_head'])
-        if 'cross_batch_module' in checkpoint:
-            cross_batch_lora_cb.load_state_dict(checkpoint['cross_batch_module'])
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=16, lora_alpha=32, lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-        )
-        model_lora_crossbatch = get_peft_model(model_lora_crossbatch, lora_config)
-        if 'lora' in checkpoint:
-            current_state = model_lora_crossbatch.state_dict()
-            current_state.update(checkpoint['lora'])
-            model_lora_crossbatch.load_state_dict(current_state)
-        history_lora_crossbatch = {'train_loss': [0.0]}  # placeholder
-        print_rank0('已加载 LoRA + lm_head + cross-batch checkpoint', rank)
-        eval_model_lora_cb = model_lora_crossbatch.base_model
+        print_rank0('Checkpoint 已存在，跳过训练', rank)
+        training_history['lora_crossbatch'] = []
     else:
         model_lora_crossbatch = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(device)
         cross_batch_lora_cb = CrossBatchAttention(hidden_size=model_lora_crossbatch.config.hidden_size, self_only=args.self_only)
@@ -892,6 +788,7 @@ def main():
             grouped=True,
         )
         print_rank0(f'LoRA + lm_head + cross-batch 最终 Loss: {history_lora_crossbatch["train_loss"][-1]:.4f}', rank)
+        training_history['lora_crossbatch'] = history_lora_crossbatch['train_loss']
 
         # 保存 checkpoint
         if is_main_process(rank):
@@ -908,41 +805,14 @@ def main():
                     'epochs': args.epochs,
                 },
             }, lora_crossbatch_checkpoint_path)
-            print(f'\nLoRA + lm_head + cross-batch checkpoint 已保存到: {lora_crossbatch_checkpoint_path}')
+            print(f'LoRA + lm_head + cross-batch checkpoint 已保存到: {lora_crossbatch_checkpoint_path}')
 
-        eval_model_lora_cb = trainer_lora_crossbatch.model.base_model
-        del trainer_lora_crossbatch
+        del model_lora_crossbatch, cross_batch_lora_cb, trainer_lora_crossbatch
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    # 评估 (启用 cross-batch)
-    metrics_lora_crossbatch = evaluate_with_strategy(
-        eval_model_lora_cb, tokenizer, cross_batch_lora_cb, device, args,
-        enable_cross_batch=True, strategy_name="lora_crossbatch",
-        rank=rank, world_size=world_size
-    )
-    all_results['lora_crossbatch'] = metrics_lora_crossbatch
-    print_rank0(f'LoRA + lm_head + cross-batch - {format_metrics(metrics_lora_crossbatch, args.dataset)}', rank)
-
-    del model_lora_crossbatch, cross_batch_lora_cb
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # 保存结果 (只在 rank 0)
+    # 保存训练历史 (只在 rank 0)
     if is_main_process(rank):
-        # 提取详细结果用于单独保存
-        inference_details = {
-            'original': all_results['original'].get('details', []),
-            'baseline': all_results['baseline'].get('details', []),
-            'crossbatch': all_results['crossbatch'].get('details', []),
-            'lora_lmhead': all_results['lora_lmhead'].get('details', []),
-            'lora_crossbatch': all_results['lora_crossbatch'].get('details', []),
-        }
-
-        # metrics 中不包含 details（太大）
-        metrics_only = {
-            k: {key: val for key, val in v.items() if key != 'details'}
-            for k, v in all_results.items()
-        }
-
         summary = {
             'config': {
                 'model': args.model,
@@ -950,95 +820,35 @@ def main():
                 'min_questions': args.min_questions,
                 'max_questions': args.max_questions,
                 'train_samples': args.max_samples,
-                'eval_samples': args.eval_samples,
                 'epochs': args.epochs,
                 'batch_size': args.batch_size,
                 'world_size': world_size,
             },
-            'training_history': {
-                'baseline': history_baseline['train_loss'],
-                'crossbatch': history_crossbatch['train_loss'],
-                'lora_lmhead': history_lora_lmhead['train_loss'],
-                'lora_crossbatch': history_lora_crossbatch['train_loss'],
+            'training_history': training_history,
+            'checkpoints': {
+                'baseline': baseline_checkpoint_path,
+                'crossbatch': crossbatch_checkpoint_path,
+                'lora_lmhead': lora_lmhead_checkpoint_path,
+                'lora_crossbatch': lora_crossbatch_checkpoint_path,
             },
-            'metrics': metrics_only,
         }
 
         os.makedirs('outputs', exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = f'outputs/training_{timestamp}.json'
+        output_file = f'outputs/training_{args.dataset}_{timestamp}.json'
         with open(output_file, 'w') as f:
             json.dump(summary, f, indent=2)
 
-        # 保存详细推理结果到单独文件
-        details_file = f'outputs/inference_details_{timestamp}.json'
-        with open(details_file, 'w', encoding='utf-8') as f:
-            json.dump(inference_details, f, indent=2, ensure_ascii=False)
-        print(f'\n详细推理结果已保存到: {details_file}')
-
-        # 打印总结 - 根据数据集选择合适的指标
         print('\n' + '=' * 60)
-        print('五方对比总结')
+        print('训练完成!')
         print('=' * 60)
-
-        # 检测使用的指标类型
-        sample_result = all_results['original']
-        if 'acc' in sample_result:
-            # CMB-Exam: 使用 accuracy
-            metric_name = 'Acc'
-            metric_key = 'acc'
-        else:
-            # SQuAD/HotpotQA/etc: 使用 EM 和 F1
-            metric_name = 'EM'
-            metric_key = 'exact_match'
-
-        def get_metric(result, key):
-            return result.get(key, 0.0)
-
-        if 'f1' in sample_result:
-            print(f'| 方法 | {metric_name} | F1 |')
-            print(f'|------|-----|-----|')
-            print(f'| 原始模型 | {get_metric(all_results["original"], metric_key):.2f} | {get_metric(all_results["original"], "f1"):.2f} |')
-            print(f'| Baseline (lm_head) | {get_metric(all_results["baseline"], metric_key):.2f} | {get_metric(all_results["baseline"], "f1"):.2f} |')
-            print(f'| lm_head + Cross-Batch | {get_metric(all_results["crossbatch"], metric_key):.2f} | {get_metric(all_results["crossbatch"], "f1"):.2f} |')
-            print(f'| LoRA + lm_head | {get_metric(all_results["lora_lmhead"], metric_key):.2f} | {get_metric(all_results["lora_lmhead"], "f1"):.2f} |')
-            print(f'| LoRA + lm_head + Cross-Batch | {get_metric(all_results["lora_crossbatch"], metric_key):.2f} | {get_metric(all_results["lora_crossbatch"], "f1"):.2f} |')
-            main_metric = 'f1'
-        else:
-            print(f'| 方法 | {metric_name} |')
-            print(f'|------|-----|')
-            print(f'| 原始模型 | {get_metric(all_results["original"], metric_key):.2f} |')
-            print(f'| Baseline (lm_head) | {get_metric(all_results["baseline"], metric_key):.2f} |')
-            print(f'| lm_head + Cross-Batch | {get_metric(all_results["crossbatch"], metric_key):.2f} |')
-            print(f'| LoRA + lm_head | {get_metric(all_results["lora_lmhead"], metric_key):.2f} |')
-            print(f'| LoRA + lm_head + Cross-Batch | {get_metric(all_results["lora_crossbatch"], metric_key):.2f} |')
-            main_metric = metric_key
-
-        print('\n改进分析:')
-        orig_val = get_metric(all_results['original'], main_metric)
-        base_val = get_metric(all_results['baseline'], main_metric)
-        cross_val = get_metric(all_results['crossbatch'], main_metric)
-        lora_lmhead_val = get_metric(all_results['lora_lmhead'], main_metric)
-        lora_crossbatch_val = get_metric(all_results['lora_crossbatch'], main_metric)
-
-        print(f'  Baseline vs 原始: {main_metric.upper()} {base_val - orig_val:+.2f}')
-        print(f'  lm_head + Cross-Batch vs 原始: {main_metric.upper()} {cross_val - orig_val:+.2f}')
-        print(f'  lm_head + Cross-Batch vs Baseline: {main_metric.upper()} {cross_val - base_val:+.2f}')
-        print(f'  LoRA + lm_head vs 原始: {main_metric.upper()} {lora_lmhead_val - orig_val:+.2f}')
-        print(f'  LoRA + lm_head + Cross-Batch vs 原始: {main_metric.upper()} {lora_crossbatch_val - orig_val:+.2f}')
-        print(f'  LoRA + lm_head + Cross-Batch vs LoRA + lm_head: {main_metric.upper()} {lora_crossbatch_val - lora_lmhead_val:+.2f}')
-
-        # 找出最佳方法
-        methods = {
-            'Baseline': base_val,
-            'lm_head + Cross-Batch': cross_val,
-            'LoRA + lm_head': lora_lmhead_val,
-            'LoRA + lm_head + Cross-Batch': lora_crossbatch_val,
-        }
-        best_method = max(methods, key=methods.get)
-        print(f'\n=> 最佳方法: {best_method} ({main_metric.upper()}: {methods[best_method]:.2f})')
-
-        print(f'\n结果已保存到: {output_file}')
+        print(f'\nCheckpoints 保存位置:')
+        print(f'  - Baseline: {baseline_checkpoint_path}')
+        print(f'  - Cross-Batch: {crossbatch_checkpoint_path}')
+        print(f'  - LoRA + lm_head: {lora_lmhead_checkpoint_path}')
+        print(f'  - LoRA + Cross-Batch: {lora_crossbatch_checkpoint_path}')
+        print(f'\n训练历史已保存到: {output_file}')
+        print('\n使用 eval_cross_batch_strategies.py 进行评估')
         print('=' * 60)
 
     cleanup_ddp()
