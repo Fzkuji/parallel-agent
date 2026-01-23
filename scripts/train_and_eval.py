@@ -10,14 +10,16 @@ Baseline uses vLLM for fast inference (same as exp2a_shared_context.py).
 Cross-batch uses transformers for compatibility with the training code.
 
 Usage:
-  Multi-GPU (8 GPUs):
-    torchrun --nproc_per_node=8 scripts/train_and_eval.py \
+  Multi-GPU (auto-detected):
+    python scripts/train_and_eval.py \
         --model Qwen/Qwen2.5-7B-Instruct --epochs 3 --cache-baseline
 
   Single GPU:
     python scripts/train_and_eval.py \
         --model Qwen/Qwen2.5-7B-Instruct --epochs 3 --cache-baseline
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -28,28 +30,11 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-import torch
-import torch.distributed as dist
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-# Add project root to path
+# Add project root to path (before other imports)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.datasets.squad import load_squad_groups
-from src.datasets.hotpot import load_hotpot_groups
-from src.models import Question
-from src.strategies.cross_batch import run_cross_batch_multi_strategy
-from src.cross_batch import (
-    CrossBatchTrainer,
-    SQuADGroupedDataset,
-    SimpleCrossBatchGate,
-    MultiLayerCrossBatch,
-    MultiLayerCrossBatchAttention,
-    CrossBatchAttention,
-    CrossBatchEmbeddingMixer,
-)
-from src.evaluation import evaluate_predictions
-from src.inference import extract_answer
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 # Simple prompt format (same as exp2a_shared_context.py)
 SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
@@ -81,7 +66,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default="outputs/train_and_eval", help="Output directory")
     parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints", help="Checkpoint directory")
     parser.add_argument("--cache-baseline", action="store_true", help="Cache baseline results to avoid recomputation")
-    parser.add_argument("--force", action="store_true", help="Force re-training even if checkpoint exists")
+    parser.add_argument("--force", action="store_true", help="Force re-run baseline even if cached")
 
     # LoRA parameters
     parser.add_argument("--use-lora", action="store_true", default=False, help="Use LoRA for model training")
@@ -101,15 +86,10 @@ def parse_args():
 
 
 def context_to_items(context_payload: dict) -> List[dict]:
-    """Convert context format to items format for batch strategy.
-
-    Supports both SQuAD and HotpotQA formats.
-    """
-    # HotpotQA format: already has items
+    """Convert context format to items format for batch strategy."""
     if "items" in context_payload:
         return context_payload["items"]
 
-    # SQuAD format: convert from shared context
     context = context_payload["context"]
     items = []
     for q in context_payload["questions"]:
@@ -123,598 +103,284 @@ def context_to_items(context_payload: dict) -> List[dict]:
     return items
 
 
-class VLLMClient:
-    """vLLM client for fast baseline inference."""
-
-    def __init__(
-        self,
-        model: str,
-        tensor_parallel_size: int = 1,
-        enable_thinking: bool = False,
-    ):
-        try:
-            from vllm import LLM, SamplingParams
-        except ImportError:
-            raise ImportError("Please install vllm: pip install vllm")
-
-        self.enable_thinking = enable_thinking
-
-        # Suppress vLLM verbose logging
-        os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
-        os.environ.setdefault("VLLM_CONFIGURE_LOGGING", "0")
-
-        logging.info(f"Loading vLLM model: {model} (tensor_parallel_size={tensor_parallel_size})")
-
-        # Load tokenizer for chat template support
-        self._tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-        if self._tokenizer.pad_token is None:
-            self._tokenizer.pad_token = self._tokenizer.eos_token
-
-        self._vllm_model = LLM(
-            model=model,
-            tensor_parallel_size=tensor_parallel_size,
-            trust_remote_code=True,
-            dtype="half",
-            gpu_memory_utilization=0.9,
-            disable_log_stats=True,
-        )
-        logging.info(f"vLLM model loaded, enable_thinking={enable_thinking}")
-
-    def generate_batch(
-        self,
-        prompts: List[str],
-        max_tokens: int = 128,
-        system_prompt: Optional[str] = None,
-    ) -> List[Tuple[str, int, int, float]]:
-        """Generate responses for multiple prompts in batch.
-
-        Returns:
-            List of (response_text, prompt_tokens, completion_tokens, latency) tuples
-        """
-        from vllm import SamplingParams
-
-        # Build full prompts using chat template
-        full_prompts = []
-        for prompt in prompts:
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-
-            if hasattr(self._tokenizer, "apply_chat_template"):
-                try:
-                    full_prompt = self._tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=self.enable_thinking,
-                    )
-                except TypeError:
-                    full_prompt = self._tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-            else:
-                if system_prompt:
-                    full_prompt = f"{system_prompt}\n\n{prompt}"
-                else:
-                    full_prompt = prompt
-            full_prompts.append(full_prompt)
-
-        # Greedy decoding for reproducibility
-        sampling_params = SamplingParams(
-            temperature=0,
-            max_tokens=max_tokens,
-        )
-
-        start_time = time.perf_counter()
-        outputs = self._vllm_model.generate(full_prompts, sampling_params, use_tqdm=False)
-        total_latency = time.perf_counter() - start_time
-
-        results = []
-        for output in outputs:
-            text = output.outputs[0].text
-            prompt_tokens = len(output.prompt_token_ids)
-            completion_tokens = len(output.outputs[0].token_ids)
-            results.append((text, prompt_tokens, completion_tokens, total_latency / len(prompts)))
-
-        return results
-
-
-def run_baseline_vllm(
-    items: List[Dict],
-    vllm_client: VLLMClient,
+def baseline_worker(
+    rank: int,
+    world_size: int,
+    gpu_id: int,
+    model_name: str,
+    eval_contexts: List[Dict],
+    output_dir: str,
     max_new_tokens: int,
     dataset: str,
-) -> Dict[str, Any]:
-    """Run baseline evaluation using vLLM (single-sample inference).
+    enable_thinking: bool,
+):
+    """Worker process for vLLM baseline inference on a single GPU.
 
-    Uses the same simple prompt format as exp2a_shared_context.py.
+    IMPORTANT: This runs in a separate process with isolated CUDA context.
     """
-    question_lookup = {
-        item["qid"]: Question(
-            qid=item["qid"],
-            text=item["question"],
-            priority=1.0,
-            answer_tokens=item.get("answer_tokens", 12),
-            type_hint=None,
-            references=item.get("references", []),
-        )
-        for item in items
-    }
+    # Set environment variables BEFORE any CUDA imports
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+    os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+    os.environ["VLLM_USE_V1"] = "0"
+    os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
+    os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
+    os.environ["TQDM_DISABLE"] = "1"
 
-    # Build prompts for all items (simple format, context in user message)
-    prompts = []
-    for item in items:
-        prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
-        prompts.append(prompt)
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting baseline, {len(eval_contexts)} contexts")
 
-    # Generate all responses in batch
-    results = vllm_client.generate_batch(
-        prompts,
-        max_tokens=max_new_tokens,
-        system_prompt=SYSTEM_PROMPT,
+    # Now import vLLM and torch
+    import torch
+    from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
+    from src.models import Question
+    from src.evaluation import evaluate_predictions
+    from src.inference import extract_answer
+
+    # Load model
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    vllm_model = LLM(
+        model=model_name,
+        tensor_parallel_size=1,
+        trust_remote_code=True,
+        dtype="half",
+        gpu_memory_utilization=0.9,
+        disable_log_stats=True,
     )
 
-    # Extract answers and compute metrics
-    answer_records = {}
-    total_latency = 0.0
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
+    logger.info(f"[Worker {rank}] Model loaded, running inference...")
 
-    for idx, item in enumerate(items):
-        raw_text, prompt_tokens, completion_tokens, latency = results[idx]
-        final_answer, strict_valid = extract_answer(raw_text, dataset)
-
-        answer_records[item["qid"]] = (final_answer, strict_valid)
-        total_latency += latency
-        total_prompt_tokens += prompt_tokens
-        total_completion_tokens += completion_tokens
-
-    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
-
-    return {
-        "metrics": metrics,
-        "latency": total_latency,
-        "prompt_tokens": total_prompt_tokens,
-        "generated_tokens": total_completion_tokens,
-    }
-
-
-def run_baseline_on_shard_vllm(
-    args,
-    eval_contexts: List[Dict],
-    vllm_client: VLLMClient,
-) -> Dict[str, Any]:
-    """Run baseline strategy on this rank's shard using vLLM."""
+    # Run inference on shard
     shard_results = {"contexts": []}
 
     for idx, context_payload in enumerate(eval_contexts, start=1):
         items = context_to_items(context_payload)
         title = context_payload.get("title", f"context-{idx}")
 
-        logging.info(f"Baseline: Processing {idx}/{len(eval_contexts)}: {title}")
+        if idx % 10 == 0:
+            logger.info(f"[Worker {rank}] Processing {idx}/{len(eval_contexts)}")
 
-        result = run_baseline_vllm(
-            items,
-            vllm_client,
-            max_new_tokens=args.max_new_tokens,
-            dataset=args.dataset,
-        )
+        # Build prompts
+        prompts = []
+        for item in items:
+            prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+            try:
+                full_prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                full_prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            prompts.append(full_prompt)
 
-        context_result = {
-            "title": title,
-            "metrics": result["metrics"],
-            "latency": result["latency"],
-            "prompt_tokens": result["prompt_tokens"],
-            "generated_tokens": result["generated_tokens"],
-            "num_questions": len(items),
+        # Generate
+        sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+        start_time = time.perf_counter()
+        outputs = vllm_model.generate(prompts, sampling_params, use_tqdm=False)
+        latency = time.perf_counter() - start_time
+
+        # Process results
+        question_lookup = {
+            item["qid"]: Question(
+                qid=item["qid"],
+                text=item["question"],
+                priority=1.0,
+                answer_tokens=item.get("answer_tokens", 12),
+                type_hint=None,
+                references=item.get("references", []),
+            )
+            for item in items
         }
-        shard_results["contexts"].append(context_result)
 
-    return shard_results
+        answer_records = {}
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
+        for i, item in enumerate(items):
+            output = outputs[i]
+            raw_text = output.outputs[0].text
+            final_answer, strict_valid = extract_answer(raw_text, dataset)
+            answer_records[item["qid"]] = (final_answer, strict_valid)
+            total_prompt_tokens += len(output.prompt_token_ids)
+            total_completion_tokens += len(output.outputs[0].token_ids)
+
+        metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+
+        shard_results["contexts"].append({
+            "title": title,
+            "metrics": metrics,
+            "latency": latency,
+            "prompt_tokens": total_prompt_tokens,
+            "generated_tokens": total_completion_tokens,
+            "num_questions": len(items),
+        })
+
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    temp_file = os.path.join(output_dir, f"baseline_shard_{rank}.json")
+    with open(temp_file, 'w') as f:
+        json.dump(shard_results, f)
+
+    logger.info(f"[Worker {rank}] Done, saved to {temp_file}")
 
 
-def load_or_run_baseline(
+def run_baseline_parallel(
     args,
     all_eval_contexts: List[Dict],
     cache_path: Path,
-    rank: int,
-    world_size: int,
+    num_gpus: int,
 ) -> Dict[str, Any]:
-    """Load cached baseline or run vLLM inference in parallel across all GPUs.
+    """Run vLLM baseline in parallel using multiprocessing."""
+    import multiprocessing as mp
 
-    Each rank runs vLLM independently on its shard (no dist needed).
-    Results are gathered via filesystem.
-
-    Args:
-        all_eval_contexts: Full evaluation contexts (will be sharded internally)
-    """
-    # If --force is specified, delete the cached baseline (rank 0 only)
-    if rank == 0 and args.force and cache_path.exists():
-        logging.info(f"--force specified, removing cached baseline: {cache_path}")
-        cache_path.unlink()
-        # Also remove shard files
-        for shard_file in cache_path.parent.glob("baseline_shard_*.json"):
-            shard_file.unlink()
-
-    # Check cache (rank 0 only, but all ranks need to know)
-    use_cache = cache_path.exists() and args.cache_baseline and not args.force
-
-    if use_cache:
-        if rank == 0:
-            logging.info(f"Loading cached baseline from {cache_path}")
-            with open(cache_path, 'r') as f:
-                baseline_results = json.load(f)
-            return baseline_results
-        else:
-            # Wait for rank 0 to load and we'll read later
-            time.sleep(2)
-            if cache_path.exists():
-                with open(cache_path, 'r') as f:
-                    return json.load(f)
-
-    # Shard data for this rank
-    shard_contexts = all_eval_contexts[rank::world_size]
-    logging.info(f"[Rank {rank}] Running vLLM baseline on {len(shard_contexts)} contexts...")
-
-    # Each rank runs vLLM independently
-    vllm_client = VLLMClient(
-        model=args.model,
-        tensor_parallel_size=1,
-        enable_thinking=args.enable_thinking,
-    )
-
-    shard_results = run_baseline_on_shard_vllm(args, shard_contexts, vllm_client)
-    logging.info(f"[Rank {rank}] Baseline shard complete: {len(shard_results['contexts'])} contexts")
-
-    # Free vLLM model to save memory for training
-    del vllm_client
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Save shard results to file (for gathering)
-    shard_file = cache_path.parent / f"baseline_shard_{rank}.json"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(shard_file, 'w') as f:
-        json.dump(shard_results, f)
-    logging.info(f"[Rank {rank}] Saved shard results to {shard_file}")
-
-    # Wait for all ranks to finish (simple file-based barrier)
-    expected_shards = world_size
-    max_wait = 3600  # 1 hour max
-    waited = 0
-    while waited < max_wait:
-        existing_shards = list(cache_path.parent.glob("baseline_shard_*.json"))
-        if len(existing_shards) >= expected_shards:
-            break
-        time.sleep(5)
-        waited += 5
-        if rank == 0 and waited % 30 == 0:
-            logging.info(f"Waiting for shards: {len(existing_shards)}/{expected_shards}")
-
-    # Rank 0 gathers and aggregates
-    if rank == 0:
-        logging.info("Gathering results from all shards...")
-        all_contexts = []
-        for shard_idx in range(world_size):
-            shard_file = cache_path.parent / f"baseline_shard_{shard_idx}.json"
-            with open(shard_file, 'r') as f:
-                shard_data = json.load(f)
-                all_contexts.extend(shard_data["contexts"])
-
-        # Aggregate results
-        total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
-        total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in all_contexts)
-        total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
-        total_latency = sum(ctx["latency"] for ctx in all_contexts)
-
-        baseline_results = {
-            "aggregate_metrics": {
-                "strict_acc": total_em / total_questions if total_questions > 0 else 0,
-                "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                "avg_latency": total_latency / len(all_contexts) if all_contexts else 0,
-                "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in all_contexts),
-                "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in all_contexts),
-            },
-            "contexts": all_contexts,
-        }
-
-        # Save aggregated cache
-        if args.cache_baseline:
-            with open(cache_path, 'w') as f:
-                json.dump(baseline_results, f, indent=2)
-            logging.info(f"Saved aggregated baseline to {cache_path}")
-
-        # Clean up shard files
-        for shard_file in cache_path.parent.glob("baseline_shard_*.json"):
-            shard_file.unlink()
-
-        return baseline_results
-    else:
-        # Other ranks wait for rank 0 to finish aggregation
-        time.sleep(5)
-        while not cache_path.exists():
-            time.sleep(2)
+    # Check cache
+    if cache_path.exists() and args.cache_baseline and not args.force:
+        logger.info(f"Loading cached baseline from {cache_path}")
         with open(cache_path, 'r') as f:
             return json.load(f)
 
+    # Delete old cache if force
+    if args.force and cache_path.exists():
+        logger.info(f"--force specified, removing cached baseline")
+        cache_path.unlink()
+        for shard_file in cache_path.parent.glob("baseline_shard_*.json"):
+            shard_file.unlink()
 
-def evaluate_checkpoint_on_shard(
-    args,
-    checkpoint_path: str,
-    eval_contexts: List[Dict],
-    tokenizer,
-    model,
-    epoch: int,
-    lora_model=None,
-) -> Dict[str, Any]:
-    """Evaluate checkpoint on this rank's shard using transformers."""
-    mix_layers = None
-    if args.mix_layers:
-        mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
+    logger.info(f"Running vLLM baseline on {num_gpus} GPU(s)...")
 
-    # Load LoRA weights from checkpoint if using LoRA
-    if args.use_lora and lora_model is not None:
-        checkpoint = torch.load(checkpoint_path, map_location=model.device if hasattr(model, 'device') else 'cuda')
-        if 'lora' in checkpoint:
-            current_state = model.state_dict()
-            current_state.update(checkpoint['lora'])
-            model.load_state_dict(current_state)
-            logging.info(f"Loaded {len(checkpoint['lora'])} LoRA tensors from checkpoint")
+    # Shard data
+    shards = [[] for _ in range(num_gpus)]
+    for i, ctx in enumerate(all_eval_contexts):
+        shards[i % num_gpus].append(ctx)
 
-    shard_results = {"contexts": []}
+    # Clean up old shard files
+    for shard_file in cache_path.parent.glob("baseline_shard_*.json"):
+        shard_file.unlink()
 
-    for idx, context_payload in enumerate(eval_contexts, start=1):
-        items = context_to_items(context_payload)
-        title = context_payload.get("title", f"context-{idx}")
+    if num_gpus > 1:
+        # Multi-GPU: use multiprocessing
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
 
-        logging.info(f"Epoch {epoch}: Evaluating {idx}/{len(eval_contexts)}: {title}")
+        processes = []
+        for rank in range(num_gpus):
+            p = mp.Process(
+                target=baseline_worker,
+                args=(
+                    rank, num_gpus, rank, args.model,
+                    shards[rank], str(cache_path.parent),
+                    args.max_new_tokens, args.dataset, args.enable_thinking,
+                )
+            )
+            p.start()
+            processes.append(p)
+            logger.info(f"Started baseline worker {rank} on GPU {rank} (PID: {p.pid})")
 
-        result = run_cross_batch_multi_strategy(
-            items,
-            tokenizer,
-            model,
-            max_new_tokens=args.max_new_tokens,
-            strategy_name=f"collab_hidden_epoch{epoch}",
-            dataset=args.dataset,
-            mix_method=args.module_type,
-            mix_layer=-1,
-            mix_layers=mix_layers,
-            checkpoint_path=checkpoint_path,
-            enable_cross_batch=True,
+        # Wait for all workers
+        for p in processes:
+            p.join()
+
+        logger.info("All baseline workers finished")
+    else:
+        # Single GPU: run directly
+        baseline_worker(
+            rank=0, world_size=1, gpu_id=0, model_name=args.model,
+            eval_contexts=all_eval_contexts, output_dir=str(cache_path.parent),
+            max_new_tokens=args.max_new_tokens, dataset=args.dataset,
+            enable_thinking=args.enable_thinking,
         )
-
-        context_result = {
-            "title": title,
-            "metrics": result.metrics,
-            "latency": result.latency,
-            "prompt_tokens": result.prompt_tokens,
-            "generated_tokens": result.generated_tokens,
-            "num_questions": len(items),
-        }
-        shard_results["contexts"].append(context_result)
-
-    return shard_results
-
-
-def evaluate_checkpoint(
-    args,
-    checkpoint_path: str,
-    eval_contexts: List[Dict],
-    tokenizer,
-    model,
-    epoch: int,
-    rank: int,
-    world_size: int,
-    lora_model=None,
-) -> Dict[str, Any]:
-    """Evaluate checkpoint across all ranks and gather."""
-    # All ranks evaluate their shard
-    shard_results = evaluate_checkpoint_on_shard(
-        args,
-        checkpoint_path,
-        eval_contexts,
-        tokenizer,
-        model,
-        epoch,
-        lora_model=lora_model,
-    )
-    logging.info(f"Epoch {epoch} evaluation shard complete: {len(shard_results['contexts'])} contexts")
 
     # Gather results
-    if world_size > 1 and dist.is_initialized():
-        logging.info("Waiting for all ranks to finish evaluation...")
-        dist.barrier()
-        logging.info("All ranks ready, gathering results...")
-        all_shards = [None for _ in range(world_size)]
-        dist.all_gather_object(all_shards, shard_results)
+    logger.info("Gathering baseline results...")
+    all_contexts = []
+    for rank in range(num_gpus):
+        shard_file = cache_path.parent / f"baseline_shard_{rank}.json"
+        if shard_file.exists():
+            with open(shard_file, 'r') as f:
+                shard_data = json.load(f)
+                all_contexts.extend(shard_data["contexts"])
+            shard_file.unlink()
 
-        if rank == 0:
-            # Merge
-            all_contexts = []
-            for shard in all_shards:
-                if shard:
-                    all_contexts.extend(shard["contexts"])
+    # Aggregate
+    total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
+    total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in all_contexts)
+    total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
+    total_latency = sum(ctx["latency"] for ctx in all_contexts)
 
-            # Aggregate
-            total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
-            total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in all_contexts)
-            total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
-            total_latency = sum(ctx["latency"] for ctx in all_contexts)
+    baseline_results = {
+        "aggregate_metrics": {
+            "strict_acc": total_em / total_questions if total_questions > 0 else 0,
+            "f1": total_f1 / total_questions if total_questions > 0 else 0,
+            "avg_latency": total_latency / len(all_contexts) if all_contexts else 0,
+            "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in all_contexts),
+            "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in all_contexts),
+        },
+        "contexts": all_contexts,
+    }
 
-            return {
-                "epoch": epoch,
-                "aggregate_metrics": {
-                    "strict_acc": total_em / total_questions if total_questions > 0 else 0,
-                    "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                    "avg_latency": total_latency / len(all_contexts),
-                    "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in all_contexts),
-                    "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in all_contexts),
-                },
-            }
-        else:
-            return {}  # Non-zero ranks
-    else:
-        # Single GPU
-        total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
-        total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
-        total_questions = sum(ctx["num_questions"] for ctx in shard_results["contexts"])
-        total_latency = sum(ctx["latency"] for ctx in shard_results["contexts"])
+    # Save cache
+    if args.cache_baseline:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump(baseline_results, f, indent=2)
+        logger.info(f"Saved baseline to {cache_path}")
 
-        return {
-            "epoch": epoch,
-            "aggregate_metrics": {
-                "strict_acc": total_em / total_questions if total_questions > 0 else 0,
-                "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                "avg_latency": total_latency / len(shard_results["contexts"]) if shard_results["contexts"] else 0,
-                "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in shard_results["contexts"]),
-                "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in shard_results["contexts"]),
-            },
-        }
+    return baseline_results
 
 
-def main():
-    args = parse_args()
+def run_training_and_eval(
+    args,
+    all_eval_contexts: List[Dict],
+    baseline_results: Dict[str, Any],
+    num_gpus: int,
+):
+    """Run training and evaluation (single process, single GPU for now).
 
-    # Detect distributed setup
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    # Setup logging
-    log_prefix = f"[Rank {rank}] " if world_size > 1 else ""
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper()),
-        format=f"{log_prefix}%(message)s",
+    TODO: Add multi-GPU training support with proper DDP.
+    """
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from src.datasets.squad import load_squad_groups
+    from src.datasets.hotpot import load_hotpot_groups
+    from src.strategies.cross_batch import run_cross_batch_multi_strategy
+    from src.cross_batch import (
+        CrossBatchTrainer,
+        SQuADGroupedDataset,
+        SimpleCrossBatchGate,
+        MultiLayerCrossBatch,
+        MultiLayerCrossBatchAttention,
+        CrossBatchAttention,
+        CrossBatchEmbeddingMixer,
     )
 
-    # Create output directory (only on rank 0)
     output_dir = Path(args.output_dir)
-    if rank == 0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    # Wait for rank 0 to create directory
-    time.sleep(1)
 
-    # Set random seed
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    # Set CUDA device for this rank (but DON'T initialize distributed yet - vLLM needs to run first)
-    # Save original CUDA_VISIBLE_DEVICES to restore later
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    device_id = 0  # Default for single GPU
-
-    if world_size > 1 and torch.cuda.is_available():
-        device_id = rank % torch.cuda.device_count()
-        torch.cuda.set_device(device_id)
-        # Set CUDA_VISIBLE_DEVICES so vLLM only sees this GPU
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
-        if rank == 0:
-            logging.info(f"Using {world_size} GPUs for vLLM baseline (parallel)")
-        logging.info(f"Rank {rank} using cuda:{device_id}")
-
-    # Load evaluation data (all ranks load full dataset, then shard)
-    if rank == 0:
-        logging.info(f"Loading evaluation data: {args.eval_samples} samples")
-
-    if args.dataset == "hotpot":
-        all_eval_contexts = load_hotpot_groups(
-            split="validation",
-            max_contexts=args.eval_samples,
-            min_questions=args.min_questions,
-            max_questions=args.max_questions,
-            seed=args.seed + 1000,
-        )
-    else:  # squad
-        all_eval_contexts = load_squad_groups(
-            split="validation",
-            min_questions=args.min_questions,
-            max_questions=args.max_questions,
-            max_contexts=args.eval_samples,
-            seed=args.seed + 1000,
-        )
-
-    # Get or compute baseline results using vLLM (rank 0 only, uses full dataset)
-    baseline_cache_path = output_dir / "baseline_results.json"
-    if rank == 0:
-        logging.info("=" * 60)
-        logging.info("STEP 1: Baseline (vLLM) Strategy")
-        logging.info("=" * 60)
-
-    baseline_results = load_or_run_baseline(
-        args,
-        all_eval_contexts,  # Full dataset for vLLM (rank 0 only)
-        baseline_cache_path,
-        rank=rank,
-        world_size=world_size,
-    )
-
-    # Now initialize distributed process group for training/evaluation (after vLLM is done)
-    if world_size > 1 and torch.cuda.is_available():
-        # Restore original CUDA_VISIBLE_DEVICES so all GPUs are visible for transformers
-        if original_cuda_visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-        elif "CUDA_VISIBLE_DEVICES" in os.environ:
-            del os.environ["CUDA_VISIBLE_DEVICES"]
-
-        # Re-set the CUDA device for this rank
-        torch.cuda.set_device(device_id)
-
-        # Initialize distributed process group
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-            logging.info(f"Initialized distributed process group (rank {rank}/{world_size})")
-
-    # Shard evaluation data across GPUs for cross-batch evaluation
-    if world_size > 1:
-        eval_contexts = all_eval_contexts[rank::world_size]
-        logging.info(f"Cross-batch will evaluate {len(eval_contexts)} contexts on this shard")
-    else:
-        eval_contexts = all_eval_contexts
-
-    if rank == 0:
-        logging.info("\nBaseline Results:")
-        logging.info(f"  EM:  {baseline_results['aggregate_metrics']['strict_acc']:.4f}")
-        logging.info(f"  F1:  {baseline_results['aggregate_metrics']['f1']:.4f}")
-        logging.info(f"  Latency: {baseline_results['aggregate_metrics']['avg_latency']:.2f}s")
-
-    # Synchronize before loading transformers model
-    if world_size > 1 and dist.is_initialized():
-        dist.barrier()
-
-    # Load model and tokenizer for training and cross-batch evaluation
-    if rank == 0:
-        logging.info(f"\nLoading transformers model: {args.model}")
+    # Load model
+    logger.info(f"\nLoading transformers model: {args.model}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # For multi-GPU, each rank loads model on its own GPU
-    if world_size > 1 and torch.cuda.is_available():
-        device_map = {"": f"cuda:{torch.cuda.current_device()}"}
-    else:
-        device_map = "auto"
-
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        device_map=device_map,
+        device_map="auto",
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
     )
     model.eval()
 
-    # Training (all ranks participate)
-    safe_model_name = args.model.replace('/', '_')
-    checkpoint_base = Path(args.checkpoint_dir) / args.dataset / safe_model_name
-    if rank == 0:
-        checkpoint_base.mkdir(parents=True, exist_ok=True)
-        logging.info("\n" + "=" * 60)
-        logging.info("STEP 2: Training Cross-Batch Module")
-        logging.info("=" * 60)
-
-    # Apply LoRA if enabled (all ranks)
+    # Apply LoRA if enabled
     lora_model = None
     if args.use_lora:
         try:
@@ -729,18 +395,15 @@ def main():
                 bias="none",
             )
             lora_model = get_peft_model(model, lora_config)
-            if rank == 0:
-                lora_model.print_trainable_parameters()
-                logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, target={target_modules}")
+            lora_model.print_trainable_parameters()
+            logger.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}")
             model = lora_model
         except ImportError:
-            if rank == 0:
-                logging.warning("peft not installed. Cannot use LoRA. Install with: pip install peft")
+            logger.warning("peft not installed. Cannot use LoRA.")
             args.use_lora = False
 
-    # All ranks load training data
-    if rank == 0:
-        logging.info(f"Loading training data: {args.train_samples} samples")
+    # Load training data
+    logger.info(f"Loading training data: {args.train_samples} samples")
 
     if args.dataset == "hotpot":
         train_groups = load_hotpot_groups(
@@ -750,7 +413,7 @@ def main():
             max_questions=args.max_questions,
             seed=args.seed,
         )
-    else:  # squad
+    else:
         train_groups = load_squad_groups(
             split="train",
             min_questions=args.min_questions,
@@ -759,27 +422,19 @@ def main():
             seed=args.seed,
         )
 
-    # Shard training data across GPUs (for DDP)
-    if world_size > 1:
-        train_groups = train_groups[rank::world_size]
-        logging.info(f"Training on {len(train_groups)} contexts (shard {rank}/{world_size})")
-
-    # All ranks create dataset
     train_dataset = SQuADGroupedDataset(
         tokenizer=tokenizer,
         groups=train_groups,
         dataset_name=args.dataset,
     )
     total_questions = sum(len(g.get("questions", g.get("items", []))) for g in train_groups)
-    if rank == 0:
-        logging.info(f"Training dataset: {len(train_dataset)} contexts, {total_questions} questions (per rank)")
+    logger.info(f"Training dataset: {len(train_dataset)} contexts, {total_questions} questions")
 
-    # Parse mix_layers
+    # Create cross-batch module
     mix_layers = None
     if args.mix_layers:
         mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
 
-    # All ranks create cross-batch module
     hidden_size = model.config.hidden_size
     num_layers = model.config.num_hidden_layers
 
@@ -791,8 +446,7 @@ def main():
             layer_indices=layer_indices,
             temperature=1.0,
         )
-        if rank == 0:
-            logging.info(f"Using MultiLayerCrossBatch with {len(layer_indices)} layers: {layer_indices[:5]}...")
+        logger.info(f"Using MultiLayerCrossBatch with {len(layer_indices)} layers")
     elif args.module_type == "multi_layer_attention":
         layer_indices = mix_layers if mix_layers else list(range(num_layers))
         cross_batch_module = MultiLayerCrossBatchAttention(
@@ -803,22 +457,19 @@ def main():
             temperature=1.0,
             use_gate=True,
         )
-        if rank == 0:
-            logging.info(f"Using MultiLayerCrossBatchAttention with {len(layer_indices)} layers: {layer_indices[:5]}...")
+        logger.info(f"Using MultiLayerCrossBatchAttention with {len(layer_indices)} layers")
     elif args.module_type == "simple":
         cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size, temperature=1.0)
     elif args.module_type == "attention":
         cross_batch_module = CrossBatchAttention(hidden_size=hidden_size, num_heads=8, temperature=1.0)
-    else:  # mixer
+    else:
         cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size, temperature=1.0)
 
-    if rank == 0:
-        num_params = sum(p.numel() for p in cross_batch_module.parameters())
-        logging.info(f"Cross-batch module parameters: {num_params:,}")
+    num_params = sum(p.numel() for p in cross_batch_module.parameters())
+    logger.info(f"Cross-batch module parameters: {num_params:,}")
 
-    # Create trainer (all ranks)
+    # Create trainer
     device = str(next(model.parameters()).device)
-    local_rank = rank if world_size > 1 else -1
     trainer = CrossBatchTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -827,151 +478,246 @@ def main():
         learning_rate=args.lr,
         train_lm_head=False,
         train_lora=args.use_lora,
-        local_rank=local_rank,
+        local_rank=-1,
         mix_layer=-1,
     )
+
+    # Checkpoint directory
+    safe_model_name = args.model.replace('/', '_')
+    checkpoint_base = Path(args.checkpoint_dir) / args.dataset / safe_model_name
+    checkpoint_base.mkdir(parents=True, exist_ok=True)
 
     # Results tracking
     all_results = {
         "config": vars(args),
-        "baseline": baseline_results.get("aggregate_metrics", {}) if rank == 0 else {},
+        "baseline": baseline_results.get("aggregate_metrics", {}),
         "epochs": [],
     }
 
-    # Train and evaluate for each epoch
+    # Train and evaluate
     for epoch in range(1, args.epochs + 1):
-        if rank == 0:
-            logging.info(f"\n{'=' * 60}")
-            logging.info(f"Epoch {epoch}/{args.epochs}")
-            logging.info("=" * 60)
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Epoch {epoch}/{args.epochs}")
+        logger.info("=" * 60)
 
-        logging.info("Training...")
-
-        # All ranks train for one epoch (DDP)
+        # Train
+        logger.info("Training...")
         history = trainer.train(
             train_dataset=train_dataset,
             num_epochs=1,
             batch_size=args.batch_size,
             save_dir=None,
-            distributed=(world_size > 1),
-            rank=rank,
-            world_size=world_size,
+            distributed=False,
+            rank=0,
+            world_size=1,
             grouped=True,
         )
+        logger.info(f"Training complete - Loss: {history['train_loss'][-1]:.4f}, Improvement: {history['improvement'][-1]:.4f}")
 
-        if rank == 0:
-            logging.info(f"Training complete - Loss: {history['train_loss'][-1]:.4f}, Improvement: {history['improvement'][-1]:.4f}")
-
-            # Save checkpoint (only rank 0)
-            checkpoint_path = str(checkpoint_base / f"{args.module_type}_frozen_epoch{epoch}.pt")
-            if hasattr(trainer, 'cross_batch_module_unwrapped'):
-                module_state = trainer.cross_batch_module_unwrapped.state_dict()
-            else:
-                module_state = cross_batch_module.state_dict()
-
-            checkpoint = {
-                'cross_batch_module': module_state,
-                'config': {
-                    'model': args.model,
-                    'dataset': args.dataset,
-                    'hidden_size': hidden_size,
-                    'num_layers': num_layers,
-                    'train_samples': args.train_samples,
-                    'epochs': epoch,
-                    'module_type': args.module_type,
-                    'mix_layer': -1,
-                    'mix_layers': mix_layers,
-                    'use_lora': args.use_lora,
-                    'lora_r': args.lora_r if args.use_lora else None,
-                    'lora_alpha': args.lora_alpha if args.use_lora else None,
-                    'lora_target_modules': args.lora_target_modules if args.use_lora else None,
-                },
-            }
-            if args.use_lora and lora_model is not None:
-                lora_state_dict = {k: v for k, v in model.state_dict().items() if 'lora' in k.lower()}
-                checkpoint['lora'] = lora_state_dict
-                logging.info(f"Saved {len(lora_state_dict)} LoRA tensors")
-            torch.save(checkpoint, checkpoint_path)
-            logging.info(f"Saved checkpoint to {checkpoint_path}")
-
-        # Sync all ranks before evaluation
-        if world_size > 1 and dist.is_initialized():
-            dist.barrier()
-            checkpoint_path_list = [str(checkpoint_base / f"{args.module_type}_frozen_epoch{epoch}.pt")]
-            dist.broadcast_object_list(checkpoint_path_list, src=0)
-            checkpoint_path = checkpoint_path_list[0]
+        # Save checkpoint
+        checkpoint_path = str(checkpoint_base / f"{args.module_type}_frozen_epoch{epoch}.pt")
+        if hasattr(trainer, 'cross_batch_module_unwrapped'):
+            module_state = trainer.cross_batch_module_unwrapped.state_dict()
         else:
-            checkpoint_path = str(checkpoint_base / f"{args.module_type}_frozen_epoch{epoch}.pt")
+            module_state = cross_batch_module.state_dict()
 
-        # All ranks evaluate
-        if rank == 0:
-            logging.info(f"\nEvaluating epoch {epoch}...")
+        checkpoint = {
+            'cross_batch_module': module_state,
+            'config': {
+                'model': args.model,
+                'dataset': args.dataset,
+                'hidden_size': hidden_size,
+                'num_layers': num_layers,
+                'train_samples': args.train_samples,
+                'epochs': epoch,
+                'module_type': args.module_type,
+                'mix_layer': -1,
+                'mix_layers': mix_layers,
+                'use_lora': args.use_lora,
+            },
+        }
+        if args.use_lora and lora_model is not None:
+            lora_state_dict = {k: v for k, v in model.state_dict().items() if 'lora' in k.lower()}
+            checkpoint['lora'] = lora_state_dict
+            logger.info(f"Saved {len(lora_state_dict)} LoRA tensors")
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-        epoch_results = evaluate_checkpoint(
-            args,
-            checkpoint_path,
-            eval_contexts,
-            tokenizer,
-            model,
-            epoch,
-            rank=rank,
-            world_size=world_size,
-            lora_model=lora_model if args.use_lora else None,
+        # Evaluate
+        logger.info(f"\nEvaluating epoch {epoch}...")
+        eval_results = {"contexts": []}
+
+        for idx, context_payload in enumerate(all_eval_contexts, start=1):
+            items = context_to_items(context_payload)
+            title = context_payload.get("title", f"context-{idx}")
+
+            if idx % 10 == 0:
+                logger.info(f"Evaluating {idx}/{len(all_eval_contexts)}")
+
+            result = run_cross_batch_multi_strategy(
+                items,
+                tokenizer,
+                model,
+                max_new_tokens=args.max_new_tokens,
+                strategy_name=f"collab_hidden_epoch{epoch}",
+                dataset=args.dataset,
+                mix_method=args.module_type,
+                mix_layer=-1,
+                mix_layers=mix_layers,
+                checkpoint_path=checkpoint_path,
+                enable_cross_batch=True,
+            )
+
+            eval_results["contexts"].append({
+                "title": title,
+                "metrics": result.metrics,
+                "latency": result.latency,
+                "prompt_tokens": result.prompt_tokens,
+                "generated_tokens": result.generated_tokens,
+                "num_questions": len(items),
+            })
+
+        # Aggregate eval results
+        total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in eval_results["contexts"])
+        total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in eval_results["contexts"])
+        total_questions = sum(ctx["num_questions"] for ctx in eval_results["contexts"])
+        total_latency = sum(ctx["latency"] for ctx in eval_results["contexts"])
+
+        epoch_metrics = {
+            "strict_acc": total_em / total_questions if total_questions > 0 else 0,
+            "f1": total_f1 / total_questions if total_questions > 0 else 0,
+            "avg_latency": total_latency / len(eval_results["contexts"]) if eval_results["contexts"] else 0,
+            "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in eval_results["contexts"]),
+            "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in eval_results["contexts"]),
+        }
+
+        baseline_em = baseline_results['aggregate_metrics']['strict_acc']
+        baseline_f1 = baseline_results['aggregate_metrics']['f1']
+
+        logger.info(f"\nEpoch {epoch} Results:")
+        logger.info(f"  EM:  {epoch_metrics['strict_acc']:.4f} (Δ {epoch_metrics['strict_acc'] - baseline_em:+.4f})")
+        logger.info(f"  F1:  {epoch_metrics['f1']:.4f} (Δ {epoch_metrics['f1'] - baseline_f1:+.4f})")
+        logger.info(f"  Latency: {epoch_metrics['avg_latency']:.2f}s")
+
+        all_results["epochs"].append(epoch_metrics)
+
+        # Save results
+        results_path = output_dir / f"results_epoch{epoch}.json"
+        with open(results_path, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        logger.info(f"Saved results to {results_path}")
+
+    # Final summary
+    logger.info("\n" + "=" * 60)
+    logger.info("FINAL SUMMARY")
+    logger.info("=" * 60)
+
+    logger.info("\nBaseline (vLLM):")
+    logger.info(f"  EM: {baseline_results['aggregate_metrics']['strict_acc']:.4f}")
+    logger.info(f"  F1: {baseline_results['aggregate_metrics']['f1']:.4f}")
+
+    logger.info("\nCross-Batch Results by Epoch:")
+    for ep, epoch_metrics in enumerate(all_results["epochs"], start=1):
+        logger.info(f"\nEpoch {ep}:")
+        logger.info(f"  EM: {epoch_metrics['strict_acc']:.4f} "
+                   f"(Δ {epoch_metrics['strict_acc'] - baseline_results['aggregate_metrics']['strict_acc']:+.4f})")
+        logger.info(f"  F1: {epoch_metrics['f1']:.4f} "
+                   f"(Δ {epoch_metrics['f1'] - baseline_results['aggregate_metrics']['f1']:+.4f})")
+
+    # Find best epoch
+    if all_results["epochs"]:
+        best_epoch = max(range(len(all_results["epochs"])),
+                        key=lambda i: all_results["epochs"][i]["f1"]) + 1
+        logger.info(f"\nBest Epoch: {best_epoch} (F1: {all_results['epochs'][best_epoch-1]['f1']:.4f})")
+
+    # Save final results
+    final_results_path = output_dir / "final_results.json"
+    with open(final_results_path, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    logger.info(f"\nSaved final results to {final_results_path}")
+
+    return all_results
+
+
+def main():
+    import torch
+    from src.datasets.squad import load_squad_groups
+    from src.datasets.hotpot import load_hotpot_groups
+
+    args = parse_args()
+
+    # Detect GPUs
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        logger.info(f"Detected {num_gpus} GPU(s)")
+    else:
+        num_gpus = 0
+        logger.info("No GPU detected, using CPU")
+
+    # Set random seed
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load evaluation data
+    logger.info(f"Loading evaluation data: {args.eval_samples} samples")
+
+    if args.dataset == "hotpot":
+        all_eval_contexts = load_hotpot_groups(
+            split="validation",
+            max_contexts=args.eval_samples,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            seed=args.seed + 1000,
+        )
+    else:
+        all_eval_contexts = load_squad_groups(
+            split="validation",
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            max_contexts=args.eval_samples,
+            seed=args.seed + 1000,
         )
 
-        # Display and save results (only rank 0)
-        if rank == 0:
-            logging.info(f"\nEpoch {epoch} Results:")
-            logging.info(f"  EM:  {epoch_results['aggregate_metrics']['strict_acc']:.4f} "
-                        f"(Δ {epoch_results['aggregate_metrics']['strict_acc'] - baseline_results['aggregate_metrics']['strict_acc']:+.4f})")
-            logging.info(f"  F1:  {epoch_results['aggregate_metrics']['f1']:.4f} "
-                        f"(Δ {epoch_results['aggregate_metrics']['f1'] - baseline_results['aggregate_metrics']['f1']:+.4f})")
-            logging.info(f"  Latency: {epoch_results['aggregate_metrics']['avg_latency']:.2f}s")
+    logger.info(f"Loaded {len(all_eval_contexts)} evaluation contexts")
 
-            all_results["epochs"].append(epoch_results["aggregate_metrics"])
+    # Step 1: Baseline (vLLM) - parallel across all GPUs
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 1: Baseline (vLLM) Strategy")
+    logger.info("=" * 60)
 
-            results_path = output_dir / f"results_epoch{epoch}.json"
-            with open(results_path, 'w') as f:
-                json.dump(all_results, f, indent=2)
-            logging.info(f"Saved results to {results_path}")
+    baseline_cache_path = output_dir / "baseline_results.json"
+    baseline_results = run_baseline_parallel(
+        args,
+        all_eval_contexts,
+        baseline_cache_path,
+        num_gpus=max(1, num_gpus),
+    )
 
-    # Final summary (only rank 0)
-    if rank == 0:
-        logging.info("\n" + "=" * 60)
-        logging.info("FINAL SUMMARY")
-        logging.info("=" * 60)
+    logger.info("\nBaseline Results:")
+    logger.info(f"  EM:  {baseline_results['aggregate_metrics']['strict_acc']:.4f}")
+    logger.info(f"  F1:  {baseline_results['aggregate_metrics']['f1']:.4f}")
+    logger.info(f"  Latency: {baseline_results['aggregate_metrics']['avg_latency']:.2f}s")
 
-        logging.info("\nBaseline (vLLM):")
-        logging.info(f"  EM: {baseline_results['aggregate_metrics']['strict_acc']:.4f}")
-        logging.info(f"  F1: {baseline_results['aggregate_metrics']['f1']:.4f}")
+    # Step 2: Training and evaluation (single GPU for now)
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 2: Training Cross-Batch Module")
+    logger.info("=" * 60)
 
-        logging.info("\nCross-Batch Results by Epoch:")
-        for ep, epoch_metrics in enumerate(all_results["epochs"], start=1):
-            logging.info(f"\nEpoch {ep}:")
-            logging.info(f"  EM: {epoch_metrics['strict_acc']:.4f} "
-                        f"(Δ {epoch_metrics['strict_acc'] - baseline_results['aggregate_metrics']['strict_acc']:+.4f})")
-            logging.info(f"  F1: {epoch_metrics['f1']:.4f} "
-                        f"(Δ {epoch_metrics['f1'] - baseline_results['aggregate_metrics']['f1']:+.4f})")
+    run_training_and_eval(
+        args,
+        all_eval_contexts,
+        baseline_results,
+        num_gpus=num_gpus,
+    )
 
-        # Find best epoch
-        if all_results["epochs"]:
-            best_epoch = max(range(len(all_results["epochs"])),
-                             key=lambda i: all_results["epochs"][i]["f1"]) + 1
-            logging.info(f"\nBest Epoch: {best_epoch} (F1: {all_results['epochs'][best_epoch-1]['f1']:.4f})")
-
-        # Save final results
-        final_results_path = output_dir / "final_results.json"
-        with open(final_results_path, 'w') as f:
-            json.dump(all_results, f, indent=2)
-        logging.info(f"\nSaved final results to {final_results_path}")
-
-        logging.info("\n" + "=" * 60)
-        logging.info("DONE!")
-        logging.info("=" * 60)
-
-    # Cleanup
-    if world_size > 1 and dist.is_initialized():
-        dist.destroy_process_group()
+    logger.info("\n" + "=" * 60)
+    logger.info("DONE!")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
