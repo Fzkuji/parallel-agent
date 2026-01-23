@@ -751,6 +751,7 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
         total_questions = sum(ctx["num_questions"] for ctx in contexts)
         total_contexts = len(contexts)
         total_latency = sum(ctx["latency"] for ctx in contexts)
+        avg_questions_per_context = total_questions / total_contexts if total_contexts else 0
 
         # Original tokens (unique input only, no repeated previous answers)
         total_prompt_tokens = sum(ctx["prompt_tokens"] for ctx in contexts)
@@ -784,6 +785,7 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
                 "avg_generated_tokens_api": total_generated_tokens_api / total_contexts if total_contexts else 0,
                 "num_contexts": total_contexts,
                 "num_questions": total_questions,
+                "avg_questions_per_context": avg_questions_per_context,
             },
             "contexts": contexts,
         }
@@ -916,7 +918,8 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
     first_strategy = next((s for s in strategies if s in all_results), None)
     if first_strategy:
         first_metrics = all_results[first_strategy]["aggregate_metrics"]
-        logger.info(f"Contexts: {first_metrics.get('num_contexts', 0)}, Questions: {first_metrics.get('num_questions', 0)}")
+        avg_q = first_metrics.get('avg_questions_per_context', 0)
+        logger.info(f"Contexts: {first_metrics.get('num_contexts', 0)}, Questions: {first_metrics.get('num_questions', 0)}, Avg Q/Context: {avg_q:.2f}")
 
     # Detailed per-strategy summary
     for strategy in strategies:
@@ -934,9 +937,9 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
         logger.info(f"  Latency:        {metrics.get('total_latency', 0):.2f}s (avg: {metrics['avg_latency']:.2f}s)")
 
     # Combined comparison table
-    logger.info("\n" + "=" * 130)
+    logger.info("\n" + "=" * 140)
     logger.info("=== Results Summary ===")
-    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
+    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'Q/Ctx':>5} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
     separator = "-" * len(header)
     logger.info(header)
     logger.info(separator)
@@ -950,6 +953,7 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
             f"{metrics['strict_acc']:>6.3f} | "
             f"{metrics['f1']:>6.3f} | "
             f"{metrics.get('lenient_acc', 0):>7.3f} | "
+            f"{metrics.get('avg_questions_per_context', 0):>5.1f} | "
             f"{metrics.get('avg_prompt_tokens', 0):>10.1f} | "
             f"{metrics.get('avg_generated_tokens', 0):>8.1f} | "
             f"{metrics.get('avg_prompt_tokens_api', 0):>13.1f} | "
@@ -957,7 +961,7 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
             f"{metrics['avg_latency']:>6.2f}s"
         )
 
-    logger.info("=" * 130)
+    logger.info("=" * 140)
 
 
 if __name__ == "__main__":
