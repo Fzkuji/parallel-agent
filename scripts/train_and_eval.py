@@ -81,6 +81,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default="outputs/train_and_eval", help="Output directory")
     parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints", help="Checkpoint directory")
     parser.add_argument("--cache-baseline", action="store_true", help="Cache baseline results to avoid recomputation")
+    parser.add_argument("--force", action="store_true", help="Force re-training even if checkpoint exists")
 
     # LoRA parameters
     parser.add_argument("--use-lora", action="store_true", default=False, help="Use LoRA for model training")
