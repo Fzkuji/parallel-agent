@@ -72,6 +72,13 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints", help="Checkpoint directory")
     parser.add_argument("--cache-baseline", action="store_true", help="Cache baseline results to avoid recomputation")
 
+    # LoRA parameters
+    parser.add_argument("--use-lora", action="store_true", default=False, help="Use LoRA for model training")
+    parser.add_argument("--lora-r", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout")
+    parser.add_argument("--lora-target-modules", type=str, default="q_proj,k_proj,v_proj,o_proj", help="LoRA target modules (comma-separated)")
+
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
@@ -239,11 +246,22 @@ def evaluate_checkpoint_on_shard(
     tokenizer,
     model,
     epoch: int,
+    lora_model=None,
 ) -> Dict[str, Any]:
     """Evaluate checkpoint on this rank's shard."""
     mix_layers = None
     if args.mix_layers:
         mix_layers = [int(x.strip()) for x in args.mix_layers.split(',')]
+
+    # Load LoRA weights from checkpoint if using LoRA
+    if args.use_lora and lora_model is not None:
+        import torch
+        checkpoint = torch.load(checkpoint_path, map_location=model.device if hasattr(model, 'device') else 'cuda')
+        if 'lora' in checkpoint:
+            current_state = model.state_dict()
+            current_state.update(checkpoint['lora'])
+            model.load_state_dict(current_state)
+            logging.info(f"Loaded {len(checkpoint['lora'])} LoRA tensors from checkpoint")
 
     shard_results = {"contexts": []}
 
@@ -289,6 +307,7 @@ def evaluate_checkpoint(
     epoch: int,
     rank: int,
     world_size: int,
+    lora_model=None,
 ) -> Dict[str, Any]:
     """Evaluate checkpoint across all ranks and gather."""
     # All ranks evaluate their shard
@@ -299,6 +318,7 @@ def evaluate_checkpoint(
         tokenizer,
         model,
         epoch,
+        lora_model=lora_model,
     )
     logging.info(f"Epoch {epoch} evaluation shard complete: {len(shard_results['contexts'])} contexts")
 
@@ -474,6 +494,30 @@ def main():
         logging.info("STEP 2: Training Cross-Batch Module")
         logging.info("=" * 60)
 
+    # Apply LoRA if enabled (all ranks)
+    lora_model = None
+    if args.use_lora:
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+            target_modules = [m.strip() for m in args.lora_target_modules.split(',')]
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=target_modules,
+                bias="none",
+            )
+            lora_model = get_peft_model(model, lora_config)
+            if rank == 0:
+                lora_model.print_trainable_parameters()
+                logging.info(f"LoRA config: r={args.lora_r}, alpha={args.lora_alpha}, target={target_modules}")
+            model = lora_model
+        except ImportError:
+            if rank == 0:
+                logging.warning("peft not installed. Cannot use LoRA. Install with: pip install peft")
+            args.use_lora = False
+
     # All ranks load training data
     if rank == 0:
         logging.info(f"Loading training data: {args.train_samples} samples")
@@ -564,6 +608,7 @@ def main():
         device=device,
         learning_rate=args.lr,
         train_lm_head=False,
+        train_lora=args.use_lora,
         local_rank=local_rank,  # Enable DDP wrapper
         mix_layer=-1,
     )
@@ -619,8 +664,17 @@ def main():
                     'module_type': args.module_type,
                     'mix_layer': -1,
                     'mix_layers': mix_layers,
+                    'use_lora': args.use_lora,
+                    'lora_r': args.lora_r if args.use_lora else None,
+                    'lora_alpha': args.lora_alpha if args.use_lora else None,
+                    'lora_target_modules': args.lora_target_modules if args.use_lora else None,
                 },
             }
+            # Save LoRA weights if enabled
+            if args.use_lora and lora_model is not None:
+                lora_state_dict = {k: v for k, v in model.state_dict().items() if 'lora' in k.lower()}
+                checkpoint['lora'] = lora_state_dict
+                logging.info(f"Saved {len(lora_state_dict)} LoRA tensors")
             torch.save(checkpoint, checkpoint_path)
             logging.info(f"Saved checkpoint to {checkpoint_path}")
 
@@ -647,6 +701,7 @@ def main():
             epoch,
             rank=rank,
             world_size=world_size,
+            lora_model=lora_model if args.use_lora else None,
         )
 
         # Display and save results (only rank 0)
