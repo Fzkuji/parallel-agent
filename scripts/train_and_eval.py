@@ -318,82 +318,66 @@ def run_baseline_on_shard_vllm(
 
 def load_or_run_baseline(
     args,
-    eval_contexts: List[Dict],
+    all_eval_contexts: List[Dict],
     cache_path: Path,
     rank: int,
     world_size: int,
 ) -> Dict[str, Any]:
-    """Load cached baseline or run on all ranks and gather."""
-    # If --force is specified, delete the cached baseline
-    if rank == 0 and args.force and cache_path.exists():
-        logging.info(f"--force specified, removing cached baseline: {cache_path}")
-        cache_path.unlink()
+    """Load cached baseline or run vLLM inference on rank 0 only.
 
-    # Rank 0 checks cache (only if --force not specified)
-    if rank == 0 and cache_path.exists() and args.cache_baseline and not args.force:
-        logging.info(f"Loading cached baseline from {cache_path}")
-        with open(cache_path, 'r') as f:
-            baseline_results = json.load(f)
-        return baseline_results
+    vLLM doesn't work well with torchrun multi-process setup, so we only
+    run baseline inference on rank 0 and broadcast results to other ranks.
 
-    # Initialize vLLM client for this rank
-    # For multi-GPU, each rank uses its own GPU
-    if world_size > 1 and torch.cuda.is_available():
-        # Set CUDA_VISIBLE_DEVICES for this rank
-        gpu_id = rank % torch.cuda.device_count()
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        # Disable vLLM V1 engine for compatibility
-        os.environ["VLLM_USE_V1"] = "0"
-        os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
+    Args:
+        all_eval_contexts: Full evaluation contexts (not sharded)
+    """
+    baseline_results = None
 
-    vllm_client = VLLMClient(
-        model=args.model,
-        tensor_parallel_size=1,
-        enable_thinking=args.enable_thinking,
-    )
+    # Only rank 0 handles baseline
+    if rank == 0:
+        # If --force is specified, delete the cached baseline
+        if args.force and cache_path.exists():
+            logging.info(f"--force specified, removing cached baseline: {cache_path}")
+            cache_path.unlink()
 
-    # All ranks run baseline on their shard
-    logging.info("Running baseline on shard...")
-    shard_results = run_baseline_on_shard_vllm(args, eval_contexts, vllm_client)
-    logging.info(f"Baseline shard complete: {len(shard_results['contexts'])} contexts")
+        # Check cache (only if --force not specified)
+        if cache_path.exists() and args.cache_baseline and not args.force:
+            logging.info(f"Loading cached baseline from {cache_path}")
+            with open(cache_path, 'r') as f:
+                baseline_results = json.load(f)
+        else:
+            # Run vLLM inference on ALL contexts (rank 0 only)
+            logging.info(f"Running vLLM baseline on {len(all_eval_contexts)} contexts...")
 
-    # Free vLLM model to save memory for training
-    del vllm_client
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+            vllm_client = VLLMClient(
+                model=args.model,
+                tensor_parallel_size=1,
+                enable_thinking=args.enable_thinking,
+            )
 
-    # Gather results
-    if world_size > 1 and dist.is_initialized():
-        logging.info("Waiting for all ranks to finish baseline...")
-        dist.barrier()
-        logging.info("All ranks ready, gathering results...")
-        all_shards = [None for _ in range(world_size)]
-        dist.all_gather_object(all_shards, shard_results)
+            shard_results = run_baseline_on_shard_vllm(args, all_eval_contexts, vllm_client)
+            logging.info(f"Baseline complete: {len(shard_results['contexts'])} contexts")
 
-        if rank == 0:
-            # Merge
-            all_contexts = []
-            for shard in all_shards:
-                if shard:
-                    all_contexts.extend(shard["contexts"])
+            # Free vLLM model to save memory for training
+            del vllm_client
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-            # Aggregate
-            total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
-            total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in all_contexts)
-            total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
-            total_latency = sum(ctx["latency"] for ctx in all_contexts)
-            total_prompt_tokens = sum(ctx["prompt_tokens"] for ctx in all_contexts)
-            total_generated_tokens = sum(ctx["generated_tokens"] for ctx in all_contexts)
+            # Aggregate results
+            total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
+            total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
+            total_questions = sum(ctx["num_questions"] for ctx in shard_results["contexts"])
+            total_latency = sum(ctx["latency"] for ctx in shard_results["contexts"])
 
             baseline_results = {
                 "aggregate_metrics": {
                     "strict_acc": total_em / total_questions if total_questions > 0 else 0,
                     "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                    "avg_latency": total_latency / len(all_contexts),
-                    "total_prompt_tokens": total_prompt_tokens,
-                    "total_generated_tokens": total_generated_tokens,
+                    "avg_latency": total_latency / len(shard_results["contexts"]) if shard_results["contexts"] else 0,
+                    "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in shard_results["contexts"]),
+                    "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in shard_results["contexts"]),
                 },
-                "contexts": all_contexts,
+                "contexts": shard_results["contexts"],
             }
 
             # Save cache
@@ -403,33 +387,13 @@ def load_or_run_baseline(
                     json.dump(baseline_results, f, indent=2)
                 logging.info(f"Saved baseline to {cache_path}")
 
-            return baseline_results
-        else:
-            return {}  # Non-zero ranks don't need baseline
-    else:
-        # Single GPU
-        total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
-        total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
-        total_questions = sum(ctx["num_questions"] for ctx in shard_results["contexts"])
-        total_latency = sum(ctx["latency"] for ctx in shard_results["contexts"])
+    # Broadcast results from rank 0 to all ranks
+    if world_size > 1 and dist.is_initialized():
+        results_list = [baseline_results]
+        dist.broadcast_object_list(results_list, src=0)
+        baseline_results = results_list[0]
 
-        baseline_results = {
-            "aggregate_metrics": {
-                "strict_acc": total_em / total_questions if total_questions > 0 else 0,
-                "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                "avg_latency": total_latency / len(shard_results["contexts"]) if shard_results["contexts"] else 0,
-                "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in shard_results["contexts"]),
-                "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in shard_results["contexts"]),
-            },
-            "contexts": shard_results["contexts"],
-        }
-
-        if args.cache_baseline:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cache_path, 'w') as f:
-                json.dump(baseline_results, f, indent=2)
-
-        return baseline_results
+    return baseline_results if baseline_results else {}
 
 
 def evaluate_checkpoint_on_shard(
@@ -609,7 +573,7 @@ def main():
         logging.info(f"Loading evaluation data: {args.eval_samples} samples")
 
     if args.dataset == "hotpot":
-        eval_contexts = load_hotpot_groups(
+        all_eval_contexts = load_hotpot_groups(
             split="validation",
             max_contexts=args.eval_samples,
             min_questions=args.min_questions,
@@ -617,7 +581,7 @@ def main():
             seed=args.seed + 1000,
         )
     else:  # squad
-        eval_contexts = load_squad_groups(
+        all_eval_contexts = load_squad_groups(
             split="validation",
             min_questions=args.min_questions,
             max_questions=args.max_questions,
@@ -625,12 +589,7 @@ def main():
             seed=args.seed + 1000,
         )
 
-    # Shard evaluation data across GPUs
-    if world_size > 1:
-        eval_contexts = eval_contexts[rank::world_size]
-        logging.info(f"Evaluating {len(eval_contexts)} contexts on this shard")
-
-    # Get or compute baseline results using vLLM
+    # Get or compute baseline results using vLLM (rank 0 only, uses full dataset)
     baseline_cache_path = output_dir / "baseline_results.json"
     if rank == 0:
         logging.info("=" * 60)
@@ -639,11 +598,18 @@ def main():
 
     baseline_results = load_or_run_baseline(
         args,
-        eval_contexts,
+        all_eval_contexts,  # Full dataset for vLLM (rank 0 only)
         baseline_cache_path,
         rank=rank,
         world_size=world_size,
     )
+
+    # Shard evaluation data across GPUs for cross-batch evaluation
+    if world_size > 1:
+        eval_contexts = all_eval_contexts[rank::world_size]
+        logging.info(f"Cross-batch will evaluate {len(eval_contexts)} contexts on this shard")
+    else:
+        eval_contexts = all_eval_contexts
 
     if rank == 0:
         logging.info("\nBaseline Results:")
