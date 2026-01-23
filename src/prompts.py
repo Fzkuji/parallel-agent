@@ -24,60 +24,53 @@ def build_dependency_prompt(
     question_lookup: Dict[str, Question],
     dataset: Optional[str] = None,
 ) -> Tuple[str, str]:
+    """Build a prompt with dependency information.
+
+    Uses simple format matching exp2a_shared_context.py:
+    - System: Simple instruction
+    - User: Context + Previous answers + Question
+    - No <answer> tags required
+    """
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
 
     # Multiple-choice questions: respond with option letter only
     use_mc_format = dataset in MULTIPLE_CHOICE_DATASETS
 
-    # CMB uses direct answer format without <answer> tags
-    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
-
-    # Only extractive QA datasets allow "unknown" responses
-    if dataset in EXTRACTIVE_DATASETS:
-        unknown_instruction = " If the answer is unknown, return <answer>unknown</answer>."
-    else:
-        unknown_instruction = ""
-
-    # Extractive QA datasets should extract answers from context
-    if dataset in EXTRACTIVE_QA_DATASETS:
-        extract_instruction = " Extract the answer directly from the background passage."
-    else:
-        extract_instruction = ""
-
     if use_mc_format:
         system_prompt = (
-            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。\n\n"
-            f"背景信息:\n{effective_background.strip()}"
-        )
-    elif use_direct_format:
-        system_prompt = (
-            f"You are a helpful medical assistant that answers questions given background passages.\n"
-            f"Provide the answer directly without any special formatting.\n\n"
-            f"Background:\n{effective_background.strip()}"
+            "你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。"
         )
     else:
         system_prompt = (
-            f"You are a helpful assistant that answers questions given background passages.\n"
-            f"Provide the answer with format <answer>text</answer>.{extract_instruction}{unknown_instruction}\n\n"
-            f"Background:\n{effective_background.strip()}"
+            "You are a helpful assistant. Answer the question based on the given passage.\n"
+            "Give a short, direct answer. Do not explain or elaborate."
         )
 
     user_lines: List[str] = []
+
+    # Add context/passage
+    if use_mc_format:
+        user_lines.append(f"背景信息:\n{effective_background.strip()}")
+    else:
+        user_lines.append(f"Passage:\n{effective_background.strip()}")
+
+    # Add dependency information if any
     if dependencies:
+        user_lines.append("")
         user_lines.append("Known previous answers:")
         for dep_id in dependencies:
             dep_question = question_lookup[dep_id]
             dep_answer = answers.get(dep_id, "").strip()
-            user_lines.append(f"{dep_id} - {dep_question.text.strip()}")
-            # Show previous answer (without <answer> tags for CMB)
-            if use_direct_format:
-                user_lines.append(f"Answer: {dep_answer}")
-            else:
-                user_lines.append(f"Answer: <answer>{dep_answer}</answer>")
-        user_lines.append("")
+            user_lines.append(f"- {dep_question.text.strip()}: {dep_answer}")
 
-    user_lines.append(f"Question ({question.qid}): {question.text.strip()}")
+    # Add current question
+    user_lines.append("")
+    if use_mc_format:
+        user_lines.append(f"问题: {question.text.strip()}")
+    else:
+        user_lines.append(f"Question: {question.text.strip()}")
+
     user_prompt = "\n".join(user_lines)
     return system_prompt, user_prompt
 
@@ -85,43 +78,30 @@ def build_dependency_prompt(
 def build_single_prompt(
     background: str, question: Question, dataset: Optional[str] = None
 ) -> Tuple[str, str]:
+    """Build a single-question prompt.
+
+    Uses simple format matching exp2a_shared_context.py:
+    - System: Simple instruction
+    - User: Context + Question
+    - No <answer> tags required
+    """
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
 
     # Multiple-choice questions: respond with option letter only
     use_mc_format = dataset in MULTIPLE_CHOICE_DATASETS
 
-    # CMB uses direct answer format without <answer> tags
-    use_direct_format = dataset in DIRECT_ANSWER_DATASETS
-
-    # Only extractive QA datasets allow "unknown" responses
-    if dataset in EXTRACTIVE_DATASETS:
-        unknown_instruction = " If the answer is unknown, return <answer>unknown</answer>."
-    else:
-        unknown_instruction = ""
-
-    # Extractive QA datasets should extract answers from context
-    if dataset in EXTRACTIVE_QA_DATASETS:
-        extract_instruction = " Extract the answer directly from the background passage."
-    else:
-        extract_instruction = ""
-
     if use_mc_format:
         system_prompt = (
-            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。\n\n"
-            f"背景信息:\n{effective_background.strip()}"
+            "你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。"
         )
-    elif use_direct_format:
-        system_prompt = (
-            f"You are a helpful medical assistant that answers questions given background passages.\n"
-            f"Provide the answer directly without any special formatting.\n\n"
-            f"Background:\n{effective_background.strip()}"
-        )
+        user_prompt = f"背景信息:\n{effective_background.strip()}\n\n问题: {question.text.strip()}"
     else:
+        # Simple format: no <answer> tags, context in user message
         system_prompt = (
-            f"You are a helpful assistant that answers questions given background passages.\n"
-            f"Provide the answer with format <answer>text</answer>.{extract_instruction}{unknown_instruction}\n\n"
-            f"Background:\n{effective_background.strip()}"
+            "You are a helpful assistant. Answer the question based on the given passage.\n"
+            "Give a short, direct answer. Do not explain or elaborate."
         )
-    user_prompt = f"Question ({question.qid}): {question.text.strip()}"
+        user_prompt = f"Passage:\n{effective_background.strip()}\n\nQuestion: {question.text.strip()}"
+
     return system_prompt, user_prompt

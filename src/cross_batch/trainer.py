@@ -66,8 +66,8 @@ class SQuADDataset(Dataset):
         for idx, item in enumerate(dataset):
             prompt = self._format_prompt(item["context"], item["question"], idx)
             raw_answer = item["answers"]["text"][0] if item["answers"]["text"] else ""
-            # Format answer with <answer> tags and EOS token to match inference
-            answer = f"<answer>{raw_answer}</answer>{eos_token}"
+            # Simple answer format: just the answer text + EOS token (no <answer> tags)
+            answer = f"{raw_answer}{eos_token}"
             self.examples.append({
                 "prompt": prompt,
                 "answer": answer,
@@ -136,7 +136,7 @@ class SQuADGroupedDataset(Dataset):
                     references = item.get("references", [])
                     prompt = self._format_prompt(context, question_text, group_idx, q_idx)
                     raw_answer = references[0] if references else ""
-                    answer = f"<answer>{raw_answer}</answer>{eos_token}"
+                    answer = f"{raw_answer}{eos_token}"
                     examples.append({
                         "prompt": prompt,
                         "answer": answer,
@@ -149,7 +149,7 @@ class SQuADGroupedDataset(Dataset):
                 for q_idx, q in enumerate(questions):
                     prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
                     raw_answer = q["references"][0] if q["references"] else ""
-                    answer = f"<answer>{raw_answer}</answer>{eos_token}"
+                    answer = f"{raw_answer}{eos_token}"
                     examples.append({
                         "prompt": prompt,
                         "answer": answer,
