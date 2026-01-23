@@ -142,37 +142,33 @@ def extract_json_from_text(text: str) -> dict:
 
 
 def build_dependency_prompt(background: str, questions: List[Question]) -> str:
-    """Build prompt for LLM-based dependency inference.
+    """Build prompt for LLM-based question ordering.
 
-    The prompt asks the model to output edges ordered by importance (most important first).
-    The position in the list will be used to assign confidence scores.
-    Uses compact format: {"source": "target"} instead of {"source": "Q1", "target": "Q2"}.
+    The prompt asks the model to output the optimal order to answer questions,
+    considering dependencies between them.
     """
     question_lines = [f"{q.qid}: {q.text.strip()}" for q in questions]
     prompt = textwrap.dedent(
         f"""
-        你将看到一段背景文本以及若干针对该背景的问题。请推断在回答这些问题时是否需要引用其他问题的答案。
+        给定背景文本和若干问题，请确定最佳的回答顺序。某些问题的答案可能对回答其他问题有帮助。
 
-        **重要：你的回答必须是markdown代码块格式，以```json开头，以```结尾。**
+        **重要：直接输出JSON，不要解释。**
 
-        输出格式示例（source依赖于target，即回答source时需要先知道target的答案）：
+        输出格式：
         ```json
-        {{"edges": [{{"Q3": "Q1"}}, {{"Q4": "Q2"}}]}}
+        {{"order": ["Q1", "Q3", "Q2", "Q4"]}}
         ```
 
         规则：
-        - 格式为 {{"被依赖问题ID": "依赖问题ID"}}，表示回答前者需要后者的答案。
-        - **按依赖关系的重要性从高到低排序输出**。
-        - 无依赖返回空数组：{{"edges": []}}
-        - 禁止循环依赖。
+        - 输出所有问题ID，按推荐的回答顺序排列
+        - 如果问题A的答案对问题B有帮助，则A应排在B之前
+        - 如果问题之间无依赖，保持原顺序
 
         背景：
         {background.strip()}
 
         问题：
         {os.linesep.join(question_lines)}
-
-        请直接输出```json代码块：
         """
     ).strip()
     return prompt
@@ -246,32 +242,25 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             if len(snippet) > 200:
                 snippet = snippet[:200] + "..."
             logging.warning(
-                "LLM dependency generation failed to produce valid JSON (%s); falling back to heuristics.",
+                "LLM ordering failed to produce valid JSON (%s); using original order.",
                 snippet,
             )
-            heuristic = HeuristicDependencyGenerator()
-            # retain the cost already incurred before fallback
-            return heuristic.generate_edges(background, questions, metadata)
-        edges_data = payload.get("edges", [])
+            # Return empty edges - will use original order
+            return []
+
+        # Parse order list and convert to edges
+        order = payload.get("order", [])
+        if not order or not isinstance(order, list):
+            # No ordering provided, use original order
+            return []
+
+        # Convert order to edges: each question depends on the one before it
+        # e.g., order=["Q1", "Q3", "Q2"] -> edges: Q3 depends on Q1, Q2 depends on Q3
         edges: List[EdgeCandidate] = []
-        for item in edges_data:
-            # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
-            if len(item) == 1:
-                target, source = next(iter(item.items()))
-            else:
-                # Fallback to old format for compatibility
-                try:
-                    source = item["source"]
-                    target = item["target"]
-                except KeyError:
-                    continue
-            # All edges have confidence 1.0 - LLM decides the order directly
-            # Handle case where source is a list (e.g., {"Q3": ["Q1", "Q2"]})
-            if isinstance(source, list):
-                for src in source:
-                    if isinstance(src, str) and isinstance(target, str):
-                        edges.append(EdgeCandidate(source=src, target=target, confidence=1.0))
-            elif isinstance(source, str) and isinstance(target, str):
+        for i in range(1, len(order)):
+            source = order[i - 1]  # Previous question in order
+            target = order[i]      # Current question depends on previous
+            if isinstance(source, str) and isinstance(target, str):
                 edges.append(EdgeCandidate(source=source, target=target, confidence=1.0))
         return edges
 
@@ -486,32 +475,24 @@ class APILLMDependencyGenerator(DependencyGraphGenerator):
             if len(snippet) > 200:
                 snippet = snippet[:200] + "..."
             logging.warning(
-                "API dependency generation failed to parse JSON (%s); falling back to heuristics.",
+                "API ordering failed to parse JSON (%s); using original order.",
                 snippet,
             )
-            heuristic = HeuristicDependencyGenerator()
-            return heuristic.generate_edges(background, questions, metadata)
+            # Return empty edges - will use original order
+            return []
 
-        edges_data = payload.get("edges", [])
+        # Parse order list and convert to edges
+        order = payload.get("order", [])
+        if not order or not isinstance(order, list):
+            # No ordering provided, use original order
+            return []
+
+        # Convert order to edges: each question depends on the one before it
+        # e.g., order=["Q1", "Q3", "Q2"] -> edges: Q3 depends on Q1, Q2 depends on Q3
         edges: List[EdgeCandidate] = []
-        for item in edges_data:
-            # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
-            if len(item) == 1:
-                target, source = next(iter(item.items()))
-            else:
-                # Fallback to old format for compatibility
-                try:
-                    source = item["source"]
-                    target = item["target"]
-                except KeyError:
-                    continue
-            # All edges have confidence 1.0 - LLM decides the order directly
-            # Handle case where source is a list (e.g., {"Q3": ["Q1", "Q2"]})
-            if isinstance(source, list):
-                for src in source:
-                    if isinstance(src, str) and isinstance(target, str):
-                        edges.append(EdgeCandidate(source=src, target=target, confidence=1.0))
-            elif isinstance(source, str) and isinstance(target, str):
+        for i in range(1, len(order)):
+            source = order[i - 1]  # Previous question in order
+            target = order[i]      # Current question depends on previous
+            if isinstance(source, str) and isinstance(target, str):
                 edges.append(EdgeCandidate(source=source, target=target, confidence=1.0))
-
         return edges

@@ -34,8 +34,8 @@ def get_think_tokens() -> bool:
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that answers questions given background passages."
 
 PLANNER_SYSTEM_PROMPT = (
-    "You are an expert planner. Analyse the questions and output only a JSON object describing dependencies. "
-    "Do NOT explain your reasoning. Output ONLY valid JSON, nothing else."
+    "You are an expert planner. Determine the optimal order to answer questions. "
+    "Output ONLY valid JSON with the order, nothing else."
 )
 
 
