@@ -84,11 +84,16 @@ def build_chat_prompt(
 
 
 def extract_box_answer(text: str) -> Tuple[str, bool]:
-    """Return the first <answer>...</answer> content if present; otherwise fallback to raw text."""
+    """Return the first <answer>...</answer> content if present; otherwise fallback to raw text.
+
+    Note: Always returns True for valid since the simple prompt format does not require
+    <answer> tags. The raw text is considered a valid answer.
+    """
     match = BOX_PATTERN.search(text)
     if match:
         return match.group(1).strip(), True
-    return text.strip(), False
+    # Simple format: no tags required, raw text is valid
+    return text.strip(), True
 
 
 def extract_option_letter(text: str) -> Tuple[str, bool]:
