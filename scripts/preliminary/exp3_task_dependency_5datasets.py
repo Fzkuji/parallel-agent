@@ -43,8 +43,7 @@ from src.datasets.triviaqa import load_triviaqa
 from src.datasets.mmlu import load_mmlu
 from src.datasets.gsm8k import load_gsm8k
 from src.models import Question
-from src.strategies.sequential import run_sequential_strategy
-from src.strategies.independent import run_independent_strategy
+from src.strategies import run_sequential_strategy, run_full_batch_strategy
 
 
 def load_dataset_by_name(dataset_name: str, split: str = "validation", max_contexts: int = 100):
@@ -148,7 +147,7 @@ def run_condition(
                 for q in context_data["questions"]
             ]
 
-            result = run_independent_strategy(
+            result = run_full_batch_strategy(
                 background=background,
                 questions=questions,
                 tokenizer=tokenizer,
@@ -194,7 +193,6 @@ def run_condition(
                 tokenizer=tokenizer,
                 model=model,
                 max_new_tokens=max_new_tokens,
-                strategy_name="icl",
                 dataset=dataset,
             )
             all_results.append(result)
