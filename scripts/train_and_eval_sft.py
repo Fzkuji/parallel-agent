@@ -779,9 +779,9 @@ def main():
             logger.info(f"Contexts: {m.get('num_contexts', 0)}, Questions: {m.get('num_questions', 0)}")
             break
 
-    # Original tokens table
-    logger.info("\n=== Aggregate Metrics (Original Tokens - unique input only) ===")
-    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'Latency':>10}"
+    # Combined results table
+    logger.info("\n=== Results Summary ===")
+    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
     separator = "-" * len(header)
     logger.info(header)
     logger.info(separator)
@@ -795,7 +795,9 @@ def main():
             f"{m.get('lenient_acc', 0):>7.3f} | "
             f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
             f"{m.get('avg_generated_tokens', 0):>8.1f} | "
-            f"{m['avg_latency']:>8.2f}s"
+            f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
+            f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
+            f"{m['avg_latency']:>6.2f}s"
         )
 
     if "sft_lora" in all_results:
@@ -807,36 +809,9 @@ def main():
             f"{m.get('lenient_acc', 0):>7.3f} | "
             f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
             f"{m.get('avg_generated_tokens', 0):>8.1f} | "
-            f"{m['avg_latency']:>8.2f}s"
-        )
-
-    # API tokens table
-    logger.info("\n=== API Cost Metrics (actual tokens sent/received) ===")
-    header_api = f"{'Strategy':<15} | {'PromptTok_API':>14} | {'GenTok_API':>12} | {'Total_API':>12}"
-    separator_api = "-" * len(header_api)
-    logger.info(header_api)
-    logger.info(separator_api)
-
-    if "baseline" in all_results:
-        m = all_results["baseline"]
-        prompt_api = m.get('avg_prompt_tokens_api', 0)
-        gen_api = m.get('avg_generated_tokens_api', 0)
-        logger.info(
-            f"{'baseline':<15} | "
-            f"{prompt_api:>14.1f} | "
-            f"{gen_api:>12.1f} | "
-            f"{prompt_api + gen_api:>12.1f}"
-        )
-
-    if "sft_lora" in all_results:
-        m = all_results["sft_lora"]
-        prompt_api = m.get('avg_prompt_tokens_api', 0)
-        gen_api = m.get('avg_generated_tokens_api', 0)
-        logger.info(
-            f"{'sft_lora':<15} | "
-            f"{prompt_api:>14.1f} | "
-            f"{gen_api:>12.1f} | "
-            f"{prompt_api + gen_api:>12.1f}"
+            f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
+            f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
+            f"{m['avg_latency']:>6.2f}s"
         )
 
         if "baseline" in all_results:

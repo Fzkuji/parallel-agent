@@ -393,17 +393,30 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
 
 def _run_sequential(vllm_model, tokenizer, items, question_lookup,
                     sampling_params, dataset, enable_thinking):
-    """Run sequential strategy: one question at a time."""
+    """Run sequential strategy: one question at a time, with previous answers concatenated."""
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
     answer_records = {}
+    answered_qa = []  # Store (question, answer) pairs for concatenation
     total_latency = 0
-    total_prompt_tokens = 0
+    total_prompt_tokens = 0  # Original: context + question only
+    total_prompt_tokens_api = 0  # API: context + question + previous answers
     total_generated_tokens = 0
 
     for item in items:
-        prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
+        # Build original prompt (context + question only)
+        original_prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
+
+        # Build extra context from previous answers
+        extra_context = ""
+        if answered_qa:
+            qa_texts = [f"Q: {q}\nA: {a}" for q, a in answered_qa]
+            extra_context = "\n\nPrevious Q&A:\n" + "\n\n".join(qa_texts) + "\n"
+
+        # Full prompt with previous answers
+        prompt = f"Passage:\n{item['context']}{extra_context}\n\nQuestion: {item['question']}"
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -427,7 +440,27 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
 
-        total_prompt_tokens += len(outputs[0].prompt_token_ids)
+        # Store for next iteration
+        answered_qa.append((item["question"], final_answer))
+
+        # Original tokens (context + question only)
+        original_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": original_prompt},
+        ]
+        try:
+            original_full = tokenizer.apply_chat_template(
+                original_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            original_full = tokenizer.apply_chat_template(
+                original_messages, tokenize=False, add_generation_prompt=True,
+            )
+        total_prompt_tokens += len(tokenizer.encode(original_full))
+
+        # API tokens (actual tokens sent)
+        total_prompt_tokens_api += len(outputs[0].prompt_token_ids)
         total_generated_tokens += len(outputs[0].outputs[0].token_ids)
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
@@ -436,9 +469,9 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         "metrics": metrics,
         "latency": total_latency,
         "prompt_tokens": total_prompt_tokens,  # Original input tokens
-        "generated_tokens": total_generated_tokens,  # Original generated tokens
-        "prompt_tokens_api": total_prompt_tokens,  # API tokens (same for sequential)
-        "generated_tokens_api": total_generated_tokens,  # API tokens (same)
+        "generated_tokens": total_generated_tokens,
+        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (includes previous answers)
+        "generated_tokens_api": total_generated_tokens,
     }
 
 
@@ -900,10 +933,10 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
         logger.info(f"  GenTok_API:     {metrics.get('total_generated_tokens_api', 0):,} (avg: {metrics.get('avg_generated_tokens_api', 0):.1f})")
         logger.info(f"  Latency:        {metrics.get('total_latency', 0):.2f}s (avg: {metrics['avg_latency']:.2f}s)")
 
-    # Comparison table - Original tokens (unique input)
-    logger.info("\n" + "=" * 110)
-    logger.info("=== Aggregate Metrics (Original Tokens - unique input only) ===")
-    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'Latency':>10}"
+    # Combined comparison table
+    logger.info("\n" + "=" * 130)
+    logger.info("=== Results Summary ===")
+    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
     separator = "-" * len(header)
     logger.info(header)
     logger.info(separator)
@@ -919,30 +952,12 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
             f"{metrics.get('lenient_acc', 0):>7.3f} | "
             f"{metrics.get('avg_prompt_tokens', 0):>10.1f} | "
             f"{metrics.get('avg_generated_tokens', 0):>8.1f} | "
-            f"{metrics['avg_latency']:>8.2f}s"
+            f"{metrics.get('avg_prompt_tokens_api', 0):>13.1f} | "
+            f"{metrics.get('avg_generated_tokens_api', 0):>10.1f} | "
+            f"{metrics['avg_latency']:>6.2f}s"
         )
 
-    # Comparison table - API tokens (actual cost)
-    logger.info("\n=== API Cost Metrics (actual tokens sent/received) ===")
-    header_api = f"{'Strategy':<15} | {'PromptTok_API':>14} | {'GenTok_API':>12} | {'Total_API':>12}"
-    separator_api = "-" * len(header_api)
-    logger.info(header_api)
-    logger.info(separator_api)
-
-    for strategy in strategies:
-        if strategy not in all_results:
-            continue
-        metrics = all_results[strategy]["aggregate_metrics"]
-        prompt_api = metrics.get('avg_prompt_tokens_api', 0)
-        gen_api = metrics.get('avg_generated_tokens_api', 0)
-        logger.info(
-            f"{strategy:<15} | "
-            f"{prompt_api:>14.1f} | "
-            f"{gen_api:>12.1f} | "
-            f"{prompt_api + gen_api:>12.1f}"
-        )
-
-    logger.info("=" * 110)
+    logger.info("=" * 130)
 
 
 if __name__ == "__main__":
