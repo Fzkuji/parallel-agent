@@ -553,8 +553,12 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     ]
     dep_question_lookup = {q.qid: q for q in dep_questions}
 
-    # Generate dependency edges using LLM
+    # Generate dependency edges using LLM (and track cost)
     edges = dep_generator.generate_edges("", dep_questions)
+    dep_metrics = dep_generator.last_metrics
+    dep_prompt_tokens = int(dep_metrics.get("prompt_tokens", 0))
+    dep_generated_tokens = int(dep_metrics.get("generated_tokens", 0))
+    dep_latency = dep_metrics.get("latency", 0.0)
 
     # Select and apply dependencies
     selected = select_dependency_edges(
@@ -668,11 +672,15 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
 
     return {
         "metrics": metrics,
-        "latency": total_latency,
+        "latency": total_latency + dep_latency,  # Include dependency generation latency
         "prompt_tokens": total_prompt_tokens,  # Original input tokens
         "generated_tokens": total_generated_tokens,  # Generated tokens
-        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (includes extra_context)
-        "generated_tokens_api": total_generated_tokens,  # Same as generated_tokens
+        "prompt_tokens_api": total_prompt_tokens_api + dep_prompt_tokens,  # Include dep generation cost
+        "generated_tokens_api": total_generated_tokens + dep_generated_tokens,  # Include dep generation cost
+        # Separate tracking for dependency generation cost
+        "dep_prompt_tokens": dep_prompt_tokens,
+        "dep_generated_tokens": dep_generated_tokens,
+        "dep_latency": dep_latency,
     }
 
 
@@ -761,6 +769,11 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
         total_prompt_tokens_api = sum(ctx.get("prompt_tokens_api", ctx["prompt_tokens"]) for ctx in contexts)
         total_generated_tokens_api = sum(ctx.get("generated_tokens_api", ctx["generated_tokens"]) for ctx in contexts)
 
+        # Dependency generation cost (for collab_llm)
+        total_dep_prompt_tokens = sum(ctx.get("dep_prompt_tokens", 0) for ctx in contexts)
+        total_dep_generated_tokens = sum(ctx.get("dep_generated_tokens", 0) for ctx in contexts)
+        total_dep_latency = sum(ctx.get("dep_latency", 0) for ctx in contexts)
+
         # Weighted averages for metrics
         total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in contexts)
         total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in contexts)
@@ -786,6 +799,13 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
                 "num_contexts": total_contexts,
                 "num_questions": total_questions,
                 "avg_questions_per_context": avg_questions_per_context,
+                # Dependency generation cost (for collab_llm)
+                "total_dep_prompt_tokens": total_dep_prompt_tokens,
+                "total_dep_generated_tokens": total_dep_generated_tokens,
+                "total_dep_latency": total_dep_latency,
+                "avg_dep_prompt_tokens": total_dep_prompt_tokens / total_contexts if total_contexts else 0,
+                "avg_dep_generated_tokens": total_dep_generated_tokens / total_contexts if total_contexts else 0,
+                "avg_dep_latency": total_dep_latency / total_contexts if total_contexts else 0,
             },
             "contexts": contexts,
         }
@@ -935,11 +955,16 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
         logger.info(f"  PromptTok_API:  {metrics.get('total_prompt_tokens_api', 0):,} (avg: {metrics.get('avg_prompt_tokens_api', 0):.1f})")
         logger.info(f"  GenTok_API:     {metrics.get('total_generated_tokens_api', 0):,} (avg: {metrics.get('avg_generated_tokens_api', 0):.1f})")
         logger.info(f"  Latency:        {metrics.get('total_latency', 0):.2f}s (avg: {metrics['avg_latency']:.2f}s)")
+        # Show dependency generation cost for collab_llm
+        if metrics.get('total_dep_prompt_tokens', 0) > 0:
+            logger.info(f"  Dep PromptTok:  {metrics.get('total_dep_prompt_tokens', 0):,} (avg: {metrics.get('avg_dep_prompt_tokens', 0):.1f})")
+            logger.info(f"  Dep GenTok:     {metrics.get('total_dep_generated_tokens', 0):,} (avg: {metrics.get('avg_dep_generated_tokens', 0):.1f})")
+            logger.info(f"  Dep Latency:    {metrics.get('total_dep_latency', 0):.2f}s (avg: {metrics.get('avg_dep_latency', 0):.2f}s)")
 
     # Combined comparison table
-    logger.info("\n" + "=" * 140)
+    logger.info("\n" + "=" * 160)
     logger.info("=== Results Summary ===")
-    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'Q/Ctx':>5} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
+    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'Q/Ctx':>5} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'DepTok':>8} | {'Latency':>8}"
     separator = "-" * len(header)
     logger.info(header)
     logger.info(separator)
@@ -948,6 +973,8 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
         if strategy not in all_results:
             continue
         metrics = all_results[strategy]["aggregate_metrics"]
+        # DepTok = dependency generation tokens (prompt + generated)
+        dep_tok = metrics.get('avg_dep_prompt_tokens', 0) + metrics.get('avg_dep_generated_tokens', 0)
         logger.info(
             f"{strategy:<15} | "
             f"{metrics['strict_acc']:>6.3f} | "
@@ -958,10 +985,11 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
             f"{metrics.get('avg_generated_tokens', 0):>8.1f} | "
             f"{metrics.get('avg_prompt_tokens_api', 0):>13.1f} | "
             f"{metrics.get('avg_generated_tokens_api', 0):>10.1f} | "
+            f"{dep_tok:>8.1f} | "
             f"{metrics['avg_latency']:>6.2f}s"
         )
 
-    logger.info("=" * 140)
+    logger.info("=" * 160)
 
 
 if __name__ == "__main__":
