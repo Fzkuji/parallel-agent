@@ -61,9 +61,9 @@ def parse_args():
                             "or 'all' (evaluate both formats, default)")
 
     # Training
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--max-seq-length", type=int, default=2048)
@@ -96,6 +96,10 @@ def parse_args():
     # Other
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--force", action="store_true", help="Force re-evaluation even if cached results exist")
+
+    # Internal: DDP training worker mode (used by torchrun)
+    parser.add_argument("--train-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--train-data-path", type=str, default=None, help=argparse.SUPPRESS)
 
     return parser.parse_args()
 
@@ -470,9 +474,9 @@ class DataCollatorForCausalLMWithMasking:
         }
 
 
-def train_lora(
+def _train_lora_worker(
     model_name: str,
-    train_groups: List[Dict],
+    train_data_path: str,
     output_dir: str,
     epochs: int,
     batch_size: int,
@@ -487,12 +491,12 @@ def train_lora(
     seed: int,
     train_format: str = "batch",
 ) -> str:
-    """Train LoRA adapter using SFT.
+    """Internal training function executed by each DDP process.
 
-    Args:
-        train_format: "batch" (each question independent) or "sequential" (multi-turn)
+    This function is called by torchrun for DDP training.
     """
     import torch
+    import torch.distributed as dist
     from transformers import (
         AutoTokenizer,
         AutoModelForCausalLM,
@@ -503,20 +507,29 @@ def train_lora(
     from peft import LoraConfig, get_peft_model, TaskType
     from datasets import Dataset
 
-    logger.info("Loading tokenizer and model...")
+    # Check if running in distributed mode
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_main_process = local_rank == 0
+
+    if is_main_process:
+        logger.info(f"Loading tokenizer and model (world_size={world_size})...")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # For DDP training, don't use device_map="auto"
+    # Let the Trainer handle device placement
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        device_map="auto",
         trust_remote_code=True,
     )
 
     # Configure LoRA
-    logger.info(f"Configuring LoRA: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
+    if is_main_process:
+        logger.info(f"Configuring LoRA: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=lora_r,
@@ -527,12 +540,16 @@ def train_lora(
     )
 
     model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    if is_main_process:
+        model.print_trainable_parameters()
 
-    # Prepare training data
-    logger.info(f"Preparing training data (format: {train_format})...")
-    training_examples = prepare_training_data(train_groups, tokenizer, max_seq_length, train_format)
-    logger.info(f"Prepared {len(training_examples)} training examples")
+    # Load pre-prepared training data
+    if is_main_process:
+        logger.info(f"Loading training data from {train_data_path}...")
+    with open(train_data_path, 'r') as f:
+        training_examples = json.load(f)
+    if is_main_process:
+        logger.info(f"Loaded {len(training_examples)} training examples")
 
     # Determine columns to remove
     columns_to_remove = ["text"]
@@ -561,7 +578,8 @@ def train_lora(
 
     # Data collator - use custom masking for sequential format
     if train_format == "sequential":
-        logger.info("Using custom data collator with assistant-only masking")
+        if is_main_process:
+            logger.info("Using custom data collator with assistant-only masking")
         data_collator = DataCollatorForCausalLMWithMasking(tokenizer)
     else:
         data_collator = DataCollatorForLanguageModeling(
@@ -569,7 +587,7 @@ def train_lora(
             mlm=False,
         )
 
-    # Training arguments
+    # Training arguments with DDP support
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -585,6 +603,10 @@ def train_lora(
         seed=seed,
         remove_unused_columns=False,
         report_to="none",
+        # DDP settings
+        ddp_find_unused_parameters=False,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
     )
 
     # Trainer
@@ -595,14 +617,111 @@ def train_lora(
         data_collator=data_collator,
     )
 
-    logger.info("Starting training...")
+    if is_main_process:
+        logger.info(f"Starting DDP training with {world_size} GPU(s)...")
     trainer.train()
 
-    # Save the final model
+    # Save the final model (only on main process)
     final_checkpoint_dir = os.path.join(output_dir, "final")
-    model.save_pretrained(final_checkpoint_dir)
-    tokenizer.save_pretrained(final_checkpoint_dir)
-    logger.info(f"Saved final checkpoint to {final_checkpoint_dir}")
+    if is_main_process:
+        model.save_pretrained(final_checkpoint_dir)
+        tokenizer.save_pretrained(final_checkpoint_dir)
+        logger.info(f"Saved final checkpoint to {final_checkpoint_dir}")
+
+    return final_checkpoint_dir
+
+
+def train_lora(
+    model_name: str,
+    train_groups: List[Dict],
+    output_dir: str,
+    epochs: int,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    learning_rate: float,
+    warmup_ratio: float,
+    max_seq_length: int,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+    lora_target_modules: List[str],
+    seed: int,
+    train_format: str = "batch",
+    num_gpus: int = 1,
+    gpu_ids: Optional[List[int]] = None,
+) -> str:
+    """Train LoRA adapter using SFT with DDP multi-GPU support.
+
+    This function prepares the training data and launches torchrun for DDP training.
+
+    Args:
+        train_format: "batch" (each question independent) or "sequential" (multi-turn)
+        num_gpus: Number of GPUs for DDP training
+        gpu_ids: List of GPU IDs to use
+    """
+    import subprocess
+    from transformers import AutoTokenizer
+
+    logger.info("Preparing training data...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Prepare training data
+    training_examples = prepare_training_data(train_groups, tokenizer, max_seq_length, train_format)
+    logger.info(f"Prepared {len(training_examples)} training examples")
+
+    # Save training data to temp file for DDP workers to load
+    os.makedirs(output_dir, exist_ok=True)
+    train_data_path = os.path.join(output_dir, "train_data.json")
+    with open(train_data_path, 'w') as f:
+        json.dump(training_examples, f)
+    logger.info(f"Saved training data to {train_data_path}")
+
+    # Prepare environment for torchrun
+    env = os.environ.copy()
+    if gpu_ids:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+        logger.info(f"Using GPUs: {gpu_ids}")
+
+    # Build torchrun command
+    script_path = os.path.abspath(__file__)
+    cmd = [
+        sys.executable, "-m", "torch.distributed.run",
+        "--nproc_per_node", str(num_gpus),
+        "--master_port", str(29500 + seed % 1000),  # Avoid port conflicts
+        script_path,
+        "--train-worker",
+        "--model", model_name,
+        "--train-data-path", train_data_path,
+        "--output-dir", output_dir,
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--gradient-accumulation-steps", str(gradient_accumulation_steps),
+        "--lr", str(learning_rate),
+        "--warmup-ratio", str(warmup_ratio),
+        "--max-seq-length", str(max_seq_length),
+        "--lora-r", str(lora_r),
+        "--lora-alpha", str(lora_alpha),
+        "--lora-dropout", str(lora_dropout),
+        "--lora-target-modules", ",".join(lora_target_modules),
+        "--seed", str(seed),
+        "--train-format", train_format,
+    ]
+
+    logger.info(f"Launching DDP training with {num_gpus} GPUs...")
+    logger.info(f"Command: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"Training failed with return code {result.returncode}")
+
+    # Clean up temp file
+    if os.path.exists(train_data_path):
+        os.unlink(train_data_path)
+
+    final_checkpoint_dir = os.path.join(output_dir, "final")
+    logger.info(f"Training complete, checkpoint at {final_checkpoint_dir}")
 
     return final_checkpoint_dir
 
@@ -1104,6 +1223,8 @@ def _train_and_eval_single_format(
             lora_target_modules=lora_target_modules,
             seed=args.seed,
             train_format=train_format,
+            num_gpus=num_gpus,
+            gpu_ids=gpu_ids,
         )
 
     if not lora_checkpoint_path:
@@ -1205,10 +1326,40 @@ def _print_comparison_table(all_format_results: Dict[str, Dict], formats: List[s
     logger.info("=" * 160)
 
 
+def _run_train_worker():
+    """Entry point for DDP training worker (called by torchrun)."""
+    args = parse_args()
+
+    lora_target_modules = [m.strip() for m in args.lora_target_modules.split(',')]
+
+    _train_lora_worker(
+        model_name=args.model,
+        train_data_path=args.train_data_path,
+        output_dir=args.output_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.lr,
+        warmup_ratio=args.warmup_ratio,
+        max_seq_length=args.max_seq_length,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=lora_target_modules,
+        seed=args.seed,
+        train_format=args.train_format,
+    )
+
+
 def main():
     import torch
 
     args = parse_args()
+
+    # Check if running as DDP training worker
+    if args.train_worker:
+        _run_train_worker()
+        return
 
     # Set random seed
     torch.manual_seed(args.seed)
