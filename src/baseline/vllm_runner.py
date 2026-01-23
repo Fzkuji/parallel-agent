@@ -33,20 +33,26 @@ def _get_available_gpus(min_free_memory_gb: float = 10.0) -> List[int]:
             ['nvidia-smi', '--query-gpu=index,memory.free', '--format=csv,noheader,nounits'],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode != 0:
-            return list(range(8))  # Fallback: assume all GPUs available
+        if result.returncode == 0:
+            available = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split(',')
+                gpu_idx = int(parts[0].strip())
+                free_mb = float(parts[1].strip())
+                free_gb = free_mb / 1024
+                if free_gb >= min_free_memory_gb:
+                    available.append(gpu_idx)
+            if available:
+                return available
+    except Exception:
+        pass
 
-        available = []
-        for line in result.stdout.strip().split('\n'):
-            if not line.strip():
-                continue
-            parts = line.split(',')
-            gpu_idx = int(parts[0].strip())
-            free_mb = float(parts[1].strip())
-            free_gb = free_mb / 1024
-            if free_gb >= min_free_memory_gb:
-                available.append(gpu_idx)
-        return available if available else list(range(8))
+    try:
+        import torch
+        count = torch.cuda.device_count()
+        return list(range(count))
     except Exception:
         return list(range(8))  # Fallback
 
@@ -229,6 +235,7 @@ def run_vllm_baseline(
     cache_baseline: bool = True,
     force: bool = False,
     num_gpus: Optional[int] = None,
+    min_free_memory_gb: float = 10.0,
 ) -> Dict[str, Any]:
     """Run vLLM baseline inference in parallel across multiple GPUs.
 
@@ -253,18 +260,20 @@ def run_vllm_baseline(
     cache_path = output_dir / "baseline_results.json"
 
     # Auto-detect available GPUs with sufficient free memory
-    available_gpus = _get_available_gpus(min_free_memory_gb=10.0)
+    available_gpus = _get_available_gpus(min_free_memory_gb=min_free_memory_gb)
     logger.info(f"Available GPUs with sufficient memory: {available_gpus}")
 
     if num_gpus is None:
         num_gpus = len(available_gpus) if available_gpus else 1
+        gpu_ids = available_gpus[:num_gpus] if available_gpus else list(range(num_gpus))
     else:
-        # Limit to available GPUs
-        num_gpus = min(num_gpus, len(available_gpus))
-    num_gpus = max(1, num_gpus)
-
-    # Use only available GPUs
-    gpu_ids = available_gpus[:num_gpus] if available_gpus else list(range(num_gpus))
+        try:
+            import torch
+            total = torch.cuda.device_count()
+        except Exception:
+            total = len(available_gpus)
+        num_gpus = max(1, min(num_gpus, total if total else num_gpus))
+        gpu_ids = list(range(num_gpus))
 
     # Check cache
     if cache_path.exists() and cache_baseline and not force:

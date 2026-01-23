@@ -44,6 +44,10 @@ def parse_args():
     # Inference
     parser.add_argument("--max-new-tokens", type=int, default=96)
 
+    # Hardware
+    parser.add_argument("--num-gpus", type=int, default=None, help="Override auto GPU detection")
+    parser.add_argument("--min-free-mem-gb", type=float, default=10.0, help="Minimum free GPU memory to auto-select")
+
     # Paths
     parser.add_argument("--output-dir", type=str, default="outputs/train_and_eval")
     parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints")
@@ -118,6 +122,8 @@ def main():
         enable_thinking=args.enable_thinking,
         cache_baseline=args.cache_baseline,
         force=args.force,
+        num_gpus=args.num_gpus,
+        min_free_memory_gb=args.min_free_mem_gb,
     )
 
     logger.info("\nBaseline Results:")
@@ -171,6 +177,8 @@ def main():
         lora_target_modules=[m.strip() for m in args.lora_target_modules.split(',')],
         checkpoint_dir=args.checkpoint_dir,
         output_dir=args.output_dir,
+        num_gpus=args.num_gpus,
+        min_free_mem_gb=args.min_free_mem_gb,
     )
 
     # Run pipeline

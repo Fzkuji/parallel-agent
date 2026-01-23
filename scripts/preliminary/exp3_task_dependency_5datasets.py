@@ -24,7 +24,11 @@ Metrics:
   - ICL Benefit = ICL - Batch
 
 Usage:
+  # Single GPU:
   python exp3_task_dependency_5datasets.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop triviaqa mmlu gsm8k
+
+  # Multi-GPU with DDP (e.g., 4 GPUs):
+  torchrun --nproc_per_node=4 scripts/preliminary/exp3_task_dependency_5datasets.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
 """
 
 import sys
@@ -35,8 +39,10 @@ import json
 import argparse
 from typing import Dict, List, Any
 import torch
+import torch.distributed as dist
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from scripts.preliminary.utils import setup_distributed, cleanup_distributed, shard_data, gather_results
 from src.datasets.squad import load_squad_groups
 from src.datasets.drop import load_drop_groups
 from src.datasets.triviaqa import load_triviaqa
@@ -156,12 +162,13 @@ def run_condition(
                 strategy_name="batch",
                 dataset=dataset,
             )
-            all_results.append(result)
+            all_results.append((result, len(questions)))
 
-        # Aggregate metrics
-        total_correct = sum(r.metrics.get("correct", 0) for r in all_results)
-        total_questions = sum(r.metrics.get("total", 0) for r in all_results)
-        accuracy = total_correct / total_questions if total_questions > 0 else 0.0
+        # Aggregate metrics (strict_acc is EM accuracy as ratio 0-1)
+        total_questions = sum(n_q for _, n_q in all_results)
+        weighted_acc = sum(r.metrics.get("strict_acc", 0) * n_q for r, n_q in all_results)
+        accuracy = weighted_acc / total_questions if total_questions > 0 else 0.0
+        total_correct = int(round(weighted_acc))
 
         return {
             "condition": condition,
@@ -195,12 +202,13 @@ def run_condition(
                 max_new_tokens=max_new_tokens,
                 dataset=dataset,
             )
-            all_results.append(result)
+            all_results.append((result, len(questions)))
 
-        # Aggregate metrics
-        total_correct = sum(r.metrics.get("correct", 0) for r in all_results)
-        total_questions = sum(r.metrics.get("total", 0) for r in all_results)
-        accuracy = total_correct / total_questions if total_questions > 0 else 0.0
+        # Aggregate metrics (strict_acc is EM accuracy as ratio 0-1)
+        total_questions = sum(n_q for _, n_q in all_results)
+        weighted_acc = sum(r.metrics.get("strict_acc", 0) * n_q for r, n_q in all_results)
+        accuracy = weighted_acc / total_questions if total_questions > 0 else 0.0
+        total_correct = int(round(weighted_acc))
 
         return {
             "condition": condition,
@@ -231,18 +239,36 @@ def main():
 
     args = parser.parse_args()
 
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Setup distributed (DDP)
+    rank, world_size = setup_distributed()
+    is_main = (rank == 0)
 
-    # Load model
-    print(f"Loading model: {args.model}")
+    # Create output directory (only on rank 0)
+    output_dir = Path(args.output_dir)
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine device for this rank
+    if torch.cuda.is_available():
+        device = f"cuda:{rank % torch.cuda.device_count()}"
+    else:
+        device = "cpu"
+
+    # Load model to specific device (not device_map="auto")
+    if is_main:
+        print(f"Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map=None,  # Don't use auto device_map for DDP
+        low_cpu_mem_usage=True,
     )
+    model = model.to(device)
+    model.eval()
+
+    if is_main:
+        print(f"Model loaded on {device} (rank {rank}/{world_size})")
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -251,27 +277,39 @@ def main():
     all_results = {}
 
     for dataset_name in args.datasets:
-        print(f"\n{'='*60}")
-        print(f"Dataset: {dataset_name}")
-        print(f"{'='*60}\n")
+        if is_main:
+            print(f"\n{'='*60}")
+            print(f"Dataset: {dataset_name}")
+            print(f"{'='*60}\n")
 
-        # Load dataset
-        print(f"Loading {dataset_name} data...")
+        # Load dataset (all ranks load full data, then shard)
+        if is_main:
+            print(f"Loading {dataset_name} data...")
         data, dataset_key = load_dataset_by_name(
             dataset_name,
             split="validation",
             max_contexts=args.max_contexts
         )
-        print(f"Loaded {len(data)} contexts\n")
+        total_contexts = len(data)
+        if is_main:
+            print(f"Loaded {total_contexts} contexts total\n")
+
+        # Shard data across ranks
+        local_data = shard_data(data, rank, world_size)
+        if is_main:
+            print(f"Rank {rank} processing {len(local_data)} contexts")
 
         # Test each condition
         dataset_results = {}
         conditions = ["batch", "icl"]
 
         for condition in conditions:
-            print(f"\nRunning condition: {condition}")
-            result = run_condition(
-                data=data,
+            if is_main:
+                print(f"\nRunning condition: {condition}")
+
+            # Run on local shard
+            local_result = run_condition(
+                data=local_data,
                 condition=condition,
                 tokenizer=tokenizer,
                 model=model,
@@ -279,9 +317,29 @@ def main():
                 dataset=dataset_key,
             )
 
+            # Gather results from all ranks
+            local_metrics = {
+                "total_correct": local_result["total_correct"],
+                "total_questions": local_result["total_questions"],
+            }
+            all_metrics = gather_results([local_metrics], world_size)
+
+            # Aggregate on all ranks (after gather)
+            total_correct = sum(m["total_correct"] for m in all_metrics)
+            total_questions = sum(m["total_questions"] for m in all_metrics)
+            accuracy = total_correct / total_questions if total_questions > 0 else 0.0
+
+            result = {
+                "condition": condition,
+                "accuracy": accuracy,
+                "total_questions": total_questions,
+                "total_correct": total_correct,
+            }
+
             dataset_results[condition] = result
-            print(f"  Accuracy: {result['accuracy']:.4f}")
-            print(f"  Correct: {result['total_correct']}/{result['total_questions']}")
+            if is_main:
+                print(f"  Accuracy: {result['accuracy']:.4f}")
+                print(f"  Correct: {result['total_correct']}/{result['total_questions']}")
 
         # Compute derived metrics
         batch_acc = dataset_results["batch"]["accuracy"]
@@ -293,41 +351,46 @@ def main():
             "icl_benefit": icl_benefit,
         }
 
-        print(f"\n{'='*40}")
-        print(f"Summary for {dataset_name}:")
-        print(f"  Batch: {batch_acc:.4f}")
-        print(f"  ICL:   {icl_acc:.4f}")
-        print(f"  ICL Benefit: {icl_benefit:+.4f}")
-        print(f"{'='*40}\n")
+        if is_main:
+            print(f"\n{'='*40}")
+            print(f"Summary for {dataset_name}:")
+            print(f"  Batch: {batch_acc:.4f}")
+            print(f"  ICL:   {icl_acc:.4f}")
+            print(f"  ICL Benefit: {icl_benefit:+.4f}")
+            print(f"{'='*40}\n")
 
         all_results[dataset_name] = dataset_results
 
-    # Save results
-    output_file = output_dir / "exp3_results_5datasets.json"
-    with open(output_file, 'w') as f:
-        json.dump({
-            "model": args.model,
-            "datasets": args.datasets,
-            "results": all_results,
-        }, f, indent=2)
+    # Save results (only on rank 0)
+    if is_main:
+        output_file = output_dir / "exp3_results_5datasets.json"
+        with open(output_file, 'w') as f:
+            json.dump({
+                "model": args.model,
+                "datasets": args.datasets,
+                "results": all_results,
+            }, f, indent=2)
 
-    print(f"\nResults saved to: {output_file}")
+        print(f"\nResults saved to: {output_file}")
 
-    # Print summary table
-    print(f"\n{'='*60}")
-    print("SUMMARY TABLE")
-    print(f"{'='*60}")
-    print(f"{'Dataset':<20} {'Batch':>10} {'ICL':>10} {'Benefit':>10}")
-    print(f"{'-'*60}")
+        # Print summary table
+        print(f"\n{'='*60}")
+        print("SUMMARY TABLE")
+        print(f"{'='*60}")
+        print(f"{'Dataset':<20} {'Batch':>10} {'ICL':>10} {'Benefit':>10}")
+        print(f"{'-'*60}")
 
-    for dataset_name in args.datasets:
-        r = all_results[dataset_name]
-        print(f"{dataset_name:<20} "
-              f"{r['batch']['accuracy']:>9.2%} "
-              f"{r['icl']['accuracy']:>9.2%} "
-              f"{r['metrics']['icl_benefit']:>+9.2%}")
+        for dataset_name in args.datasets:
+            r = all_results[dataset_name]
+            print(f"{dataset_name:<20} "
+                  f"{r['batch']['accuracy']:>9.2%} "
+                  f"{r['icl']['accuracy']:>9.2%} "
+                  f"{r['metrics']['icl_benefit']:>+9.2%}")
 
-    print(f"{'='*60}\n")
+        print(f"{'='*60}\n")
+
+    # Cleanup distributed
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

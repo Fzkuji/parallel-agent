@@ -35,22 +35,29 @@ def _get_available_gpus(min_free_memory_gb: float = 10.0) -> List[int]:
             ['nvidia-smi', '--query-gpu=index,memory.free', '--format=csv,noheader,nounits'],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode != 0:
-            return list(range(8))  # Fallback: assume all GPUs available
-
-        available = []
-        for line in result.stdout.strip().split('\n'):
-            if not line.strip():
-                continue
-            parts = line.split(',')
-            gpu_idx = int(parts[0].strip())
-            free_mb = float(parts[1].strip())
-            free_gb = free_mb / 1024
-            if free_gb >= min_free_memory_gb:
-                available.append(gpu_idx)
-        return available if available else list(range(8))
+        if result.returncode == 0:
+            available = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split(',')
+                gpu_idx = int(parts[0].strip())
+                free_mb = float(parts[1].strip())
+                free_gb = free_mb / 1024
+                if free_gb >= min_free_memory_gb:
+                    available.append(gpu_idx)
+            if available:
+                return available
     except Exception:
-        return list(range(8))  # Fallback
+        pass
+
+    # Fallback: use torch to detect device count
+    try:
+        import torch
+        count = torch.cuda.device_count()
+        return list(range(count))
+    except Exception:
+        return list(range(8))  # Final fallback if torch is unavailable
 
 
 @dataclass
@@ -78,6 +85,7 @@ class TrainingConfig:
 
     # DDP settings
     num_gpus: Optional[int] = None  # Auto-detect if None
+    min_free_mem_gb: float = 10.0
 
 
 def _context_to_items(context_payload: dict) -> List[dict]:
@@ -491,17 +499,22 @@ class CrossBatchPipeline:
             Dictionary with all results
         """
         # Auto-detect available GPUs with sufficient free memory
-        available_gpus = _get_available_gpus(min_free_memory_gb=10.0)
+        available_gpus = _get_available_gpus(min_free_memory_gb=self.config.min_free_mem_gb)
         logger.info(f"Available GPUs with sufficient memory: {available_gpus}")
 
-        num_gpus = self.config.num_gpus
-        if num_gpus is None:
+        if self.config.num_gpus is None:
             num_gpus = len(available_gpus) if available_gpus else 1
+            self._gpu_ids = available_gpus[:num_gpus] if available_gpus else list(range(num_gpus))
         else:
-            num_gpus = min(num_gpus, len(available_gpus))
-        num_gpus = max(1, num_gpus)
+            # Respect user override: use the first N visible GPUs, bypassing the free-memory filter
+            try:
+                import torch
+                total = torch.cuda.device_count()
+            except Exception:
+                total = len(available_gpus)
+            num_gpus = max(1, min(self.config.num_gpus, total if total else self.config.num_gpus))
+            self._gpu_ids = list(range(num_gpus))
 
-        self._gpu_ids = available_gpus[:num_gpus] if available_gpus else list(range(num_gpus))
         logger.info(f"Using {num_gpus} GPU(s) for training and evaluation: {self._gpu_ids}")
 
         # Checkpoint directory
