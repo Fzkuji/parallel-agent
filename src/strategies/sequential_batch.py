@@ -60,9 +60,10 @@ def run_sequential_strategy(
 
     if use_mc_format:
         system_message = (
-            f"你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。\n\n"
-            f"背景信息:\n{background.strip()}"
+            "You are a helpful assistant. Read the question and options and reply with the single correct option letter (A, B, C, D, ...)."
         )
+        if background.strip():
+            system_message += "\n\nPassage:\n" + background.strip()
     elif use_direct_format:
         system_message = (
             textwrap.dedent(

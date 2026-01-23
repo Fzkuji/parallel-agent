@@ -123,17 +123,10 @@ def extract_option_letter(text: str) -> Tuple[str, bool]:
 def extract_answer(text: str, dataset: str = None) -> Tuple[str, bool]:
     """Extract answer from text based on dataset type.
 
-    For multiple-choice datasets (cmb_exam), extracts the first option letter.
+    For multiple-choice datasets, extracts the first option letter.
     For other datasets, looks for <answer>...</answer> tags.
-
-    Args:
-        text: Raw model output
-        dataset: Dataset name to determine extraction method
-
-    Returns:
-        Tuple of (answer, valid) where valid indicates clean extraction
     """
-    if dataset == "cmb_exam":
+    if dataset in {"cmb_exam", "mmlu"}:
         return extract_option_letter(text)
     return extract_box_answer(text)
 

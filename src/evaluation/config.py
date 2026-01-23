@@ -73,6 +73,16 @@ DATASET_METRICS: Dict[str, Dict[str, MetricFunc]] = {
     "cmb_exam": {
         "acc": compute_choice_accuracy,
     },
+    # MMLU: Multiple-choice academic exams
+    "mmlu": {
+        "strict_acc": compute_choice_accuracy,
+    },
+    # GSM8K: Math word problems (short-form numerical answer)
+    "gsm8k": {
+        "strict_acc": compute_em,
+        "f1": compute_f1,
+        "lenient_acc": compute_contains,
+    },
 }
 
 

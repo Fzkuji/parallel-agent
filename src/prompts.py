@@ -13,7 +13,7 @@ EXTRACTIVE_QA_DATASETS = {"squad", "quac", "hotpot"}
 DIRECT_ANSWER_DATASETS = {"cmb"}
 
 # Multiple-choice datasets (respond with option letter only)
-MULTIPLE_CHOICE_DATASETS = {"cmb_exam"}
+MULTIPLE_CHOICE_DATASETS = {"cmb_exam", "mmlu"}
 
 
 def build_dependency_prompt(
@@ -36,7 +36,7 @@ def build_dependency_prompt(
 
     if use_mc_format:
         system_prompt = (
-            "你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。"
+            "You are a helpful assistant. Read the question and options, then reply with the single correct option letter (A, B, C, D, ...)."
         )
     else:
         system_prompt = (
@@ -88,9 +88,9 @@ def build_single_prompt(
 
     if use_mc_format:
         system_prompt = (
-            "你是一个医学考试助手。请根据题目和选项，直接回答正确选项的字母（如A、B、C、D、E）。"
+            "You are a helpful assistant. Read the question and options, then reply with the single correct option letter (A, B, C, D, ...)."
         )
-        user_prompt = f"背景信息:\n{effective_background.strip()}\n\n问题: {question.text.strip()}"
+        user_prompt = f"Passage:\n{effective_background.strip()}\n\nQuestion: {question.text.strip()}\n\nRespond with the option letter only."
     else:
         system_prompt = (
             "You are a helpful assistant. Answer the question based on the given passage.\n"
