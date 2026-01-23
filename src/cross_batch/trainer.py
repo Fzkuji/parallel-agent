@@ -30,7 +30,7 @@ from .attention import (
 )
 from .utils import is_instruct_model, get_eos_token
 from src.prompts import build_single_prompt
-from src.inference import build_chat_prompt
+from src.templates import build_chat_prompt
 from src.models import Question
 
 logging.basicConfig(level=logging.INFO)

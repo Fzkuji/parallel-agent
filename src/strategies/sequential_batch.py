@@ -6,7 +6,8 @@ import textwrap
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.models import Question, StrategyResult
-from src.inference import USE_THINK_TOKENS, build_chat_prompt, extract_answer
+from src.templates import USE_THINK_TOKENS, build_chat_prompt
+from src.inference import extract_answer
 from src.evaluation import evaluate_predictions
 from src.prompts import (
     build_single_prompt,

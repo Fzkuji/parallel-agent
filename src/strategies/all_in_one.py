@@ -7,7 +7,7 @@ import textwrap
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.models import Question, StrategyResult
-from src.inference import USE_THINK_TOKENS
+from src.templates import USE_THINK_TOKENS
 from src.evaluation import evaluate_predictions
 from src.prompts import (
     EXTRACTIVE_DATASETS,

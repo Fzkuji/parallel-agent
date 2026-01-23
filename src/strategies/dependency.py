@@ -5,7 +5,8 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from src.models import Question, StrategyResult
-from src.inference import build_chat_prompt, extract_answer
+from src.templates import build_chat_prompt
+from src.inference import extract_answer
 from src.scheduler import DependencyScheduler
 from src.selection import apply_dependencies, select_dependency_edges
 from src.evaluation import evaluate_predictions

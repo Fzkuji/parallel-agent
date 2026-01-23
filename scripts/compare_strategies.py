@@ -135,7 +135,8 @@ def run_vllm_batch_strategy(
     """Run batch strategy using vLLM for fast inference."""
     from vllm import SamplingParams
     from src.prompts import build_single_prompt
-    from src.inference import build_chat_prompt, extract_answer
+    from src.templates import build_chat_prompt
+    from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
     from src.models import Question, StrategyResult
 
@@ -228,7 +229,8 @@ def run_vllm_sequential_strategy(
     """Run sequential strategy using vLLM (one prompt at a time for fair comparison)."""
     from vllm import SamplingParams
     from src.prompts import build_single_prompt
-    from src.inference import build_chat_prompt, extract_answer
+    from src.templates import build_chat_prompt
+    from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
     from src.models import Question, StrategyResult
 
@@ -317,7 +319,8 @@ def run_vllm_all_in_one_strategy(
     """Run all-in-one strategy using vLLM (all questions in one prompt)."""
     from vllm import SamplingParams
     from src.prompts import build_all_in_one_prompt
-    from src.inference import build_chat_prompt, extract_answer
+    from src.templates import build_chat_prompt
+    from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
     from src.models import Question, StrategyResult
 

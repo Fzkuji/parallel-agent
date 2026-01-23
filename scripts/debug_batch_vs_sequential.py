@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.inference import build_chat_prompt, set_think_tokens
+from src.templates import build_chat_prompt, set_think_tokens
 
 
 def seed_everything(seed: int) -> None:
