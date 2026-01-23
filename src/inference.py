@@ -254,8 +254,7 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
             return heuristic.generate_edges(background, questions, metadata)
         edges_data = payload.get("edges", [])
         edges: List[EdgeCandidate] = []
-        total_edges = len(edges_data)
-        for idx, item in enumerate(edges_data):
+        for item in edges_data:
             # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
             if len(item) == 1:
                 target, source = next(iter(item.items()))
@@ -266,15 +265,14 @@ class LocalLLMDependencyGenerator(DependencyGraphGenerator):
                     target = item["target"]
                 except KeyError:
                     continue
-            # Position-based confidence: first edge = 1.0, last edge = 0.5
-            confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            # All edges have confidence 1.0 - LLM decides the order directly
             # Handle case where source is a list (e.g., {"Q3": ["Q1", "Q2"]})
             if isinstance(source, list):
                 for src in source:
                     if isinstance(src, str) and isinstance(target, str):
-                        edges.append(EdgeCandidate(source=src, target=target, confidence=confidence))
+                        edges.append(EdgeCandidate(source=src, target=target, confidence=1.0))
             elif isinstance(source, str) and isinstance(target, str):
-                edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
+                edges.append(EdgeCandidate(source=source, target=target, confidence=1.0))
         return edges
 
 
@@ -496,8 +494,7 @@ class APILLMDependencyGenerator(DependencyGraphGenerator):
 
         edges_data = payload.get("edges", [])
         edges: List[EdgeCandidate] = []
-        total_edges = len(edges_data)
-        for idx, item in enumerate(edges_data):
+        for item in edges_data:
             # Compact format: {"Q3": "Q1"} means Q3 depends on Q1 (source=Q1, target=Q3)
             if len(item) == 1:
                 target, source = next(iter(item.items()))
@@ -508,14 +505,13 @@ class APILLMDependencyGenerator(DependencyGraphGenerator):
                     target = item["target"]
                 except KeyError:
                     continue
-            # Position-based confidence: first edge = 1.0, last edge = 0.5
-            confidence = 1.0 - (idx / max(total_edges, 1)) * 0.5
+            # All edges have confidence 1.0 - LLM decides the order directly
             # Handle case where source is a list (e.g., {"Q3": ["Q1", "Q2"]})
             if isinstance(source, list):
                 for src in source:
                     if isinstance(src, str) and isinstance(target, str):
-                        edges.append(EdgeCandidate(source=src, target=target, confidence=confidence))
+                        edges.append(EdgeCandidate(source=src, target=target, confidence=1.0))
             elif isinstance(source, str) and isinstance(target, str):
-                edges.append(EdgeCandidate(source=source, target=target, confidence=confidence))
+                edges.append(EdgeCandidate(source=source, target=target, confidence=1.0))
 
         return edges

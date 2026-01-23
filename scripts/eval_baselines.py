@@ -565,22 +565,21 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     dep_latency = dep_metrics.get("latency", 0.0)
 
     # Debug: print raw edges from LLM
-    print(f"  [collab_llm] LLM generated {len(edges)} edges: {[(e.source, e.target, f'{e.confidence:.2f}') for e in edges[:5]]}{'...' if len(edges) > 5 else ''}", flush=True)
+    print(f"  [collab_llm] LLM generated {len(edges)} edges: {[(e.source, e.target) for e in edges[:5]]}{'...' if len(edges) > 5 else ''}", flush=True)
 
-    # Select and apply dependencies
+    # Select and apply dependencies (preserves LLM order, only filters cycles/limits)
     selected = select_dependency_edges(
         dep_question_lookup,
         edges,
-        cost_weight=dep_args["cost_weight"],
-        min_confidence=dep_args["min_confidence"],
         max_dependencies_per_target=dep_args["max_dependencies"],
         total_cost_budget=dep_args["total_cost_budget"],
         fmt_overhead=6,
     )
     apply_dependencies(dep_question_lookup, selected)
 
-    # Debug: print selected edges and dependencies
-    print(f"  [collab_llm] Selected {len(selected)} edges after filtering", flush=True)
+    # Debug: print selected edges
+    total_selected = sum(len(v) for v in selected.values())
+    print(f"  [collab_llm] Applied {total_selected} edges (after cycle/limit filtering)", flush=True)
 
     # Build scheduler and get schedule
     scheduler = DependencyScheduler(

@@ -39,21 +39,24 @@ def select_dependency_edges(
     questions: Dict[str, Question],
     edge_candidates: Sequence[EdgeCandidate],
     *,
-    cost_weight: float = 0.01,
-    min_confidence: float = 0.35,
+    cost_weight: float = 0.01,  # Kept for API compatibility, but no longer used
+    min_confidence: float = 0.0,  # Kept for API compatibility, but no longer used
     max_dependencies_per_target: int = 3,
     total_cost_budget: Optional[int] = None,
     fmt_overhead: int = 6,
     prevent_cycles: bool = True,
 ) -> Dict[str, List[EdgeCandidate]]:
     """
-    Select dependency edges based on confidence and cost constraints.
+    Select dependency edges, preserving LLM-determined order.
+
+    The LLM decides which edges are important by their order in the output.
+    We simply filter out invalid edges (cycles, missing questions) and apply limits.
 
     Args:
         questions: Dictionary of question ID to Question object.
-        edge_candidates: List of candidate edges to select from.
-        cost_weight: Weight for cost penalty in scoring.
-        min_confidence: Minimum confidence threshold for edges.
+        edge_candidates: List of candidate edges to select from (in LLM order).
+        cost_weight: Deprecated, kept for API compatibility.
+        min_confidence: Deprecated, kept for API compatibility.
         max_dependencies_per_target: Maximum edges per target question.
         total_cost_budget: Optional global cost budget.
         fmt_overhead: Token overhead per dependency.
@@ -62,32 +65,22 @@ def select_dependency_edges(
     Returns:
         Dictionary mapping target question ID to list of selected edges.
     """
-    scored_edges: List[Tuple[float, EdgeCandidate, int]] = []
-    for edge in edge_candidates:
-        if edge.source not in questions or edge.target not in questions:
-            continue
-        if edge.source == edge.target:
-            continue
-        confidence = max(0.0, min(1.0, edge.confidence))
-        if confidence < min_confidence:
-            continue
-        cost = compute_dependency_cost(questions, edge.source, fmt_overhead=fmt_overhead)
-        score = confidence - cost_weight * cost
-        scored_edges.append((score, edge, cost))
-
-    scored_edges.sort(key=lambda item: item[0], reverse=True)
     adjacency: Dict[str, Set[str]] = defaultdict(set)
     selected: Dict[str, List[EdgeCandidate]] = defaultdict(list)
     accumulated_cost = 0
 
-    for score, edge, cost in scored_edges:
-        if score <= 0:
+    # Process edges in LLM-determined order (no sorting by confidence)
+    for edge in edge_candidates:
+        if edge.source not in questions or edge.target not in questions:
+            continue
+        if edge.source == edge.target:
             continue
         target_edges = selected[edge.target]
         if len(target_edges) >= max_dependencies_per_target:
             continue
         if prevent_cycles and _creates_cycle(adjacency, edge.source, edge.target):
             continue
+        cost = compute_dependency_cost(questions, edge.source, fmt_overhead=fmt_overhead)
         if total_cost_budget is not None and accumulated_cost + cost > total_cost_budget:
             continue
         adjacency[edge.source].add(edge.target)
