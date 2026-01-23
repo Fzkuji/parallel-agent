@@ -57,15 +57,21 @@ def _baseline_worker(
     Environment variables must be set BEFORE any CUDA imports.
     """
     # Set environment variables BEFORE any CUDA imports
+    # CRITICAL: These must be set before importing torch/vllm
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
     os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+    # Disable V1 engine (multiple ways for compatibility)
     os.environ["VLLM_USE_V1"] = "0"
+    os.environ["VLLM_USE_V1_ENGINE"] = "0"
     os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
     os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
     os.environ["TQDM_DISABLE"] = "1"
+    # Reduce memory fragmentation
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    print(f"[Worker {rank}] PID={os.getpid()}, GPU={gpu_id}, contexts={len(eval_contexts)}", flush=True)
+    print(f"[Worker {rank}] PID={os.getpid()}, CUDA_VISIBLE_DEVICES={gpu_id}, contexts={len(eval_contexts)}", flush=True)
 
     # Now import CUDA-related modules
     import torch
@@ -83,14 +89,16 @@ def _baseline_worker(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load vLLM model
+    # Load vLLM model with conservative settings
     vllm_model = LLM(
         model=model_name,
         tensor_parallel_size=1,
         trust_remote_code=True,
         dtype="half",
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.85,  # Lower to avoid OOM
         disable_log_stats=True,
+        enforce_eager=True,  # Disable CUDA graphs to reduce memory
+        max_num_seqs=256,  # Limit concurrent sequences
     )
     print(f"[Worker {rank}] Model loaded", flush=True)
 
@@ -248,8 +256,9 @@ def run_vllm_baseline(
     except RuntimeError:
         pass
 
-    # Start worker processes
+    # Start worker processes with staggered startup to avoid memory pressure
     processes = []
+    startup_delay = 5  # seconds between each worker start
     for rank in range(num_gpus):
         logger.info(f"Starting worker {rank} on GPU {rank} with {len(shards[rank])} contexts")
         p = mp.Process(
@@ -262,6 +271,9 @@ def run_vllm_baseline(
         )
         p.start()
         processes.append(p)
+        # Stagger startup to avoid all workers loading models simultaneously
+        if rank < num_gpus - 1:
+            time.sleep(startup_delay)
 
     # Wait for all workers
     timeout = 3600  # 1 hour max
