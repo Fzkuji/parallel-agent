@@ -555,9 +555,9 @@ collab_llm      |  0.826 |  0.920 |   0.957 |   3.7 |     889.6 |     43.6 |    
 | Column | Description |
 |--------|-------------|
 | Q/Ctx | Average questions per context |
-| PromptTok | Original input tokens (context + question only) |
+| PromptTok | Deduplicated input tokens (context counted once + all questions) |
 | GenTok | Generated tokens |
-| PromptTok_API | Actual API tokens (includes concatenated history for sequential/collab_llm) |
+| PromptTok_API | Actual API tokens (context repeated per call, includes history for sequential/collab_llm) |
 | GenTok_API | Actual generated tokens (includes dependency generation for collab_llm) |
 | DepTok | Dependency generation tokens (collab_llm only) |
 

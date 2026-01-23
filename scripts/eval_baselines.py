@@ -404,14 +404,38 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
     answer_records = {}
     answered_qa = []  # Store (question, answer) pairs for concatenation
     total_latency = 0
-    total_prompt_tokens = 0  # Original: context + question only
     total_prompt_tokens_api = 0  # API: context + question + previous answers
     total_generated_tokens = 0
 
-    for item in items:
-        # Build original prompt (context + question only)
-        original_prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
+    # Calculate deduplicated prompt tokens: context (once) + all questions
+    # Get context tokens (only count once)
+    context = items[0]["context"] if items else ""
+    context_prompt = f"Passage:\n{context}"
+    context_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": context_prompt},
+    ]
+    try:
+        context_full = tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        context_full = tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=True,
+        )
+    context_tokens = len(tokenizer.encode(context_full))
 
+    # Count question tokens (sum of all questions, without context)
+    total_question_tokens = 0
+    for item in items:
+        question_only = f"Question: {item['question']}"
+        total_question_tokens += len(tokenizer.encode(question_only))
+
+    # Deduplicated total: context (once) + all questions
+    total_prompt_tokens = context_tokens + total_question_tokens
+
+    for item in items:
         # Build extra context from previous answers
         extra_context = ""
         if answered_qa:
@@ -447,22 +471,6 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         # Store for next iteration
         answered_qa.append((item["question"], final_answer))
 
-        # Original tokens (context + question only)
-        original_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": original_prompt},
-        ]
-        try:
-            original_full = tokenizer.apply_chat_template(
-                original_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            original_full = tokenizer.apply_chat_template(
-                original_messages, tokenize=False, add_generation_prompt=True,
-            )
-        total_prompt_tokens += len(tokenizer.encode(original_full))
-
         # API tokens (actual tokens sent)
         total_prompt_tokens_api += len(outputs[0].prompt_token_ids)
         total_generated_tokens += len(outputs[0].outputs[0].token_ids)
@@ -472,9 +480,9 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
     return {
         "metrics": metrics,
         "latency": total_latency,
-        "prompt_tokens": total_prompt_tokens,  # Original input tokens
+        "prompt_tokens": total_prompt_tokens,  # Deduplicated: context (once) + all questions
         "generated_tokens": total_generated_tokens,
-        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (includes previous answers)
+        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (includes repeated context)
         "generated_tokens_api": total_generated_tokens,
     }
 
@@ -484,6 +492,33 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     """Run batch strategy: all questions in parallel."""
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
+
+    # Calculate deduplicated prompt tokens: context (once) + all questions
+    context = items[0]["context"] if items else ""
+    context_prompt = f"Passage:\n{context}"
+    context_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": context_prompt},
+    ]
+    try:
+        context_full = tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        context_full = tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=True,
+        )
+    context_tokens = len(tokenizer.encode(context_full))
+
+    # Count question tokens (sum of all questions, without context)
+    total_question_tokens = 0
+    for item in items:
+        question_only = f"Question: {item['question']}"
+        total_question_tokens += len(tokenizer.encode(question_only))
+
+    # Deduplicated total: context (once) + all questions
+    deduplicated_prompt_tokens = context_tokens + total_question_tokens
 
     prompts = []
     for item in items:
@@ -509,7 +544,7 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     latency = time.perf_counter() - start_time
 
     answer_records = {}
-    total_prompt_tokens = 0
+    total_prompt_tokens_api = 0
     total_generated_tokens = 0
 
     for i, item in enumerate(items):
@@ -517,7 +552,7 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
         raw_text = output.outputs[0].text
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
-        total_prompt_tokens += len(output.prompt_token_ids)
+        total_prompt_tokens_api += len(output.prompt_token_ids)
         total_generated_tokens += len(output.outputs[0].token_ids)
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
@@ -525,10 +560,10 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     return {
         "metrics": metrics,
         "latency": latency,
-        "prompt_tokens": total_prompt_tokens,  # Original input tokens
-        "generated_tokens": total_generated_tokens,  # Original generated tokens
-        "prompt_tokens_api": total_prompt_tokens,  # API tokens (same for batch)
-        "generated_tokens_api": total_generated_tokens,  # API tokens (same)
+        "prompt_tokens": deduplicated_prompt_tokens,  # Deduplicated: context (once) + all questions
+        "generated_tokens": total_generated_tokens,
+        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (context repeated N times)
+        "generated_tokens_api": total_generated_tokens,
     }
 
 
@@ -597,40 +632,48 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     # Debug: print schedule
     print(f"  [collab_llm] Schedule: {len(schedule.batches)} batches", flush=True)
 
+    # Calculate deduplicated prompt tokens: context (once) + all questions
+    context = items[0]["context"] if items else ""
+    context_prompt = f"Passage:\n{context}"
+    context_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": context_prompt},
+    ]
+    try:
+        context_full = tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        context_full = tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=True,
+        )
+    context_tokens = len(tokenizer.encode(context_full))
+
+    # Count question tokens (sum of all questions, without context)
+    total_question_tokens = 0
+    for item in items:
+        question_only = f"Question: {item['question']}"
+        total_question_tokens += len(tokenizer.encode(question_only))
+
+    # Deduplicated total: context (once) + all questions
+    deduplicated_prompt_tokens = context_tokens + total_question_tokens
+
     # Generate answers in scheduled order
     answer_records = {}
     answers_text = {}
     total_latency = 0
-    total_prompt_tokens = 0  # Original: context + question only
     total_prompt_tokens_api = 0  # API: includes extra_context (previous answers)
     total_generated_tokens = 0
 
     for batch in schedule.batches:
         batch_prompts = []
-        batch_original_prompts = []  # Prompts without extra_context
         batch_items = []
 
         for qid in batch.question_ids:
             item = next(i for i in items if i["qid"] == qid)
             batch_items.append(item)
             question = dep_question_lookup[qid]
-
-            # Original prompt (without previous answers)
-            original_prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
-            original_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": original_prompt},
-            ]
-            try:
-                original_full_prompt = tokenizer.apply_chat_template(
-                    original_messages, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
-                )
-            except TypeError:
-                original_full_prompt = tokenizer.apply_chat_template(
-                    original_messages, tokenize=False, add_generation_prompt=True,
-                )
-            batch_original_prompts.append(original_full_prompt)
 
             # Include previous answers if there are dependencies (for actual API call)
             deps = sorted(question.dependencies)
@@ -673,10 +716,6 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
             answer_records[item["qid"]] = (final_answer, strict_valid)
             answers_text[item["qid"]] = final_answer
 
-            # Original tokens (context + question only)
-            original_tokens = len(tokenizer.encode(batch_original_prompts[i]))
-            total_prompt_tokens += original_tokens
-
             # API tokens (actual tokens sent, includes extra_context)
             total_prompt_tokens_api += len(output.prompt_token_ids)
             total_generated_tokens += len(output.outputs[0].token_ids)
@@ -686,8 +725,8 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     return {
         "metrics": metrics,
         "latency": total_latency + dep_latency,  # Include dependency generation latency
-        "prompt_tokens": total_prompt_tokens,  # Original input tokens
-        "generated_tokens": total_generated_tokens,  # Generated tokens
+        "prompt_tokens": deduplicated_prompt_tokens,  # Deduplicated: context (once) + all questions
+        "generated_tokens": total_generated_tokens,
         "prompt_tokens_api": total_prompt_tokens_api + dep_prompt_tokens,  # Include dep generation cost
         "generated_tokens_api": total_generated_tokens + dep_generated_tokens,  # Include dep generation cost
         # Separate tracking for dependency generation cost
