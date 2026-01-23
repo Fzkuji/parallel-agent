@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 
 # Prompt format with <answer> tags for answer extraction
 SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
-Give a short, direct answer in <answer></answer> tags. Do not explain or elaborate."""
+You MUST wrap your answer in <answer></answer> tags. Be concise.
+
+Example:
+Question: What color is the sky?
+<answer>blue</answer>"""
 
 
 def _context_to_items(context_payload: dict) -> List[dict]:

@@ -41,7 +41,8 @@ def build_dependency_prompt(
     else:
         system_prompt = (
             "You are a helpful assistant. Answer the question based on the given passage.\n"
-            "Give a short, direct answer in <answer></answer> tags. Do not explain or elaborate."
+            "You MUST wrap your answer in <answer></answer> tags. Be concise.\n\n"
+            "Example:\nQuestion: What color is the sky?\n<answer>blue</answer>"
         )
 
     user_lines: List[str] = []
@@ -93,7 +94,8 @@ def build_single_prompt(
     else:
         system_prompt = (
             "You are a helpful assistant. Answer the question based on the given passage.\n"
-            "Give a short, direct answer in <answer></answer> tags. Do not explain or elaborate."
+            "You MUST wrap your answer in <answer></answer> tags. Be concise.\n\n"
+            "Example:\nQuestion: What color is the sky?\n<answer>blue</answer>"
         )
         user_prompt = f"Passage:\n{effective_background.strip()}\n\nQuestion: {question.text.strip()}"
 
