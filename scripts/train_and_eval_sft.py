@@ -84,6 +84,7 @@ def parse_args():
 
     # Other
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--force", action="store_true", help="Force re-evaluation even if cached results exist")
 
     return parser.parse_args()
 
@@ -685,62 +686,14 @@ def _eval_worker(
             total_latency = 0
             total_prompt_tokens_api = 0
             total_generated_tokens = 0
+            deduplicated_prompt_tokens = 0
 
             # Build conversation history
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-            # Calculate deduplicated prompt tokens (context once + all questions with template overhead)
-            first_user = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
-            first_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": first_user},
-            ]
-            try:
-                first_full = tokenizer.apply_chat_template(
-                    first_messages, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
-                )
-            except TypeError:
-                first_full = tokenizer.apply_chat_template(
-                    first_messages, tokenize=False, add_generation_prompt=True,
-                )
-            first_turn_tokens = len(tokenizer.encode(first_full))
-
-            # For subsequent turns, measure incremental token cost with template overhead
-            additional_turn_tokens = 0
-            for item in items[1:]:
-                question_content = f"Question: {item['question']}"
-                # Measure incremental cost by comparing two-turn vs one-turn template
-                two_turn_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": "dummy"},
-                    {"role": "assistant", "content": "dummy"},
-                    {"role": "user", "content": question_content},
-                ]
-                one_turn_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": "dummy"},
-                    {"role": "assistant", "content": "dummy"},
-                ]
-                try:
-                    two_turn_full = tokenizer.apply_chat_template(
-                        two_turn_messages, tokenize=False, add_generation_prompt=True,
-                        enable_thinking=enable_thinking,
-                    )
-                    one_turn_full = tokenizer.apply_chat_template(
-                        one_turn_messages, tokenize=False, add_generation_prompt=True,
-                        enable_thinking=enable_thinking,
-                    )
-                except TypeError:
-                    two_turn_full = tokenizer.apply_chat_template(
-                        two_turn_messages, tokenize=False, add_generation_prompt=True,
-                    )
-                    one_turn_full = tokenizer.apply_chat_template(
-                        one_turn_messages, tokenize=False, add_generation_prompt=True,
-                    )
-                additional_turn_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
-
-            total_prompt_tokens = first_turn_tokens + additional_turn_tokens
+            # Track previous turn's tokens for incremental calculation
+            prev_prompt_tokens = 0
+            prev_generated_tokens = 0
 
             for i, item in enumerate(items):
                 if i == 0:
@@ -773,10 +726,26 @@ def _eval_worker(
                     )
                 total_latency += time.perf_counter() - start_time
 
-                input_len = inputs["input_ids"].shape[1]
-                generated = outputs[0][input_len:]
-                total_generated_tokens += generated.shape[0]
-                total_prompt_tokens_api += input_len
+                # Get actual tokens from model output
+                current_prompt_tokens = inputs["input_ids"].shape[1]
+                generated = outputs[0][current_prompt_tokens:]
+                generated_tokens = generated.shape[0]
+
+                total_generated_tokens += generated_tokens
+                total_prompt_tokens_api += current_prompt_tokens
+
+                # Calculate deduplicated prompt tokens:
+                # First turn: full prompt tokens
+                # Subsequent turns: incremental tokens (current - previous - previous_generated)
+                if i == 0:
+                    deduplicated_prompt_tokens += current_prompt_tokens
+                else:
+                    incremental_tokens = current_prompt_tokens - prev_prompt_tokens - prev_generated_tokens
+                    deduplicated_prompt_tokens += incremental_tokens
+
+                # Save for next iteration
+                prev_prompt_tokens = current_prompt_tokens
+                prev_generated_tokens = generated_tokens
 
                 raw_text = tokenizer.decode(generated, skip_special_tokens=True)
                 final_answer, strict_valid = extract_answer(raw_text, dataset)
@@ -791,7 +760,7 @@ def _eval_worker(
                 "title": title,
                 "metrics": metrics,
                 "latency": total_latency,
-                "prompt_tokens": total_prompt_tokens,
+                "prompt_tokens": deduplicated_prompt_tokens,
                 "generated_tokens": total_generated_tokens,
                 "prompt_tokens_api": total_prompt_tokens_api,
                 "generated_tokens_api": total_generated_tokens,
@@ -799,58 +768,7 @@ def _eval_worker(
             })
         else:
             # Batch inference (default)
-            # Calculate deduplicated prompt tokens (context once + all questions with template overhead)
-            first_prompt = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
-            first_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": first_prompt},
-            ]
-            try:
-                first_full = tokenizer.apply_chat_template(
-                    first_messages, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
-                )
-            except TypeError:
-                first_full = tokenizer.apply_chat_template(
-                    first_messages, tokenize=False, add_generation_prompt=True,
-                )
-            first_question_tokens = len(tokenizer.encode(first_full))
-
-            # For additional questions, measure incremental cost with template overhead
-            additional_question_tokens = 0
-            for item in items[1:]:
-                question_content = f"Question: {item['question']}"
-                two_turn_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": "dummy"},
-                    {"role": "assistant", "content": "dummy"},
-                    {"role": "user", "content": question_content},
-                ]
-                one_turn_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": "dummy"},
-                    {"role": "assistant", "content": "dummy"},
-                ]
-                try:
-                    two_turn_full = tokenizer.apply_chat_template(
-                        two_turn_messages, tokenize=False, add_generation_prompt=True,
-                        enable_thinking=enable_thinking,
-                    )
-                    one_turn_full = tokenizer.apply_chat_template(
-                        one_turn_messages, tokenize=False, add_generation_prompt=True,
-                        enable_thinking=enable_thinking,
-                    )
-                except TypeError:
-                    two_turn_full = tokenizer.apply_chat_template(
-                        two_turn_messages, tokenize=False, add_generation_prompt=True,
-                    )
-                    one_turn_full = tokenizer.apply_chat_template(
-                        one_turn_messages, tokenize=False, add_generation_prompt=True,
-                    )
-                additional_question_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
-
-            deduplicated_prompt_tokens = first_question_tokens + additional_question_tokens
-
+            # Build prompts for all questions
             prompts = []
             for item in items:
                 prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
@@ -885,19 +803,31 @@ def _eval_worker(
                 )
             latency = time.perf_counter() - start_time
 
+            # Calculate context tokens for deduplication
+            context_tokens = len(tokenizer.encode(context))
+
             # Decode and extract answers
             answer_records = {}
             total_prompt_tokens_api = 0
             total_generated_tokens = 0
+            deduplicated_prompt_tokens = 0
 
             for i, item in enumerate(items):
                 # Count non-padding tokens for API cost
                 attention_mask = inputs["attention_mask"][i]
-                input_len = attention_mask.sum().item()
-                total_prompt_tokens_api += input_len
+                prompt_tokens = attention_mask.sum().item()
+                total_prompt_tokens_api += prompt_tokens
 
                 generated = outputs[i][inputs["input_ids"][i].shape[0]:]
                 total_generated_tokens += generated.shape[0]
+
+                # Calculate deduplicated prompt tokens:
+                # First question: full prompt tokens
+                # Subsequent questions: prompt tokens - context tokens (context counted only once)
+                if i == 0:
+                    deduplicated_prompt_tokens += prompt_tokens
+                else:
+                    deduplicated_prompt_tokens += prompt_tokens - context_tokens
 
                 raw_text = tokenizer.decode(generated, skip_special_tokens=True)
                 final_answer, strict_valid = extract_answer(raw_text, dataset)
@@ -1033,6 +963,61 @@ def run_parallel_eval(
     }
 
 
+def _get_eval_cache_key(args, strategy_name: str, lora_checkpoint_path: Optional[str] = None) -> str:
+    """Generate a cache key for evaluation results."""
+    key_parts = [
+        args.model.replace("/", "_"),
+        args.dataset,
+        f"n{args.eval_samples}",
+        f"q{args.min_questions}-{args.max_questions}",
+        f"tok{args.max_new_tokens}",
+        f"fmt_{args.train_format}",
+        strategy_name,
+    ]
+    # Include checkpoint path hash for SFT-LoRA
+    if lora_checkpoint_path:
+        import hashlib
+        path_hash = hashlib.md5(lora_checkpoint_path.encode()).hexdigest()[:8]
+        key_parts.append(f"ckpt_{path_hash}")
+    return "_".join(key_parts)
+
+
+def _load_eval_cache(cache_dir: Path, cache_key: str) -> Optional[Dict[str, Any]]:
+    """Load cached evaluation results if available."""
+    cache_file = cache_dir / f"eval_cache_{cache_key}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                data = json.load(f)
+            logger.info(f"Loaded cached results from {cache_file}")
+            return data
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Failed to load cache: {e}")
+    return None
+
+
+def _save_eval_cache(cache_dir: Path, cache_key: str, results: Dict[str, Any], args) -> None:
+    """Save evaluation results to cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"eval_cache_{cache_key}.json"
+
+    data_with_meta = {
+        "config": {
+            "model": args.model,
+            "dataset": args.dataset,
+            "eval_samples": args.eval_samples,
+            "min_questions": args.min_questions,
+            "max_questions": args.max_questions,
+            "max_new_tokens": args.max_new_tokens,
+            "train_format": args.train_format,
+        },
+        **results,
+    }
+    with open(cache_file, 'w') as f:
+        json.dump(data_with_meta, f, indent=2)
+    logger.info(f"Saved results to {cache_file}")
+
+
 def main():
     import torch
 
@@ -1094,23 +1079,34 @@ def main():
         logger.info("STEP 1: Evaluating Baseline (no LoRA)")
         logger.info("=" * 60)
 
-        baseline_results = run_parallel_eval(
-            model_name=args.model,
-            eval_contexts=eval_contexts,
-            output_dir=str(output_dir),
-            max_new_tokens=args.max_new_tokens,
-            dataset=args.dataset,
-            enable_thinking=args.enable_thinking,
-            lora_checkpoint_path=None,
-            strategy_name="baseline",
-            num_gpus=num_gpus,
-            gpu_ids=gpu_ids,
-            eval_format=args.train_format,  # Use same format as training
-        )
+        # Check cache first
+        baseline_cache_key = _get_eval_cache_key(args, "baseline", None)
+        baseline_results = None
+
+        if not args.force:
+            baseline_results = _load_eval_cache(output_dir, baseline_cache_key)
+
+        if baseline_results is None:
+            baseline_results = run_parallel_eval(
+                model_name=args.model,
+                eval_contexts=eval_contexts,
+                output_dir=str(output_dir),
+                max_new_tokens=args.max_new_tokens,
+                dataset=args.dataset,
+                enable_thinking=args.enable_thinking,
+                lora_checkpoint_path=None,
+                strategy_name="baseline",
+                num_gpus=num_gpus,
+                gpu_ids=gpu_ids,
+                eval_format=args.train_format,  # Use same format as training
+            )
+            # Save to cache
+            if baseline_results:
+                _save_eval_cache(output_dir, baseline_cache_key, baseline_results, args)
 
         if baseline_results:
-            all_results["baseline"] = baseline_results["aggregate_metrics"]
-            m = baseline_results['aggregate_metrics']
+            all_results["baseline"] = baseline_results.get("aggregate_metrics", baseline_results)
+            m = all_results["baseline"]
             logger.info(f"\nBaseline Results:")
             logger.info(f"  EM:             {m['strict_acc']:.4f}")
             logger.info(f"  F1:             {m['f1']:.4f}")
@@ -1172,23 +1168,34 @@ def main():
     logger.info("STEP 3: Evaluating SFT-LoRA")
     logger.info("=" * 60)
 
-    sft_results = run_parallel_eval(
-        model_name=args.model,
-        eval_contexts=eval_contexts,
-        output_dir=str(output_dir),
-        max_new_tokens=args.max_new_tokens,
-        dataset=args.dataset,
-        enable_thinking=args.enable_thinking,
-        lora_checkpoint_path=lora_checkpoint_path,
-        strategy_name="sft_lora",
-        num_gpus=num_gpus,
-        gpu_ids=gpu_ids,
-        eval_format=args.train_format,  # Use same format as training
-    )
+    # Check cache first
+    sft_cache_key = _get_eval_cache_key(args, "sft_lora", lora_checkpoint_path)
+    sft_results = None
+
+    if not args.force:
+        sft_results = _load_eval_cache(output_dir, sft_cache_key)
+
+    if sft_results is None:
+        sft_results = run_parallel_eval(
+            model_name=args.model,
+            eval_contexts=eval_contexts,
+            output_dir=str(output_dir),
+            max_new_tokens=args.max_new_tokens,
+            dataset=args.dataset,
+            enable_thinking=args.enable_thinking,
+            lora_checkpoint_path=lora_checkpoint_path,
+            strategy_name="sft_lora",
+            num_gpus=num_gpus,
+            gpu_ids=gpu_ids,
+            eval_format=args.train_format,  # Use same format as training
+        )
+        # Save to cache
+        if sft_results:
+            _save_eval_cache(output_dir, sft_cache_key, sft_results, args)
 
     if sft_results:
-        all_results["sft_lora"] = sft_results["aggregate_metrics"]
-        m = sft_results['aggregate_metrics']
+        all_results["sft_lora"] = sft_results.get("aggregate_metrics", sft_results)
+        m = all_results["sft_lora"]
         logger.info(f"\nSFT-LoRA Results:")
         logger.info(f"  EM:             {m['strict_acc']:.4f}")
         logger.info(f"  F1:             {m['f1']:.4f}")

@@ -413,6 +413,7 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
     total_latency = 0
     total_prompt_tokens_api = 0
     total_generated_tokens = 0
+    deduplicated_prompt_tokens = 0
 
     # Build conversation history as multi-turn messages
     context = items[0]["context"] if items else ""
@@ -422,67 +423,8 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
 
-    # Calculate deduplicated prompt tokens for reporting
-    # For sequential multi-turn: context (once) + all questions + chat template overhead per turn
-    # We measure the incremental cost of each turn (user message + template overhead)
-    # without counting the assistant responses (which are generated, not input)
-
-    # Turn 1: system + user(context + Q1) + generation_prompt
-    first_user = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
-    first_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": first_user},
-    ]
-    try:
-        first_full = tokenizer.apply_chat_template(
-            first_messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
-    except TypeError:
-        first_full = tokenizer.apply_chat_template(
-            first_messages, tokenize=False, add_generation_prompt=True,
-        )
-    first_turn_tokens = len(tokenizer.encode(first_full))
-
-    # For subsequent turns, measure the incremental token cost
-    # = new user message + its chat template markers (not the history)
-    # We do this by comparing: [sys, user, assistant, user2] vs [sys, user, assistant]
-    # The difference gives us the cost of adding user2 with its template markers
-    additional_turn_tokens = 0
-    for item in items[1:]:
-        question_content = f"Question: {item['question']}"
-        # Build a two-turn conversation to measure the incremental cost
-        two_turn_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "dummy"},  # First user message
-            {"role": "assistant", "content": "dummy"},  # First assistant response
-            {"role": "user", "content": question_content},  # Second user message (what we want to measure)
-        ]
-        one_turn_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "dummy"},
-            {"role": "assistant", "content": "dummy"},
-        ]
-        try:
-            two_turn_full = tokenizer.apply_chat_template(
-                two_turn_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-            one_turn_full = tokenizer.apply_chat_template(
-                one_turn_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            two_turn_full = tokenizer.apply_chat_template(
-                two_turn_messages, tokenize=False, add_generation_prompt=True,
-            )
-            one_turn_full = tokenizer.apply_chat_template(
-                one_turn_messages, tokenize=False, add_generation_prompt=True,
-            )
-        # Incremental cost = tokens added by the second user message + its template
-        additional_turn_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
-
-    total_prompt_tokens = first_turn_tokens + additional_turn_tokens
+    # Track the previous turn's prompt tokens to calculate incremental cost
+    prev_prompt_tokens = 0
 
     for i, item in enumerate(items):
         if i == 0:
@@ -512,19 +454,39 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
 
+        # Get actual prompt tokens from vLLM output
+        current_prompt_tokens = len(outputs[0].prompt_token_ids)
+        generated_tokens = len(outputs[0].outputs[0].token_ids)
+
+        # API tokens (actual tokens sent for this turn)
+        total_prompt_tokens_api += current_prompt_tokens
+        total_generated_tokens += generated_tokens
+
+        # Calculate deduplicated prompt tokens:
+        # First turn: full prompt tokens
+        # Subsequent turns: incremental tokens (current - previous - previous_generated)
+        # This gives us: new question + template overhead (without counting repeated history)
+        if i == 0:
+            deduplicated_prompt_tokens += current_prompt_tokens
+        else:
+            # Incremental cost = current prompt - (previous prompt + previous generated)
+            # This is the cost of adding the new question to the conversation
+            incremental_tokens = current_prompt_tokens - prev_prompt_tokens - prev_generated_tokens
+            deduplicated_prompt_tokens += incremental_tokens
+
+        # Save for next iteration
+        prev_prompt_tokens = current_prompt_tokens
+        prev_generated_tokens = generated_tokens
+
         # Add assistant response to history for next turn
         messages.append({"role": "assistant", "content": raw_text})
-
-        # API tokens (actual tokens sent)
-        total_prompt_tokens_api += len(outputs[0].prompt_token_ids)
-        total_generated_tokens += len(outputs[0].outputs[0].token_ids)
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
     return {
         "metrics": metrics,
         "latency": total_latency,
-        "prompt_tokens": total_prompt_tokens,  # Deduplicated: context (once) + all questions
+        "prompt_tokens": deduplicated_prompt_tokens,  # Deduplicated: context (once) + all questions
         "generated_tokens": total_generated_tokens,
         "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (grows with conversation history)
         "generated_tokens_api": total_generated_tokens,
@@ -537,67 +499,9 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
-    # Calculate deduplicated prompt tokens: context (once) + all questions + chat template overhead
-    # For batch: each question is independent, but we report deduplicated tokens
-    # = first question (full prompt with context) + incremental cost for each additional question
-    # This makes it comparable with sequential strategy
     context = items[0]["context"] if items else ""
 
-    # First question: full prompt with context
-    first_prompt = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
-    first_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": first_prompt},
-    ]
-    try:
-        first_full = tokenizer.apply_chat_template(
-            first_messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
-    except TypeError:
-        first_full = tokenizer.apply_chat_template(
-            first_messages, tokenize=False, add_generation_prompt=True,
-        )
-    first_question_tokens = len(tokenizer.encode(first_full))
-
-    # For additional questions, measure the incremental cost of just the question
-    # (without context, which is counted once)
-    # We use the same method as sequential: measure template overhead per question
-    additional_question_tokens = 0
-    for item in items[1:]:
-        question_content = f"Question: {item['question']}"
-        # Build a two-turn conversation to measure the incremental cost
-        two_turn_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "dummy"},
-            {"role": "assistant", "content": "dummy"},
-            {"role": "user", "content": question_content},
-        ]
-        one_turn_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "dummy"},
-            {"role": "assistant", "content": "dummy"},
-        ]
-        try:
-            two_turn_full = tokenizer.apply_chat_template(
-                two_turn_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-            one_turn_full = tokenizer.apply_chat_template(
-                one_turn_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            two_turn_full = tokenizer.apply_chat_template(
-                two_turn_messages, tokenize=False, add_generation_prompt=True,
-            )
-            one_turn_full = tokenizer.apply_chat_template(
-                one_turn_messages, tokenize=False, add_generation_prompt=True,
-            )
-        additional_question_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
-
-    deduplicated_prompt_tokens = first_question_tokens + additional_question_tokens
-
+    # Build prompts for all questions
     prompts = []
     for item in items:
         prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
@@ -621,17 +525,33 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     outputs = vllm_model.generate(prompts, sampling_params, use_tqdm=False)
     latency = time.perf_counter() - start_time
 
+    # Calculate context tokens from actual vLLM tokenization
+    # We measure what vLLM would count for the context portion
+    context_tokens = len(tokenizer.encode(context))
+
     answer_records = {}
     total_prompt_tokens_api = 0
     total_generated_tokens = 0
+    deduplicated_prompt_tokens = 0
 
     for i, item in enumerate(items):
         output = outputs[i]
         raw_text = output.outputs[0].text
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
-        total_prompt_tokens_api += len(output.prompt_token_ids)
+
+        # Get actual prompt tokens from vLLM output
+        prompt_tokens = len(output.prompt_token_ids)
+        total_prompt_tokens_api += prompt_tokens
         total_generated_tokens += len(output.outputs[0].token_ids)
+
+        # Calculate deduplicated prompt tokens:
+        # First question: full prompt tokens
+        # Subsequent questions: prompt tokens - context tokens (context counted only once)
+        if i == 0:
+            deduplicated_prompt_tokens += prompt_tokens
+        else:
+            deduplicated_prompt_tokens += prompt_tokens - context_tokens
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
@@ -710,64 +630,7 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     # Debug: print schedule
     print(f"  [collab_llm] Schedule: {len(schedule.batches)} batches", flush=True)
 
-    # Calculate deduplicated prompt tokens: context (once) + all questions + chat template overhead
-    # Same method as sequential: measure incremental cost per turn
     context = items[0]["context"] if items else ""
-
-    # First question includes context
-    first_item = items[0] if items else None
-    first_user = f"Passage:\n{context}\n\nQuestion: {first_item['question']}" if first_item else ""
-    first_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": first_user},
-    ]
-    try:
-        first_full = tokenizer.apply_chat_template(
-            first_messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
-    except TypeError:
-        first_full = tokenizer.apply_chat_template(
-            first_messages, tokenize=False, add_generation_prompt=True,
-        )
-    first_turn_tokens = len(tokenizer.encode(first_full))
-
-    # Additional question tokens with chat template overhead
-    additional_turn_tokens = 0
-    for item in items[1:]:
-        question_content = f"Question: {item['question']}"
-        # Build a two-turn conversation to measure the incremental cost
-        two_turn_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "dummy"},
-            {"role": "assistant", "content": "dummy"},
-            {"role": "user", "content": question_content},
-        ]
-        one_turn_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "dummy"},
-            {"role": "assistant", "content": "dummy"},
-        ]
-        try:
-            two_turn_full = tokenizer.apply_chat_template(
-                two_turn_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-            one_turn_full = tokenizer.apply_chat_template(
-                one_turn_messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            two_turn_full = tokenizer.apply_chat_template(
-                two_turn_messages, tokenize=False, add_generation_prompt=True,
-            )
-            one_turn_full = tokenizer.apply_chat_template(
-                one_turn_messages, tokenize=False, add_generation_prompt=True,
-            )
-        additional_turn_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
-
-    # Deduplicated total: first turn (with context) + additional questions with template overhead
-    deduplicated_prompt_tokens = first_turn_tokens + additional_turn_tokens
 
     # Generate answers in scheduled order using multi-turn conversation
     # Each question in the schedule order becomes a turn in the conversation
@@ -776,10 +639,15 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     total_latency = 0
     total_prompt_tokens_api = 0
     total_generated_tokens = 0
+    deduplicated_prompt_tokens = 0
 
     # Build conversation history
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     is_first_question = True
+
+    # Track the previous turn's tokens to calculate incremental cost
+    prev_prompt_tokens = 0
+    prev_generated_tokens = 0
 
     # Flatten batches to get execution order
     execution_order = []
@@ -833,12 +701,31 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
         answer_records[item["qid"]] = (final_answer, strict_valid)
         answers_text[item["qid"]] = final_answer
 
-        # Add assistant response to history
-        messages.append({"role": "assistant", "content": raw_text})
+        # Get actual prompt tokens from vLLM output
+        current_prompt_tokens = len(output.prompt_token_ids)
+        generated_tokens = len(output.outputs[0].token_ids)
 
         # API tokens (actual tokens sent)
-        total_prompt_tokens_api += len(output.prompt_token_ids)
-        total_generated_tokens += len(output.outputs[0].token_ids)
+        total_prompt_tokens_api += current_prompt_tokens
+        total_generated_tokens += generated_tokens
+
+        # Calculate deduplicated prompt tokens:
+        # First turn: full prompt tokens
+        # Subsequent turns: incremental tokens (current - previous - previous_generated)
+        if prev_prompt_tokens == 0:
+            # First turn
+            deduplicated_prompt_tokens += current_prompt_tokens
+        else:
+            # Incremental cost = current prompt - (previous prompt + previous generated)
+            incremental_tokens = current_prompt_tokens - prev_prompt_tokens - prev_generated_tokens
+            deduplicated_prompt_tokens += incremental_tokens
+
+        # Save for next iteration
+        prev_prompt_tokens = current_prompt_tokens
+        prev_generated_tokens = generated_tokens
+
+        # Add assistant response to history
+        messages.append({"role": "assistant", "content": raw_text})
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
@@ -985,6 +872,62 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
     return aggregated
 
 
+def _get_cache_key(args) -> str:
+    """Generate a cache key based on evaluation parameters."""
+    # Include parameters that affect results
+    key_parts = [
+        args.model.replace("/", "_"),
+        args.dataset,
+        f"n{args.eval_samples}",
+        f"q{args.min_questions}-{args.max_questions}",
+        f"tok{args.max_new_tokens}",
+    ]
+    return "_".join(key_parts)
+
+
+def _load_cached_results(cache_dir: Path, cache_key: str, strategies: List[str]) -> Dict[str, Any]:
+    """Load cached results for strategies that have been evaluated before.
+
+    Returns:
+        Dictionary mapping strategy name to cached results (or empty dict if not cached)
+    """
+    cached = {}
+    for strategy in strategies:
+        cache_file = cache_dir / f"cache_{cache_key}_{strategy}.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+                cached[strategy] = data
+                logger.info(f"  Loaded cached results for {strategy}")
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"  Failed to load cache for {strategy}: {e}")
+    return cached
+
+
+def _save_cached_results(cache_dir: Path, cache_key: str, results: Dict[str, Any], args) -> None:
+    """Save results to cache files (one per strategy)."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for strategy, data in results.items():
+        cache_file = cache_dir / f"cache_{cache_key}_{strategy}.json"
+        # Add metadata to cached results
+        data_with_meta = {
+            "config": {
+                "model": args.model,
+                "dataset": args.dataset,
+                "eval_samples": args.eval_samples,
+                "min_questions": args.min_questions,
+                "max_questions": args.max_questions,
+                "max_new_tokens": args.max_new_tokens,
+            },
+            **data,
+        }
+        with open(cache_file, 'w') as f:
+            json.dump(data_with_meta, f, indent=2)
+        logger.info(f"  Saved cache for {strategy} to {cache_file}")
+
+
 def main():
     args = parse_args()
 
@@ -1000,14 +943,29 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check cache
-    cache_path = output_dir / f"baseline_results_{args.dataset}.json"
-    if cache_path.exists() and args.cache and not args.force:
-        logger.info(f"Loading cached results from {cache_path}")
-        with open(cache_path, 'r') as f:
-            all_results = json.load(f)
-        _print_summary(all_results, strategies)
-        return
+    # Generate cache key and check for cached results
+    cache_key = _get_cache_key(args)
+    logger.info(f"Cache key: {cache_key}")
+
+    # Load cached results (unless --force)
+    cached_results = {}
+    strategies_to_run = strategies.copy()
+
+    if not args.force:
+        logger.info("Checking for cached results...")
+        cached_results = _load_cached_results(output_dir, cache_key, strategies)
+        strategies_to_run = [s for s in strategies if s not in cached_results]
+
+        if cached_results:
+            logger.info(f"Found cached results for: {list(cached_results.keys())}")
+        if strategies_to_run:
+            logger.info(f"Will evaluate: {strategies_to_run}")
+        else:
+            logger.info("All strategies already cached, using cached results")
+            _print_summary(cached_results, strategies, dataset=args.dataset)
+            return
+    else:
+        logger.info("--force specified, ignoring cache")
 
     # Load evaluation data
     logger.info(f"Loading evaluation data: {args.eval_samples} samples from {args.dataset}")
@@ -1053,8 +1011,8 @@ def main():
         "total_cost_budget": args.total_cost_budget,
     }
 
-    # Start workers
-    logger.info(f"Starting {num_gpus} workers...")
+    # Start workers (only for strategies that need to be run)
+    logger.info(f"Starting {num_gpus} workers for strategies: {strategies_to_run}...")
     processes = []
     for rank in range(num_gpus):
         gpu_id = gpu_ids[rank]
@@ -1062,7 +1020,7 @@ def main():
             target=_eval_worker,
             args=(
                 rank, num_gpus, gpu_id, args.model,
-                shards[rank], strategies, str(output_dir),
+                shards[rank], strategies_to_run, str(output_dir),
                 args.max_new_tokens, args.dataset, args.enable_thinking,
                 dep_args,
             )
@@ -1084,17 +1042,19 @@ def main():
 
     logger.info("All workers finished, gathering results...")
 
-    # Aggregate results
-    all_results = aggregate_results(output_dir, num_gpus, strategies)
+    # Aggregate results for newly evaluated strategies
+    new_results = aggregate_results(output_dir, num_gpus, strategies_to_run)
+
+    # Save new results to cache
+    if new_results:
+        logger.info("Saving results to cache...")
+        _save_cached_results(output_dir, cache_key, new_results, args)
+
+    # Merge cached and new results
+    all_results = {**cached_results, **new_results}
 
     if not all_results:
         raise RuntimeError("No results collected. Check worker logs.")
-
-    # Save results
-    if args.cache:
-        with open(cache_path, 'w') as f:
-            json.dump(all_results, f, indent=2)
-        logger.info(f"Saved results to {cache_path}")
 
     # Print summary
     _print_summary(all_results, strategies, dataset=args.dataset)
