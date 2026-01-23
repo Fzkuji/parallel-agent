@@ -269,6 +269,8 @@ def _eval_worker(
                 "latency": result["latency"],
                 "prompt_tokens": result["prompt_tokens"],
                 "generated_tokens": result["generated_tokens"],
+                "prompt_tokens_api": result.get("prompt_tokens_api", result["prompt_tokens"]),
+                "generated_tokens_api": result.get("generated_tokens_api", result["generated_tokens"]),
                 "num_questions": len(items),
             })
 
@@ -376,11 +378,16 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
+    prompt_tokens = len(outputs[0].prompt_token_ids)
+    generated_tokens = len(outputs[0].outputs[0].token_ids)
+
     return {
         "metrics": metrics,
         "latency": latency,
-        "prompt_tokens": len(outputs[0].prompt_token_ids),
-        "generated_tokens": len(outputs[0].outputs[0].token_ids),
+        "prompt_tokens": prompt_tokens,  # Original input tokens
+        "generated_tokens": generated_tokens,  # Original generated tokens
+        "prompt_tokens_api": prompt_tokens,  # API tokens (same for all_in_one)
+        "generated_tokens_api": generated_tokens,  # API tokens (same)
     }
 
 
@@ -428,8 +435,10 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
     return {
         "metrics": metrics,
         "latency": total_latency,
-        "prompt_tokens": total_prompt_tokens,
-        "generated_tokens": total_generated_tokens,
+        "prompt_tokens": total_prompt_tokens,  # Original input tokens
+        "generated_tokens": total_generated_tokens,  # Original generated tokens
+        "prompt_tokens_api": total_prompt_tokens,  # API tokens (same for sequential)
+        "generated_tokens_api": total_generated_tokens,  # API tokens (same)
     }
 
 
@@ -479,8 +488,10 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     return {
         "metrics": metrics,
         "latency": latency,
-        "prompt_tokens": total_prompt_tokens,
-        "generated_tokens": total_generated_tokens,
+        "prompt_tokens": total_prompt_tokens,  # Original input tokens
+        "generated_tokens": total_generated_tokens,  # Original generated tokens
+        "prompt_tokens_api": total_prompt_tokens,  # API tokens (same for batch)
+        "generated_tokens_api": total_generated_tokens,  # API tokens (same)
     }
 
 
@@ -540,11 +551,13 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     answer_records = {}
     answers_text = {}
     total_latency = 0
-    total_prompt_tokens = 0
+    total_prompt_tokens = 0  # Original: context + question only
+    total_prompt_tokens_api = 0  # API: includes extra_context (previous answers)
     total_generated_tokens = 0
 
     for batch in schedule.batches:
         batch_prompts = []
+        batch_original_prompts = []  # Prompts without extra_context
         batch_items = []
 
         for qid in batch.question_ids:
@@ -552,7 +565,24 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
             batch_items.append(item)
             question = dep_question_lookup[qid]
 
-            # Include previous answers if there are dependencies
+            # Original prompt (without previous answers)
+            original_prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
+            original_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": original_prompt},
+            ]
+            try:
+                original_full_prompt = tokenizer.apply_chat_template(
+                    original_messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                original_full_prompt = tokenizer.apply_chat_template(
+                    original_messages, tokenize=False, add_generation_prompt=True,
+                )
+            batch_original_prompts.append(original_full_prompt)
+
+            # Include previous answers if there are dependencies (for actual API call)
             deps = sorted(question.dependencies)
             extra_context = ""
             if deps and answers_text:
@@ -592,7 +622,13 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
             final_answer, strict_valid = extract_answer(raw_text, dataset)
             answer_records[item["qid"]] = (final_answer, strict_valid)
             answers_text[item["qid"]] = final_answer
-            total_prompt_tokens += len(output.prompt_token_ids)
+
+            # Original tokens (context + question only)
+            original_tokens = len(tokenizer.encode(batch_original_prompts[i]))
+            total_prompt_tokens += original_tokens
+
+            # API tokens (actual tokens sent, includes extra_context)
+            total_prompt_tokens_api += len(output.prompt_token_ids)
             total_generated_tokens += len(output.outputs[0].token_ids)
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
@@ -600,8 +636,10 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     return {
         "metrics": metrics,
         "latency": total_latency,
-        "prompt_tokens": total_prompt_tokens,
-        "generated_tokens": total_generated_tokens,
+        "prompt_tokens": total_prompt_tokens,  # Original input tokens
+        "generated_tokens": total_generated_tokens,  # Generated tokens
+        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (includes extra_context)
+        "generated_tokens_api": total_generated_tokens,  # Same as generated_tokens
     }
 
 
@@ -680,8 +718,14 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
         total_questions = sum(ctx["num_questions"] for ctx in contexts)
         total_contexts = len(contexts)
         total_latency = sum(ctx["latency"] for ctx in contexts)
+
+        # Original tokens (unique input only, no repeated previous answers)
         total_prompt_tokens = sum(ctx["prompt_tokens"] for ctx in contexts)
         total_generated_tokens = sum(ctx["generated_tokens"] for ctx in contexts)
+
+        # API tokens (actual tokens sent/received, includes repeated content)
+        total_prompt_tokens_api = sum(ctx.get("prompt_tokens_api", ctx["prompt_tokens"]) for ctx in contexts)
+        total_generated_tokens_api = sum(ctx.get("generated_tokens_api", ctx["generated_tokens"]) for ctx in contexts)
 
         # Weighted averages for metrics
         total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in contexts)
@@ -695,10 +739,16 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
                 "lenient_acc": total_lenient / total_questions if total_questions > 0 else 0,
                 "avg_latency": total_latency / total_contexts if total_contexts else 0,
                 "total_latency": total_latency,
+                # Original tokens (unique input)
                 "total_prompt_tokens": total_prompt_tokens,
                 "total_generated_tokens": total_generated_tokens,
                 "avg_prompt_tokens": total_prompt_tokens / total_contexts if total_contexts else 0,
                 "avg_generated_tokens": total_generated_tokens / total_contexts if total_contexts else 0,
+                # API tokens (actual cost)
+                "total_prompt_tokens_api": total_prompt_tokens_api,
+                "total_generated_tokens_api": total_generated_tokens_api,
+                "avg_prompt_tokens_api": total_prompt_tokens_api / total_contexts if total_contexts else 0,
+                "avg_generated_tokens_api": total_generated_tokens_api / total_contexts if total_contexts else 0,
                 "num_contexts": total_contexts,
                 "num_questions": total_questions,
             },
@@ -825,9 +875,9 @@ def main():
 
 def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squad"):
     """Print summary of results."""
-    logger.info("\n" + "=" * 90)
+    logger.info("\n" + "=" * 110)
     logger.info("RESULTS SUMMARY")
-    logger.info("=" * 90)
+    logger.info("=" * 110)
 
     # Get sample counts from first strategy
     first_strategy = next((s for s in strategies if s in all_results), None)
@@ -841,16 +891,18 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
             continue
         metrics = all_results[strategy]["aggregate_metrics"]
         logger.info(f"\n{strategy}:")
-        logger.info(f"  EM:           {metrics['strict_acc']:.4f}")
-        logger.info(f"  F1:           {metrics['f1']:.4f}")
-        logger.info(f"  Lenient:      {metrics.get('lenient_acc', 0):.4f}")
-        logger.info(f"  Prompt Tok:   {metrics['total_prompt_tokens']:,} (avg: {metrics.get('avg_prompt_tokens', 0):.1f})")
-        logger.info(f"  Gen Tok:      {metrics['total_generated_tokens']:,} (avg: {metrics.get('avg_generated_tokens', 0):.1f})")
-        logger.info(f"  Latency:      {metrics.get('total_latency', 0):.2f}s (avg: {metrics['avg_latency']:.2f}s)")
+        logger.info(f"  EM:             {metrics['strict_acc']:.4f}")
+        logger.info(f"  F1:             {metrics['f1']:.4f}")
+        logger.info(f"  Lenient:        {metrics.get('lenient_acc', 0):.4f}")
+        logger.info(f"  Prompt Tok:     {metrics['total_prompt_tokens']:,} (avg: {metrics.get('avg_prompt_tokens', 0):.1f})")
+        logger.info(f"  Gen Tok:        {metrics['total_generated_tokens']:,} (avg: {metrics.get('avg_generated_tokens', 0):.1f})")
+        logger.info(f"  PromptTok_API:  {metrics.get('total_prompt_tokens_api', 0):,} (avg: {metrics.get('avg_prompt_tokens_api', 0):.1f})")
+        logger.info(f"  GenTok_API:     {metrics.get('total_generated_tokens_api', 0):,} (avg: {metrics.get('avg_generated_tokens_api', 0):.1f})")
+        logger.info(f"  Latency:        {metrics.get('total_latency', 0):.2f}s (avg: {metrics['avg_latency']:.2f}s)")
 
-    # Comparison table
-    logger.info("\n" + "=" * 90)
-    logger.info("=== Aggregate Metrics ===")
+    # Comparison table - Original tokens (unique input)
+    logger.info("\n" + "=" * 110)
+    logger.info("=== Aggregate Metrics (Original Tokens - unique input only) ===")
     header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'Latency':>10}"
     separator = "-" * len(header)
     logger.info(header)
@@ -870,7 +922,27 @@ def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squ
             f"{metrics['avg_latency']:>8.2f}s"
         )
 
-    logger.info("=" * 90)
+    # Comparison table - API tokens (actual cost)
+    logger.info("\n=== API Cost Metrics (actual tokens sent/received) ===")
+    header_api = f"{'Strategy':<15} | {'PromptTok_API':>14} | {'GenTok_API':>12} | {'Total_API':>12}"
+    separator_api = "-" * len(header_api)
+    logger.info(header_api)
+    logger.info(separator_api)
+
+    for strategy in strategies:
+        if strategy not in all_results:
+            continue
+        metrics = all_results[strategy]["aggregate_metrics"]
+        prompt_api = metrics.get('avg_prompt_tokens_api', 0)
+        gen_api = metrics.get('avg_generated_tokens_api', 0)
+        logger.info(
+            f"{strategy:<15} | "
+            f"{prompt_api:>14.1f} | "
+            f"{gen_api:>12.1f} | "
+            f"{prompt_api + gen_api:>12.1f}"
+        )
+
+    logger.info("=" * 110)
 
 
 if __name__ == "__main__":

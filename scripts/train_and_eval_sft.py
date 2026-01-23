@@ -490,6 +490,8 @@ def _eval_worker(
             "latency": latency,
             "prompt_tokens": total_prompt_tokens,
             "generated_tokens": total_generated_tokens,
+            "prompt_tokens_api": total_prompt_tokens,  # Same as original for batch inference
+            "generated_tokens_api": total_generated_tokens,  # Same as original
             "num_questions": len(items),
         })
 
@@ -566,8 +568,14 @@ def run_parallel_eval(
     total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
     total_contexts = len(all_contexts)
     total_latency = sum(ctx["latency"] for ctx in all_contexts)
+
+    # Original tokens (unique input only)
     total_prompt_tokens = sum(ctx["prompt_tokens"] for ctx in all_contexts)
     total_generated_tokens = sum(ctx["generated_tokens"] for ctx in all_contexts)
+
+    # API tokens (actual tokens sent/received)
+    total_prompt_tokens_api = sum(ctx.get("prompt_tokens_api", ctx["prompt_tokens"]) for ctx in all_contexts)
+    total_generated_tokens_api = sum(ctx.get("generated_tokens_api", ctx["generated_tokens"]) for ctx in all_contexts)
 
     # Weighted averages for metrics
     total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
@@ -581,10 +589,16 @@ def run_parallel_eval(
             "lenient_acc": total_lenient / total_questions if total_questions > 0 else 0,
             "avg_latency": total_latency / total_contexts if total_contexts else 0,
             "total_latency": total_latency,
+            # Original tokens (unique input)
             "total_prompt_tokens": total_prompt_tokens,
             "total_generated_tokens": total_generated_tokens,
             "avg_prompt_tokens": total_prompt_tokens / total_contexts if total_contexts else 0,
             "avg_generated_tokens": total_generated_tokens / total_contexts if total_contexts else 0,
+            # API tokens (actual cost)
+            "total_prompt_tokens_api": total_prompt_tokens_api,
+            "total_generated_tokens_api": total_generated_tokens_api,
+            "avg_prompt_tokens_api": total_prompt_tokens_api / total_contexts if total_contexts else 0,
+            "avg_generated_tokens_api": total_generated_tokens_api / total_contexts if total_contexts else 0,
             "num_contexts": total_contexts,
             "num_questions": total_questions,
         },
@@ -669,12 +683,14 @@ def main():
             all_results["baseline"] = baseline_results["aggregate_metrics"]
             m = baseline_results['aggregate_metrics']
             logger.info(f"\nBaseline Results:")
-            logger.info(f"  EM:           {m['strict_acc']:.4f}")
-            logger.info(f"  F1:           {m['f1']:.4f}")
-            logger.info(f"  Lenient:      {m.get('lenient_acc', 0):.4f}")
-            logger.info(f"  Prompt Tok:   {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
-            logger.info(f"  Gen Tok:      {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
-            logger.info(f"  Latency:      {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
+            logger.info(f"  EM:             {m['strict_acc']:.4f}")
+            logger.info(f"  F1:             {m['f1']:.4f}")
+            logger.info(f"  Lenient:        {m.get('lenient_acc', 0):.4f}")
+            logger.info(f"  Prompt Tok:     {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
+            logger.info(f"  Gen Tok:        {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
+            logger.info(f"  PromptTok_API:  {m.get('total_prompt_tokens_api', 0):,} (avg: {m.get('avg_prompt_tokens_api', 0):.1f})")
+            logger.info(f"  GenTok_API:     {m.get('total_generated_tokens_api', 0):,} (avg: {m.get('avg_generated_tokens_api', 0):.1f})")
+            logger.info(f"  Latency:        {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
 
     # Step 2: Training (unless eval-only)
     lora_checkpoint_path = args.checkpoint_path
@@ -742,17 +758,19 @@ def main():
         all_results["sft_lora"] = sft_results["aggregate_metrics"]
         m = sft_results['aggregate_metrics']
         logger.info(f"\nSFT-LoRA Results:")
-        logger.info(f"  EM:           {m['strict_acc']:.4f}")
-        logger.info(f"  F1:           {m['f1']:.4f}")
-        logger.info(f"  Lenient:      {m.get('lenient_acc', 0):.4f}")
-        logger.info(f"  Prompt Tok:   {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
-        logger.info(f"  Gen Tok:      {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
-        logger.info(f"  Latency:      {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
+        logger.info(f"  EM:             {m['strict_acc']:.4f}")
+        logger.info(f"  F1:             {m['f1']:.4f}")
+        logger.info(f"  Lenient:        {m.get('lenient_acc', 0):.4f}")
+        logger.info(f"  Prompt Tok:     {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
+        logger.info(f"  Gen Tok:        {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
+        logger.info(f"  PromptTok_API:  {m.get('total_prompt_tokens_api', 0):,} (avg: {m.get('avg_prompt_tokens_api', 0):.1f})")
+        logger.info(f"  GenTok_API:     {m.get('total_generated_tokens_api', 0):,} (avg: {m.get('avg_generated_tokens_api', 0):.1f})")
+        logger.info(f"  Latency:        {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
 
     # Final summary
-    logger.info("\n" + "=" * 90)
+    logger.info("\n" + "=" * 110)
     logger.info("FINAL SUMMARY")
-    logger.info("=" * 90)
+    logger.info("=" * 110)
 
     # Get sample counts
     for key in ["baseline", "sft_lora"]:
@@ -761,6 +779,8 @@ def main():
             logger.info(f"Contexts: {m.get('num_contexts', 0)}, Questions: {m.get('num_questions', 0)}")
             break
 
+    # Original tokens table
+    logger.info("\n=== Aggregate Metrics (Original Tokens - unique input only) ===")
     header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'Latency':>10}"
     separator = "-" * len(header)
     logger.info(header)
@@ -788,6 +808,35 @@ def main():
             f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
             f"{m.get('avg_generated_tokens', 0):>8.1f} | "
             f"{m['avg_latency']:>8.2f}s"
+        )
+
+    # API tokens table
+    logger.info("\n=== API Cost Metrics (actual tokens sent/received) ===")
+    header_api = f"{'Strategy':<15} | {'PromptTok_API':>14} | {'GenTok_API':>12} | {'Total_API':>12}"
+    separator_api = "-" * len(header_api)
+    logger.info(header_api)
+    logger.info(separator_api)
+
+    if "baseline" in all_results:
+        m = all_results["baseline"]
+        prompt_api = m.get('avg_prompt_tokens_api', 0)
+        gen_api = m.get('avg_generated_tokens_api', 0)
+        logger.info(
+            f"{'baseline':<15} | "
+            f"{prompt_api:>14.1f} | "
+            f"{gen_api:>12.1f} | "
+            f"{prompt_api + gen_api:>12.1f}"
+        )
+
+    if "sft_lora" in all_results:
+        m = all_results["sft_lora"]
+        prompt_api = m.get('avg_prompt_tokens_api', 0)
+        gen_api = m.get('avg_generated_tokens_api', 0)
+        logger.info(
+            f"{'sft_lora':<15} | "
+            f"{prompt_api:>14.1f} | "
+            f"{gen_api:>12.1f} | "
+            f"{prompt_api + gen_api:>12.1f}"
         )
 
         if "baseline" in all_results:
