@@ -26,10 +26,7 @@ def build_dependency_prompt(
 ) -> Tuple[str, str]:
     """Build a prompt with dependency information.
 
-    Uses simple format matching exp2a_shared_context.py:
-    - System: Simple instruction
-    - User: Context + Previous answers + Question
-    - No <answer> tags required
+    Uses <answer> tag format for answer extraction.
     """
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
@@ -44,7 +41,7 @@ def build_dependency_prompt(
     else:
         system_prompt = (
             "You are a helpful assistant. Answer the question based on the given passage.\n"
-            "Give a short, direct answer. Do not explain or elaborate."
+            "Give a short, direct answer in <answer></answer> tags. Do not explain or elaborate."
         )
 
     user_lines: List[str] = []
@@ -80,10 +77,7 @@ def build_single_prompt(
 ) -> Tuple[str, str]:
     """Build a single-question prompt.
 
-    Uses simple format matching exp2a_shared_context.py:
-    - System: Simple instruction
-    - User: Context + Question
-    - No <answer> tags required
+    Uses <answer> tag format for answer extraction.
     """
     # Use question-specific context if available, otherwise use shared background
     effective_background = question.context if question.context else background
@@ -97,10 +91,9 @@ def build_single_prompt(
         )
         user_prompt = f"背景信息:\n{effective_background.strip()}\n\n问题: {question.text.strip()}"
     else:
-        # Simple format: no <answer> tags, context in user message
         system_prompt = (
             "You are a helpful assistant. Answer the question based on the given passage.\n"
-            "Give a short, direct answer. Do not explain or elaborate."
+            "Give a short, direct answer in <answer></answer> tags. Do not explain or elaborate."
         )
         user_prompt = f"Passage:\n{effective_background.strip()}\n\nQuestion: {question.text.strip()}"
 

@@ -17,9 +17,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Simple prompt format (same as exp2a_shared_context.py)
+# Prompt format with <answer> tags for answer extraction
 SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
-Give a short, direct answer. Do not explain or elaborate."""
+Give a short, direct answer in <answer></answer> tags. Do not explain or elaborate."""
 
 
 def _context_to_items(context_payload: dict) -> List[dict]:
