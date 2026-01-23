@@ -280,6 +280,35 @@ def _eval_worker(
 
     print(f"[Worker {rank}] Done, saved to {temp_file}", flush=True)
 
+    # Clean up vLLM and HF models to ensure process exits properly
+    # vLLM spawns background processes (EngineCore) that need explicit shutdown
+    print(f"[Worker {rank}] Cleaning up models...", flush=True)
+    try:
+        # Try to shutdown vLLM engine properly
+        if hasattr(vllm_model, 'llm_engine') and hasattr(vllm_model.llm_engine, 'shutdown'):
+            vllm_model.llm_engine.shutdown()
+        elif hasattr(vllm_model, 'shutdown'):
+            vllm_model.shutdown()
+    except Exception as e:
+        print(f"[Worker {rank}] vLLM shutdown warning: {e}", flush=True)
+
+    del vllm_model
+    if hf_model is not None:
+        del hf_model
+        del dep_generator
+
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        # Force synchronize to ensure all CUDA operations complete
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    print(f"[Worker {rank}] Cleanup complete, exiting", flush=True)
+
 
 def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_lookup,
                     sampling_params, dataset, enable_thinking):
