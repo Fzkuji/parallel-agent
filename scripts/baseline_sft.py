@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """
-SFT-LoRA training and evaluation script.
+SFT-LoRA baseline training and evaluation script.
 
-This script trains a LoRA adapter on the QA task and evaluates the trained model.
+This script trains LoRA adapters on the QA task and evaluates the trained models.
+By default, it trains and evaluates BOTH formats (batch and sequential) and
+outputs a comparison table.
 
 Usage:
-    python scripts/train_and_eval_sft.py \
+    # Evaluate both formats (default)
+    python scripts/baseline_sft.py \
         --model Qwen/Qwen2.5-7B-Instruct \
         --dataset squad \
-        --epochs 3 \
-        --train-samples 1000 \
         --eval-samples 100 \
-        --num-gpus 8
+        --min-questions 5 \
+        --max-questions 10
+
+    # Train and evaluate a specific format only
+    python scripts/baseline_sft.py \
+        --model Qwen/Qwen2.5-7B-Instruct \
+        --dataset squad \
+        --train-format batch \
+        --epochs 3 \
+        --train-samples 1000
 """
 
 import argparse
@@ -44,10 +54,11 @@ def parse_args():
     parser.add_argument("--max-questions", type=int, default=5)
 
     # Training format
-    parser.add_argument("--train-format", type=str, default="batch",
-                       choices=["batch", "sequential"],
-                       help="Training format: 'batch' (each question independent) or "
-                            "'sequential' (multi-turn conversation, train answer only)")
+    parser.add_argument("--train-format", type=str, default="all",
+                       choices=["batch", "sequential", "all"],
+                       help="Training format: 'batch' (each question independent), "
+                            "'sequential' (multi-turn conversation, train answer only), "
+                            "or 'all' (evaluate both formats, default)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=3)
@@ -963,7 +974,7 @@ def run_parallel_eval(
     }
 
 
-def _get_eval_cache_key(args, strategy_name: str, lora_checkpoint_path: Optional[str] = None) -> str:
+def _get_eval_cache_key(args, strategy_name: str, eval_format: str, lora_checkpoint_path: Optional[str] = None) -> str:
     """Generate a cache key for evaluation results."""
     key_parts = [
         args.model.replace("/", "_"),
@@ -971,7 +982,7 @@ def _get_eval_cache_key(args, strategy_name: str, lora_checkpoint_path: Optional
         f"n{args.eval_samples}",
         f"q{args.min_questions}-{args.max_questions}",
         f"tok{args.max_new_tokens}",
-        f"fmt_{args.train_format}",
+        f"fmt_{eval_format}",
         strategy_name,
     ]
     # Include checkpoint path hash for SFT-LoRA
@@ -996,7 +1007,7 @@ def _load_eval_cache(cache_dir: Path, cache_key: str) -> Optional[Dict[str, Any]
     return None
 
 
-def _save_eval_cache(cache_dir: Path, cache_key: str, results: Dict[str, Any], args) -> None:
+def _save_eval_cache(cache_dir: Path, cache_key: str, results: Dict[str, Any], args, eval_format: str) -> None:
     """Save evaluation results to cache."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"eval_cache_{cache_key}.json"
@@ -1009,13 +1020,189 @@ def _save_eval_cache(cache_dir: Path, cache_key: str, results: Dict[str, Any], a
             "min_questions": args.min_questions,
             "max_questions": args.max_questions,
             "max_new_tokens": args.max_new_tokens,
-            "train_format": args.train_format,
+            "train_format": eval_format,
         },
         **results,
     }
     with open(cache_file, 'w') as f:
         json.dump(data_with_meta, f, indent=2)
     logger.info(f"Saved results to {cache_file}")
+
+
+def _train_and_eval_single_format(
+    args,
+    train_format: str,
+    eval_contexts: List[Dict],
+    train_groups: Optional[List[Dict]],
+    output_dir: Path,
+    checkpoint_dir: Path,
+    num_gpus: int,
+    gpu_ids: List[int],
+) -> Dict[str, Any]:
+    """Train and evaluate a single format (batch or sequential).
+
+    Returns dict with 'sft_lora' and optionally 'baseline' keys.
+    """
+    import torch
+
+    results = {}
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"FORMAT: {train_format.upper()}")
+    logger.info(f"{'='*60}")
+
+    # Step 1: Evaluate baseline if requested
+    if args.compare_baseline:
+        logger.info(f"\n[{train_format}] Evaluating Baseline (no LoRA)")
+
+        baseline_cache_key = _get_eval_cache_key(args, "baseline", train_format, None)
+        baseline_results = None
+
+        if not args.force:
+            baseline_results = _load_eval_cache(output_dir, baseline_cache_key)
+
+        if baseline_results is None:
+            baseline_results = run_parallel_eval(
+                model_name=args.model,
+                eval_contexts=eval_contexts,
+                output_dir=str(output_dir),
+                max_new_tokens=args.max_new_tokens,
+                dataset=args.dataset,
+                enable_thinking=args.enable_thinking,
+                lora_checkpoint_path=None,
+                strategy_name=f"baseline_{train_format}",
+                num_gpus=num_gpus,
+                gpu_ids=gpu_ids,
+                eval_format=train_format,
+            )
+            if baseline_results:
+                _save_eval_cache(output_dir, baseline_cache_key, baseline_results, args, train_format)
+
+        if baseline_results:
+            results["baseline"] = baseline_results.get("aggregate_metrics", baseline_results)
+
+    # Step 2: Training (unless eval-only)
+    lora_checkpoint_path = args.checkpoint_path
+    if not args.eval_only and train_groups is not None:
+        logger.info(f"\n[{train_format}] Training SFT-LoRA")
+
+        lora_target_modules = [m.strip() for m in args.lora_target_modules.split(',')]
+
+        lora_checkpoint_path = train_lora(
+            model_name=args.model,
+            train_groups=train_groups,
+            output_dir=str(checkpoint_dir / args.dataset / args.model.replace('/', '_') / train_format),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.lr,
+            warmup_ratio=args.warmup_ratio,
+            max_seq_length=args.max_seq_length,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=lora_target_modules,
+            seed=args.seed,
+            train_format=train_format,
+        )
+
+    if not lora_checkpoint_path:
+        logger.warning(f"[{train_format}] No LoRA checkpoint available, skipping SFT-LoRA evaluation")
+        return results
+
+    # Step 3: Evaluate SFT-LoRA
+    logger.info(f"\n[{train_format}] Evaluating SFT-LoRA")
+
+    sft_cache_key = _get_eval_cache_key(args, "sft_lora", train_format, lora_checkpoint_path)
+    sft_results = None
+
+    if not args.force:
+        sft_results = _load_eval_cache(output_dir, sft_cache_key)
+
+    if sft_results is None:
+        sft_results = run_parallel_eval(
+            model_name=args.model,
+            eval_contexts=eval_contexts,
+            output_dir=str(output_dir),
+            max_new_tokens=args.max_new_tokens,
+            dataset=args.dataset,
+            enable_thinking=args.enable_thinking,
+            lora_checkpoint_path=lora_checkpoint_path,
+            strategy_name=f"sft_lora_{train_format}",
+            num_gpus=num_gpus,
+            gpu_ids=gpu_ids,
+            eval_format=train_format,
+        )
+        if sft_results:
+            _save_eval_cache(output_dir, sft_cache_key, sft_results, args, train_format)
+
+    if sft_results:
+        results["sft_lora"] = sft_results.get("aggregate_metrics", sft_results)
+
+    return results
+
+
+def _print_comparison_table(all_format_results: Dict[str, Dict], formats: List[str]) -> None:
+    """Print a comparison table for all formats."""
+    logger.info("\n" + "=" * 160)
+    logger.info("RESULTS SUMMARY")
+    logger.info("=" * 160)
+
+    # Get sample counts from first available result
+    for fmt in formats:
+        if fmt in all_format_results:
+            for key in ["sft_lora", "baseline"]:
+                if key in all_format_results[fmt]:
+                    m = all_format_results[fmt][key]
+                    logger.info(f"Contexts: {m.get('num_contexts', 0)}, Questions: {m.get('num_questions', 0)}")
+                    break
+            break
+
+    # Combined results table
+    header = f"{'Strategy':<20} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
+    separator = "-" * len(header)
+    logger.info("\n" + header)
+    logger.info(separator)
+
+    for fmt in formats:
+        if fmt not in all_format_results:
+            continue
+
+        results = all_format_results[fmt]
+
+        # Print baseline for this format
+        if "baseline" in results:
+            m = results["baseline"]
+            strategy_name = f"baseline_{fmt}"
+            logger.info(
+                f"{strategy_name:<20} | "
+                f"{m['strict_acc']:>6.3f} | "
+                f"{m['f1']:>6.3f} | "
+                f"{m.get('lenient_acc', 0):>7.3f} | "
+                f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
+                f"{m.get('avg_generated_tokens', 0):>8.1f} | "
+                f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
+                f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
+                f"{m['avg_latency']:>6.2f}s"
+            )
+
+        # Print SFT-LoRA for this format
+        if "sft_lora" in results:
+            m = results["sft_lora"]
+            strategy_name = f"sft_lora_{fmt}"
+            logger.info(
+                f"{strategy_name:<20} | "
+                f"{m['strict_acc']:>6.3f} | "
+                f"{m['f1']:>6.3f} | "
+                f"{m.get('lenient_acc', 0):>7.3f} | "
+                f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
+                f"{m.get('avg_generated_tokens', 0):>8.1f} | "
+                f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
+                f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
+                f"{m['avg_latency']:>6.2f}s"
+            )
+
+    logger.info("=" * 160)
 
 
 def main():
@@ -1059,6 +1246,28 @@ def main():
     )
     logger.info(f"Loaded {len(eval_contexts)} evaluation contexts")
 
+    # Load training data (unless eval-only)
+    train_groups = None
+    if not args.eval_only:
+        logger.info(f"Loading training data: {args.train_samples} samples")
+        train_groups = load_dataset(
+            args.dataset,
+            split="train",
+            max_contexts=args.train_samples,
+            min_questions=args.min_questions,
+            max_questions=args.max_questions,
+            seed=args.seed,
+        )
+        logger.info(f"Loaded {len(train_groups)} training contexts")
+
+    # Determine which formats to evaluate
+    if args.train_format == "all":
+        formats_to_eval = ["batch", "sequential"]
+    else:
+        formats_to_eval = [args.train_format]
+
+    logger.info(f"Formats to evaluate: {formats_to_eval}")
+
     # Results storage
     all_results = {
         "config": {
@@ -1073,192 +1282,24 @@ def main():
         },
     }
 
-    # Step 1: Evaluate baseline if requested
-    if args.compare_baseline:
-        logger.info("\n" + "=" * 60)
-        logger.info("STEP 1: Evaluating Baseline (no LoRA)")
-        logger.info("=" * 60)
-
-        # Check cache first
-        baseline_cache_key = _get_eval_cache_key(args, "baseline", None)
-        baseline_results = None
-
-        if not args.force:
-            baseline_results = _load_eval_cache(output_dir, baseline_cache_key)
-
-        if baseline_results is None:
-            baseline_results = run_parallel_eval(
-                model_name=args.model,
-                eval_contexts=eval_contexts,
-                output_dir=str(output_dir),
-                max_new_tokens=args.max_new_tokens,
-                dataset=args.dataset,
-                enable_thinking=args.enable_thinking,
-                lora_checkpoint_path=None,
-                strategy_name="baseline",
-                num_gpus=num_gpus,
-                gpu_ids=gpu_ids,
-                eval_format=args.train_format,  # Use same format as training
-            )
-            # Save to cache
-            if baseline_results:
-                _save_eval_cache(output_dir, baseline_cache_key, baseline_results, args)
-
-        if baseline_results:
-            all_results["baseline"] = baseline_results.get("aggregate_metrics", baseline_results)
-            m = all_results["baseline"]
-            logger.info(f"\nBaseline Results:")
-            logger.info(f"  EM:             {m['strict_acc']:.4f}")
-            logger.info(f"  F1:             {m['f1']:.4f}")
-            logger.info(f"  Lenient:        {m.get('lenient_acc', 0):.4f}")
-            logger.info(f"  Prompt Tok:     {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
-            logger.info(f"  Gen Tok:        {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
-            logger.info(f"  PromptTok_API:  {m.get('total_prompt_tokens_api', 0):,} (avg: {m.get('avg_prompt_tokens_api', 0):.1f})")
-            logger.info(f"  GenTok_API:     {m.get('total_generated_tokens_api', 0):,} (avg: {m.get('avg_generated_tokens_api', 0):.1f})")
-            logger.info(f"  Latency:        {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
-
-    # Step 2: Training (unless eval-only)
-    lora_checkpoint_path = args.checkpoint_path
-    if not args.eval_only:
-        logger.info("\n" + "=" * 60)
-        logger.info("STEP 2: Training SFT-LoRA")
-        logger.info("=" * 60)
-
-        # Load training data
-        logger.info(f"Loading training data: {args.train_samples} samples")
-        train_groups = load_dataset(
-            args.dataset,
-            split="train",
-            max_contexts=args.train_samples,
-            min_questions=args.min_questions,
-            max_questions=args.max_questions,
-            seed=args.seed,
-        )
-        logger.info(f"Loaded {len(train_groups)} training contexts")
-
-        # Parse target modules
-        lora_target_modules = [m.strip() for m in args.lora_target_modules.split(',')]
-
-        # Train
-        logger.info(f"Training format: {args.train_format}")
-        lora_checkpoint_path = train_lora(
-            model_name=args.model,
-            train_groups=train_groups,
-            output_dir=str(checkpoint_dir / args.dataset / args.model.replace('/', '_') / args.train_format),
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.lr,
-            warmup_ratio=args.warmup_ratio,
-            max_seq_length=args.max_seq_length,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            lora_target_modules=lora_target_modules,
-            seed=args.seed,
-            train_format=args.train_format,
-        )
-
-    if not lora_checkpoint_path:
-        logger.error("No LoRA checkpoint available. Either train a model or provide --checkpoint-path")
-        sys.exit(1)
-
-    # Step 3: Evaluate SFT-LoRA
-    logger.info("\n" + "=" * 60)
-    logger.info("STEP 3: Evaluating SFT-LoRA")
-    logger.info("=" * 60)
-
-    # Check cache first
-    sft_cache_key = _get_eval_cache_key(args, "sft_lora", lora_checkpoint_path)
-    sft_results = None
-
-    if not args.force:
-        sft_results = _load_eval_cache(output_dir, sft_cache_key)
-
-    if sft_results is None:
-        sft_results = run_parallel_eval(
-            model_name=args.model,
+    # Train and evaluate each format
+    all_format_results = {}
+    for train_format in formats_to_eval:
+        format_results = _train_and_eval_single_format(
+            args=args,
+            train_format=train_format,
             eval_contexts=eval_contexts,
-            output_dir=str(output_dir),
-            max_new_tokens=args.max_new_tokens,
-            dataset=args.dataset,
-            enable_thinking=args.enable_thinking,
-            lora_checkpoint_path=lora_checkpoint_path,
-            strategy_name="sft_lora",
+            train_groups=train_groups,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
             num_gpus=num_gpus,
             gpu_ids=gpu_ids,
-            eval_format=args.train_format,  # Use same format as training
         )
-        # Save to cache
-        if sft_results:
-            _save_eval_cache(output_dir, sft_cache_key, sft_results, args)
+        all_format_results[train_format] = format_results
+        all_results[train_format] = format_results
 
-    if sft_results:
-        all_results["sft_lora"] = sft_results.get("aggregate_metrics", sft_results)
-        m = all_results["sft_lora"]
-        logger.info(f"\nSFT-LoRA Results:")
-        logger.info(f"  EM:             {m['strict_acc']:.4f}")
-        logger.info(f"  F1:             {m['f1']:.4f}")
-        logger.info(f"  Lenient:        {m.get('lenient_acc', 0):.4f}")
-        logger.info(f"  Prompt Tok:     {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
-        logger.info(f"  Gen Tok:        {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
-        logger.info(f"  PromptTok_API:  {m.get('total_prompt_tokens_api', 0):,} (avg: {m.get('avg_prompt_tokens_api', 0):.1f})")
-        logger.info(f"  GenTok_API:     {m.get('total_generated_tokens_api', 0):,} (avg: {m.get('avg_generated_tokens_api', 0):.1f})")
-        logger.info(f"  Latency:        {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
-
-    # Final summary
-    logger.info("\n" + "=" * 110)
-    logger.info("FINAL SUMMARY")
-    logger.info("=" * 110)
-
-    # Get sample counts
-    for key in ["baseline", "sft_lora"]:
-        if key in all_results:
-            m = all_results[key]
-            logger.info(f"Contexts: {m.get('num_contexts', 0)}, Questions: {m.get('num_questions', 0)}")
-            break
-
-    # Combined results table
-    logger.info("\n=== Results Summary ===")
-    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
-    separator = "-" * len(header)
-    logger.info(header)
-    logger.info(separator)
-
-    if "baseline" in all_results:
-        m = all_results["baseline"]
-        logger.info(
-            f"{'baseline':<15} | "
-            f"{m['strict_acc']:>6.3f} | "
-            f"{m['f1']:>6.3f} | "
-            f"{m.get('lenient_acc', 0):>7.3f} | "
-            f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
-            f"{m.get('avg_generated_tokens', 0):>8.1f} | "
-            f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
-            f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
-            f"{m['avg_latency']:>6.2f}s"
-        )
-
-    if "sft_lora" in all_results:
-        m = all_results["sft_lora"]
-        logger.info(
-            f"{'sft_lora':<15} | "
-            f"{m['strict_acc']:>6.3f} | "
-            f"{m['f1']:>6.3f} | "
-            f"{m.get('lenient_acc', 0):>7.3f} | "
-            f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
-            f"{m.get('avg_generated_tokens', 0):>8.1f} | "
-            f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
-            f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
-            f"{m['avg_latency']:>6.2f}s"
-        )
-
-        if "baseline" in all_results:
-            baseline_m = all_results["baseline"]
-            logger.info(f"\nImprovement over baseline:")
-            logger.info(f"  EM:      {m['strict_acc'] - baseline_m['strict_acc']:+.4f}")
-            logger.info(f"  F1:      {m['f1'] - baseline_m['f1']:+.4f}")
-            logger.info(f"  Lenient: {m.get('lenient_acc', 0) - baseline_m.get('lenient_acc', 0):+.4f}")
+    # Print comparison table
+    _print_comparison_table(all_format_results, formats_to_eval)
 
     # Save results
     results_path = output_dir / f"sft_lora_results_{args.dataset}.json"

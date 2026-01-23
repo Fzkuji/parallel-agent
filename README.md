@@ -504,7 +504,7 @@ python scripts/compare_strategies.py \
 | `--lora-lmhead-checkpoint` | Path to LoRA + lm_head checkpoint |
 | `--lora-crossbatch-checkpoint` | Path to LoRA + cross-batch checkpoint |
 
-## Baseline Evaluation (eval_baselines.py)
+## Pretrained Model Evaluation (baseline_pretrained.py)
 
 Fast evaluation of baseline strategies using vLLM with multi-GPU parallelism. No training required.
 
@@ -512,7 +512,7 @@ Fast evaluation of baseline strategies using vLLM with multi-GPU parallelism. No
 
 ```bash
 # Evaluate all baseline strategies
-python scripts/eval_baselines.py \
+python scripts/baseline_pretrained.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
     --eval-samples 100 \
@@ -532,9 +532,9 @@ python scripts/eval_baselines.py \
 | `--min-questions` / `--max-questions` | Questions per context (default: 3-5) |
 | `--cache` | Enable result caching |
 
-## SFT-LoRA Training (train_and_eval_sft.py)
+## SFT-LoRA Training (baseline_sft.py)
 
-Train a LoRA adapter on the QA task and evaluate the trained model.
+Train LoRA adapters on the QA task and evaluate the trained models. By default, evaluates BOTH formats (batch and sequential) and outputs a comparison table.
 
 ### Training Formats
 
@@ -542,12 +542,21 @@ Train a LoRA adapter on the QA task and evaluate the trained model.
 |--------|-------------|
 | `batch` | Each question is an independent single-turn conversation. Standard SFT training. |
 | `sequential` | Multi-turn conversation format. Context only in first turn, subsequent turns only have questions. Only trains on assistant answer tokens (prompt tokens are masked). |
+| `all` | (Default) Evaluate both formats and output comparison table. |
 
 ### Usage
 
 ```bash
-# Train with batch format (default)
-python scripts/train_and_eval_sft.py \
+# Evaluate both formats (default)
+python scripts/baseline_sft.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --eval-samples 100 \
+    --min-questions 5 \
+    --max-questions 10
+
+# Train and evaluate a specific format only
+python scripts/baseline_sft.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
     --train-format batch \
@@ -556,7 +565,7 @@ python scripts/train_and_eval_sft.py \
     --eval-samples 100
 
 # Train with sequential format (multi-turn, answer-only training)
-python scripts/train_and_eval_sft.py \
+python scripts/baseline_sft.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
     --train-format sequential \
@@ -565,7 +574,7 @@ python scripts/train_and_eval_sft.py \
     --eval-samples 100
 
 # Compare with baseline
-python scripts/train_and_eval_sft.py \
+python scripts/baseline_sft.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
     --epochs 3 \
@@ -578,7 +587,7 @@ python scripts/train_and_eval_sft.py \
 |----------|-------------|
 | `--model` | HuggingFace model ID |
 | `--dataset` | Dataset for training and evaluation |
-| `--train-format` | Training format: `batch` or `sequential` |
+| `--train-format` | Training format: `batch`, `sequential`, or `all` (default) |
 | `--train-samples` | Number of training samples |
 | `--eval-samples` | Number of evaluation contexts |
 | `--epochs` | Training epochs (default: 3) |
