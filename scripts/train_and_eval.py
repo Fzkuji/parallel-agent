@@ -232,6 +232,15 @@ def baseline_worker(
 
     logger.info(f"[Worker {rank}] Done, saved to {temp_file}")
 
+    # Explicitly cleanup vLLM to avoid hanging
+    del vllm_model
+    torch.cuda.empty_cache()
+
+    # Force process exit to kill any lingering vLLM subprocesses
+    import gc
+    gc.collect()
+    os._exit(0)
+
 
 def run_baseline_parallel(
     args,
@@ -287,19 +296,40 @@ def run_baseline_parallel(
             processes.append(p)
             logger.info(f"Started baseline worker {rank} on GPU {rank} (PID: {p.pid})")
 
-        # Wait for all workers
+        # Wait for all workers with timeout
+        timeout = 3600  # 1 hour max
         for p in processes:
-            p.join()
+            p.join(timeout=timeout)
+            if p.is_alive():
+                logger.warning(f"Worker {p.pid} timed out, terminating...")
+                p.terminate()
+                p.join(timeout=10)
+                if p.is_alive():
+                    p.kill()
 
         logger.info("All baseline workers finished")
     else:
-        # Single GPU: run directly
-        baseline_worker(
-            rank=0, world_size=1, gpu_id=0, model_name=args.model,
-            eval_contexts=all_eval_contexts, output_dir=str(cache_path.parent),
-            max_new_tokens=args.max_new_tokens, dataset=args.dataset,
-            enable_thinking=args.enable_thinking,
+        # Single GPU: still run in subprocess to handle cleanup properly
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+
+        p = mp.Process(
+            target=baseline_worker,
+            args=(
+                0, 1, 0, args.model,
+                all_eval_contexts, str(cache_path.parent),
+                args.max_new_tokens, args.dataset, args.enable_thinking,
+            )
         )
+        p.start()
+        logger.info(f"Started baseline worker on GPU 0 (PID: {p.pid})")
+        p.join(timeout=3600)
+        if p.is_alive():
+            logger.warning("Worker timed out, terminating...")
+            p.terminate()
+            p.join(timeout=10)
 
     # Gather results
     logger.info("Gathering baseline results...")
