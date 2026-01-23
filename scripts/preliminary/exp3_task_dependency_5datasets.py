@@ -138,7 +138,7 @@ def run_condition(
             questions = [
                 Question(
                     qid=q["qid"],
-                    text=q["question"],
+                    text=q["text"],
                     priority=1.0,
                     answer_tokens=q.get("answer_tokens", 32),
                     type_hint=None,
@@ -178,7 +178,7 @@ def run_condition(
             questions = [
                 Question(
                     qid=q["qid"],
-                    text=q["question"],
+                    text=q["text"],
                     priority=1.0,
                     answer_tokens=q.get("answer_tokens", 32),
                     type_hint=None,
