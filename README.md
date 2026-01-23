@@ -513,9 +513,9 @@ Fast evaluation of baseline strategies using vLLM with multi-GPU parallelism. No
 | Strategy | Description | Token Tracking |
 |----------|-------------|----------------|
 | `all_in_one` | All questions in one prompt | PromptTok = PromptTok_API |
-| `sequential` | One question at a time, with previous answers concatenated | PromptTok_API > PromptTok (includes history) |
-| `batch` | All questions answered in parallel (no history) | PromptTok = PromptTok_API |
-| `collab_llm` | LLM-based dependency ordering with relevant answers | PromptTok_API includes dependency cost |
+| `sequential` | Multi-turn conversation, context only in first turn | PromptTok_API grows with conversation history |
+| `batch` | All questions answered in parallel (no history) | PromptTok_API = N × (context + question) |
+| `collab_llm` | Multi-turn with LLM-based ordering, dependency answers only | PromptTok_API includes conversation history + dep cost |
 
 ### Usage
 

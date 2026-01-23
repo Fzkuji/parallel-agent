@@ -397,58 +397,68 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
 
 def _run_sequential(vllm_model, tokenizer, items, question_lookup,
                     sampling_params, dataset, enable_thinking):
-    """Run sequential strategy: one question at a time, with previous answers concatenated."""
+    """Run sequential strategy: multi-turn conversation, context only in first turn.
+
+    Uses multi-turn chat format:
+    - Turn 1: [system, user(context + Q1)] -> assistant(A1)
+    - Turn 2: [system, user(context + Q1), assistant(A1), user(Q2)] -> assistant(A2)
+    - ...
+
+    This avoids repeating context in each turn's user message.
+    """
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
     answer_records = {}
-    answered_qa = []  # Store (question, answer) pairs for concatenation
     total_latency = 0
-    total_prompt_tokens_api = 0  # API: context + question + previous answers
+    total_prompt_tokens_api = 0
     total_generated_tokens = 0
 
-    # Calculate deduplicated prompt tokens: context (once) + all questions
-    # Get context tokens (only count once)
+    # Build conversation history as multi-turn messages
     context = items[0]["context"] if items else ""
-    context_prompt = f"Passage:\n{context}"
-    context_messages = [
+
+    # Start with system message
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": context_prompt},
+    ]
+
+    # Calculate deduplicated prompt tokens for reporting
+    # Context (once) + all questions + all answers
+    context_user = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}" if items else ""
+    first_turn_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": context_user},
     ]
     try:
-        context_full = tokenizer.apply_chat_template(
-            context_messages, tokenize=False, add_generation_prompt=True,
+        first_turn_full = tokenizer.apply_chat_template(
+            first_turn_messages, tokenize=False, add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
     except TypeError:
-        context_full = tokenizer.apply_chat_template(
-            context_messages, tokenize=False, add_generation_prompt=True,
+        first_turn_full = tokenizer.apply_chat_template(
+            first_turn_messages, tokenize=False, add_generation_prompt=True,
         )
-    context_tokens = len(tokenizer.encode(context_full))
+    # Base tokens = first turn (includes context)
+    base_prompt_tokens = len(tokenizer.encode(first_turn_full))
 
-    # Count question tokens (sum of all questions, without context)
-    total_question_tokens = 0
-    for item in items:
+    # Additional question tokens (Q2, Q3, ... without context)
+    additional_question_tokens = 0
+    for item in items[1:]:
         question_only = f"Question: {item['question']}"
-        total_question_tokens += len(tokenizer.encode(question_only))
+        additional_question_tokens += len(tokenizer.encode(question_only))
 
-    # Deduplicated total: context (once) + all questions
-    total_prompt_tokens = context_tokens + total_question_tokens
+    # Deduplicated total: first turn + additional questions
+    total_prompt_tokens = base_prompt_tokens + additional_question_tokens
 
-    for item in items:
-        # Build extra context from previous answers
-        extra_context = ""
-        if answered_qa:
-            qa_texts = [f"Q: {q}\nA: {a}" for q, a in answered_qa]
-            extra_context = "\n\nPrevious Q&A:\n" + "\n\n".join(qa_texts) + "\n"
+    for i, item in enumerate(items):
+        if i == 0:
+            # First turn: include context
+            user_content = f"Passage:\n{context}\n\nQuestion: {item['question']}"
+        else:
+            # Subsequent turns: only question (context already in history)
+            user_content = f"Question: {item['question']}"
 
-        # Full prompt with previous answers
-        prompt = f"Passage:\n{item['context']}{extra_context}\n\nQuestion: {item['question']}"
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ]
+        messages.append({"role": "user", "content": user_content})
 
         try:
             full_prompt = tokenizer.apply_chat_template(
@@ -468,8 +478,8 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
 
-        # Store for next iteration
-        answered_qa.append((item["question"], final_answer))
+        # Add assistant response to history for next turn
+        messages.append({"role": "assistant", "content": raw_text})
 
         # API tokens (actual tokens sent)
         total_prompt_tokens_api += len(outputs[0].prompt_token_ids)
@@ -482,7 +492,7 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
         "latency": total_latency,
         "prompt_tokens": total_prompt_tokens,  # Deduplicated: context (once) + all questions
         "generated_tokens": total_generated_tokens,
-        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (includes repeated context)
+        "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (grows with conversation history)
         "generated_tokens_api": total_generated_tokens,
     }
 
@@ -634,50 +644,62 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
 
     # Calculate deduplicated prompt tokens: context (once) + all questions
     context = items[0]["context"] if items else ""
-    context_prompt = f"Passage:\n{context}"
-    context_messages = [
+
+    # First question includes context
+    first_item = items[0] if items else None
+    first_user = f"Passage:\n{context}\n\nQuestion: {first_item['question']}" if first_item else ""
+    first_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": context_prompt},
+        {"role": "user", "content": first_user},
     ]
     try:
-        context_full = tokenizer.apply_chat_template(
-            context_messages, tokenize=False, add_generation_prompt=True,
+        first_full = tokenizer.apply_chat_template(
+            first_messages, tokenize=False, add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
     except TypeError:
-        context_full = tokenizer.apply_chat_template(
-            context_messages, tokenize=False, add_generation_prompt=True,
+        first_full = tokenizer.apply_chat_template(
+            first_messages, tokenize=False, add_generation_prompt=True,
         )
-    context_tokens = len(tokenizer.encode(context_full))
+    base_prompt_tokens = len(tokenizer.encode(first_full))
 
-    # Count question tokens (sum of all questions, without context)
-    total_question_tokens = 0
-    for item in items:
+    # Additional question tokens (without context)
+    additional_question_tokens = 0
+    for item in items[1:]:
         question_only = f"Question: {item['question']}"
-        total_question_tokens += len(tokenizer.encode(question_only))
+        additional_question_tokens += len(tokenizer.encode(question_only))
 
-    # Deduplicated total: context (once) + all questions
-    deduplicated_prompt_tokens = context_tokens + total_question_tokens
+    # Deduplicated total: first turn (with context) + additional questions
+    deduplicated_prompt_tokens = base_prompt_tokens + additional_question_tokens
 
-    # Generate answers in scheduled order
+    # Generate answers in scheduled order using multi-turn conversation
+    # Each question in the schedule order becomes a turn in the conversation
     answer_records = {}
     answers_text = {}
     total_latency = 0
-    total_prompt_tokens_api = 0  # API: includes extra_context (previous answers)
+    total_prompt_tokens_api = 0
     total_generated_tokens = 0
 
+    # Build conversation history
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    is_first_question = True
+
+    # Flatten batches to get execution order
+    execution_order = []
     for batch in schedule.batches:
-        batch_prompts = []
-        batch_items = []
+        execution_order.extend(batch.question_ids)
 
-        for qid in batch.question_ids:
-            item = next(i for i in items if i["qid"] == qid)
-            batch_items.append(item)
-            question = dep_question_lookup[qid]
+    for qid in execution_order:
+        item = next(i for i in items if i["qid"] == qid)
+        question = dep_question_lookup[qid]
 
-            # Include previous answers if there are dependencies (for actual API call)
+        if is_first_question:
+            # First turn: include context
+            user_content = f"Passage:\n{context}\n\nQuestion: {item['question']}"
+            is_first_question = False
+        else:
+            # Subsequent turns: only question + dependency answers if any
             deps = sorted(question.dependencies)
-            extra_context = ""
             if deps and answers_text:
                 dep_answers = []
                 for dep_qid in deps:
@@ -686,39 +708,40 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
                         if dep_item:
                             dep_answers.append(f"Q: {dep_item['question']}\nA: {answers_text[dep_qid]}")
                 if dep_answers:
-                    extra_context = "\n\nRelated Q&A:\n" + "\n\n".join(dep_answers) + "\n"
+                    user_content = "Related Q&A:\n" + "\n\n".join(dep_answers) + f"\n\nQuestion: {item['question']}"
+                else:
+                    user_content = f"Question: {item['question']}"
+            else:
+                user_content = f"Question: {item['question']}"
 
-            prompt = f"Passage:\n{item['context']}{extra_context}\n\nQuestion: {item['question']}"
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
+        messages.append({"role": "user", "content": user_content})
 
-            try:
-                full_prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
-                )
-            except TypeError:
-                full_prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
-                )
-            batch_prompts.append(full_prompt)
+        try:
+            full_prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            full_prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
 
         start_time = time.perf_counter()
-        outputs = vllm_model.generate(batch_prompts, sampling_params, use_tqdm=False)
+        outputs = vllm_model.generate([full_prompt], sampling_params, use_tqdm=False)
         total_latency += time.perf_counter() - start_time
 
-        for i, item in enumerate(batch_items):
-            output = outputs[i]
-            raw_text = output.outputs[0].text
-            final_answer, strict_valid = extract_answer(raw_text, dataset)
-            answer_records[item["qid"]] = (final_answer, strict_valid)
-            answers_text[item["qid"]] = final_answer
+        output = outputs[0]
+        raw_text = output.outputs[0].text
+        final_answer, strict_valid = extract_answer(raw_text, dataset)
+        answer_records[item["qid"]] = (final_answer, strict_valid)
+        answers_text[item["qid"]] = final_answer
 
-            # API tokens (actual tokens sent, includes extra_context)
-            total_prompt_tokens_api += len(output.prompt_token_ids)
-            total_generated_tokens += len(output.outputs[0].token_ids)
+        # Add assistant response to history
+        messages.append({"role": "assistant", "content": raw_text})
+
+        # API tokens (actual tokens sent)
+        total_prompt_tokens_api += len(output.prompt_token_ids)
+        total_generated_tokens += len(output.outputs[0].token_ids)
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
