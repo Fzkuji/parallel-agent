@@ -323,77 +323,122 @@ def load_or_run_baseline(
     rank: int,
     world_size: int,
 ) -> Dict[str, Any]:
-    """Load cached baseline or run vLLM inference on rank 0 only.
+    """Load cached baseline or run vLLM inference in parallel across all GPUs.
 
-    vLLM doesn't work well with torchrun multi-process setup, so we only
-    run baseline inference on rank 0 and broadcast results to other ranks.
+    Each rank runs vLLM independently on its shard (no dist needed).
+    Results are gathered via filesystem.
 
     Args:
-        all_eval_contexts: Full evaluation contexts (not sharded)
+        all_eval_contexts: Full evaluation contexts (will be sharded internally)
     """
-    baseline_results = None
+    # If --force is specified, delete the cached baseline (rank 0 only)
+    if rank == 0 and args.force and cache_path.exists():
+        logging.info(f"--force specified, removing cached baseline: {cache_path}")
+        cache_path.unlink()
+        # Also remove shard files
+        for shard_file in cache_path.parent.glob("baseline_shard_*.json"):
+            shard_file.unlink()
 
-    # Only rank 0 handles baseline
-    if rank == 0:
-        # If --force is specified, delete the cached baseline
-        if args.force and cache_path.exists():
-            logging.info(f"--force specified, removing cached baseline: {cache_path}")
-            cache_path.unlink()
+    # Check cache (rank 0 only, but all ranks need to know)
+    use_cache = cache_path.exists() and args.cache_baseline and not args.force
 
-        # Check cache (only if --force not specified)
-        if cache_path.exists() and args.cache_baseline and not args.force:
+    if use_cache:
+        if rank == 0:
             logging.info(f"Loading cached baseline from {cache_path}")
             with open(cache_path, 'r') as f:
                 baseline_results = json.load(f)
+            return baseline_results
         else:
-            # Run vLLM inference on ALL contexts (rank 0 only)
-            logging.info(f"Running vLLM baseline on {len(all_eval_contexts)} contexts...")
+            # Wait for rank 0 to load and we'll read later
+            time.sleep(2)
+            if cache_path.exists():
+                with open(cache_path, 'r') as f:
+                    return json.load(f)
 
-            vllm_client = VLLMClient(
-                model=args.model,
-                tensor_parallel_size=1,
-                enable_thinking=args.enable_thinking,
-            )
+    # Shard data for this rank
+    shard_contexts = all_eval_contexts[rank::world_size]
+    logging.info(f"[Rank {rank}] Running vLLM baseline on {len(shard_contexts)} contexts...")
 
-            shard_results = run_baseline_on_shard_vllm(args, all_eval_contexts, vllm_client)
-            logging.info(f"Baseline complete: {len(shard_results['contexts'])} contexts")
+    # Each rank runs vLLM independently
+    vllm_client = VLLMClient(
+        model=args.model,
+        tensor_parallel_size=1,
+        enable_thinking=args.enable_thinking,
+    )
 
-            # Free vLLM model to save memory for training
-            del vllm_client
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    shard_results = run_baseline_on_shard_vllm(args, shard_contexts, vllm_client)
+    logging.info(f"[Rank {rank}] Baseline shard complete: {len(shard_results['contexts'])} contexts")
 
-            # Aggregate results
-            total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
-            total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in shard_results["contexts"])
-            total_questions = sum(ctx["num_questions"] for ctx in shard_results["contexts"])
-            total_latency = sum(ctx["latency"] for ctx in shard_results["contexts"])
+    # Free vLLM model to save memory for training
+    del vllm_client
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-            baseline_results = {
-                "aggregate_metrics": {
-                    "strict_acc": total_em / total_questions if total_questions > 0 else 0,
-                    "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                    "avg_latency": total_latency / len(shard_results["contexts"]) if shard_results["contexts"] else 0,
-                    "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in shard_results["contexts"]),
-                    "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in shard_results["contexts"]),
-                },
-                "contexts": shard_results["contexts"],
-            }
+    # Save shard results to file (for gathering)
+    shard_file = cache_path.parent / f"baseline_shard_{rank}.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(shard_file, 'w') as f:
+        json.dump(shard_results, f)
+    logging.info(f"[Rank {rank}] Saved shard results to {shard_file}")
 
-            # Save cache
-            if args.cache_baseline:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(cache_path, 'w') as f:
-                    json.dump(baseline_results, f, indent=2)
-                logging.info(f"Saved baseline to {cache_path}")
+    # Wait for all ranks to finish (simple file-based barrier)
+    expected_shards = world_size
+    max_wait = 3600  # 1 hour max
+    waited = 0
+    while waited < max_wait:
+        existing_shards = list(cache_path.parent.glob("baseline_shard_*.json"))
+        if len(existing_shards) >= expected_shards:
+            break
+        time.sleep(5)
+        waited += 5
+        if rank == 0 and waited % 30 == 0:
+            logging.info(f"Waiting for shards: {len(existing_shards)}/{expected_shards}")
 
-    # Broadcast results from rank 0 to all ranks
-    if world_size > 1 and dist.is_initialized():
-        results_list = [baseline_results]
-        dist.broadcast_object_list(results_list, src=0)
-        baseline_results = results_list[0]
+    # Rank 0 gathers and aggregates
+    if rank == 0:
+        logging.info("Gathering results from all shards...")
+        all_contexts = []
+        for shard_idx in range(world_size):
+            shard_file = cache_path.parent / f"baseline_shard_{shard_idx}.json"
+            with open(shard_file, 'r') as f:
+                shard_data = json.load(f)
+                all_contexts.extend(shard_data["contexts"])
 
-    return baseline_results if baseline_results else {}
+        # Aggregate results
+        total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
+        total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in all_contexts)
+        total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
+        total_latency = sum(ctx["latency"] for ctx in all_contexts)
+
+        baseline_results = {
+            "aggregate_metrics": {
+                "strict_acc": total_em / total_questions if total_questions > 0 else 0,
+                "f1": total_f1 / total_questions if total_questions > 0 else 0,
+                "avg_latency": total_latency / len(all_contexts) if all_contexts else 0,
+                "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in all_contexts),
+                "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in all_contexts),
+            },
+            "contexts": all_contexts,
+        }
+
+        # Save aggregated cache
+        if args.cache_baseline:
+            with open(cache_path, 'w') as f:
+                json.dump(baseline_results, f, indent=2)
+            logging.info(f"Saved aggregated baseline to {cache_path}")
+
+        # Clean up shard files
+        for shard_file in cache_path.parent.glob("baseline_shard_*.json"):
+            shard_file.unlink()
+
+        return baseline_results
+    else:
+        # Other ranks wait for rank 0 to finish aggregation
+        time.sleep(5)
+        while not cache_path.exists():
+            time.sleep(2)
+        with open(cache_path, 'r') as f:
+            return json.load(f)
 
 
 def evaluate_checkpoint_on_shard(
@@ -548,25 +593,27 @@ def main():
     output_dir = Path(args.output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
+    # Wait for rank 0 to create directory
+    time.sleep(1)
 
     # Set random seed
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Initialize distributed backend
-    if world_size > 1:
-        if torch.cuda.is_available():
-            device_id = rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
-            if rank == 0:
-                logging.info(f"Using {world_size} GPUs for evaluation")
-            logging.info(f"Rank {rank} using cuda:{device_id}")
+    # Set CUDA device for this rank (but DON'T initialize distributed yet - vLLM needs to run first)
+    # Save original CUDA_VISIBLE_DEVICES to restore later
+    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    device_id = 0  # Default for single GPU
 
-        if not dist.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            timeout = torch.distributed.timedelta(minutes=30)
-            dist.init_process_group(backend=backend, rank=rank, world_size=world_size, timeout=timeout)
+    if world_size > 1 and torch.cuda.is_available():
+        device_id = rank % torch.cuda.device_count()
+        torch.cuda.set_device(device_id)
+        # Set CUDA_VISIBLE_DEVICES so vLLM only sees this GPU
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        if rank == 0:
+            logging.info(f"Using {world_size} GPUs for vLLM baseline (parallel)")
+        logging.info(f"Rank {rank} using cuda:{device_id}")
 
     # Load evaluation data (all ranks load full dataset, then shard)
     if rank == 0:
@@ -603,6 +650,22 @@ def main():
         rank=rank,
         world_size=world_size,
     )
+
+    # Now initialize distributed process group for training/evaluation (after vLLM is done)
+    if world_size > 1 and torch.cuda.is_available():
+        # Restore original CUDA_VISIBLE_DEVICES so all GPUs are visible for transformers
+        if original_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
+        elif "CUDA_VISIBLE_DEVICES" in os.environ:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
+
+        # Re-set the CUDA device for this rank
+        torch.cuda.set_device(device_id)
+
+        # Initialize distributed process group
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+            logging.info(f"Initialized distributed process group (rank {rank}/{world_size})")
 
     # Shard evaluation data across GPUs for cross-batch evaluation
     if world_size > 1:
