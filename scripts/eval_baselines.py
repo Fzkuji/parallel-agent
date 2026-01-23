@@ -170,7 +170,6 @@ def _eval_worker(
     from src.models import Question
     from src.evaluation import evaluate_predictions
     from src.inference import extract_answer
-    from src.prompts import build_all_in_one_prompt
     from src import LocalLLMDependencyGenerator
 
     # Load tokenizer
@@ -285,11 +284,27 @@ def _eval_worker(
 def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_lookup,
                     sampling_params, dataset, enable_thinking):
     """Run all-in-one strategy: all questions in one prompt."""
-    from src.prompts import build_all_in_one_prompt
-    from src.inference import extract_answer, parse_all_in_one_response
+    import re
+    from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
-    system_prompt, user_prompt = build_all_in_one_prompt(context, questions, dataset)
+    # Build all-in-one prompt (same logic as src/strategies/all_in_one.py)
+    system_prompt = (
+        "You are a helpful assistant that answers multiple questions from a single background.\n"
+        "Answer each question using exactly this format: QID: <answer>text</answer>\n\n"
+        "Example:\n"
+        "Q1: <answer>Paris</answer>\n"
+        "Q2: <answer>42</answer>\n\n"
+        "Rules:\n"
+        "- Use the exact question ID (e.g., Q1, Q2)\n"
+        "- Put answer inside <answer></answer> tags\n"
+        "- Extract answers directly from the background passage\n"
+        "- One answer per line, no extra text"
+    )
+
+    question_lines = [f"Question ({q['qid']}): {q['text'].strip()}" for q in questions]
+    user_prompt = f"Background:\n{context.strip()}\n\nQuestions:\n" + "\n".join(question_lines)
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -311,14 +326,23 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
 
     raw_text = outputs[0].outputs[0].text
 
-    # Parse all-in-one response
-    parsed_answers = parse_all_in_one_response(raw_text, questions)
+    # Parse all-in-one response: Q1: <answer>text</answer>
+    pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+    matches = pattern.findall(raw_text)
+    found = {}
+    for qid, ans in matches:
+        if qid not in found:
+            found[qid] = ans.strip()
 
     answer_records = {}
     for item in items:
         qid = item["qid"]
-        answer = parsed_answers.get(qid, "")
-        _, strict_valid = extract_answer(f"<answer>{answer}</answer>", dataset)
+        if qid in found:
+            answer = found[qid]
+            strict_valid = True
+        else:
+            answer = ""
+            strict_valid = False
         answer_records[qid] = (answer, strict_valid)
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
@@ -438,9 +462,10 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
     from src.models import Question
-    from src.scheduler import build_dag_with_costs, schedule_dag
+    from src.scheduler import DependencyScheduler
+    from src.selection import apply_dependencies, select_dependency_edges
 
-    # Build questions with context
+    # Build questions with context - use these for everything to ensure consistency
     dep_questions = [
         Question(
             qid=item["qid"],
@@ -453,45 +478,61 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
         )
         for item in items
     ]
+    dep_question_lookup = {q.qid: q for q in dep_questions}
 
-    # Build dependency graph
-    dag = build_dag_with_costs(
-        dep_questions,
-        dep_generator,
+    # Generate dependency edges using LLM
+    edges = dep_generator.generate_edges("", dep_questions)
+
+    # Select and apply dependencies
+    selected = select_dependency_edges(
+        dep_question_lookup,
+        edges,
         cost_weight=dep_args["cost_weight"],
         min_confidence=dep_args["min_confidence"],
-        max_dependencies=dep_args["max_dependencies"],
+        max_dependencies_per_target=dep_args["max_dependencies"],
         total_cost_budget=dep_args["total_cost_budget"],
+        fmt_overhead=6,
     )
+    apply_dependencies(dep_question_lookup, selected)
 
-    # Schedule questions based on DAG
-    schedule = schedule_dag(dag)
+    # Build scheduler and get schedule
+    scheduler = DependencyScheduler(
+        "",  # Empty background, each question has its own context
+        dep_questions,
+        max_batch_tokens=None,
+        fmt_overhead_per_section=6,
+        prefill_token_cost=0.8,
+        generate_token_cost=1.2,
+    )
+    scheduler.build_dependencies(auto_infer=False)
+    schedule = scheduler.schedule()
 
     # Generate answers in scheduled order
     answer_records = {}
+    answers_text = {}
     total_latency = 0
     total_prompt_tokens = 0
     total_generated_tokens = 0
-    answered_so_far = {}
 
-    for batch in schedule:
+    for batch in schedule.batches:
         batch_prompts = []
         batch_items = []
 
-        for qid in batch:
+        for qid in batch.question_ids:
             item = next(i for i in items if i["qid"] == qid)
             batch_items.append(item)
+            question = dep_question_lookup[qid]
 
             # Include previous answers if there are dependencies
-            deps = dag.get(qid, {}).get("deps", [])
+            deps = sorted(question.dependencies)
             extra_context = ""
-            if deps and answered_so_far:
+            if deps and answers_text:
                 dep_answers = []
                 for dep_qid in deps:
-                    if dep_qid in answered_so_far:
+                    if dep_qid in answers_text:
                         dep_item = next((i for i in items if i["qid"] == dep_qid), None)
                         if dep_item:
-                            dep_answers.append(f"Q: {dep_item['question']}\nA: {answered_so_far[dep_qid]}")
+                            dep_answers.append(f"Q: {dep_item['question']}\nA: {answers_text[dep_qid]}")
                 if dep_answers:
                     extra_context = "\n\nRelated Q&A:\n" + "\n\n".join(dep_answers) + "\n"
 
@@ -521,7 +562,7 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
             raw_text = output.outputs[0].text
             final_answer, strict_valid = extract_answer(raw_text, dataset)
             answer_records[item["qid"]] = (final_answer, strict_valid)
-            answered_so_far[item["qid"]] = final_answer
+            answers_text[item["qid"]] = final_answer
             total_prompt_tokens += len(output.prompt_token_ids)
             total_generated_tokens += len(output.outputs[0].token_ids)
 
