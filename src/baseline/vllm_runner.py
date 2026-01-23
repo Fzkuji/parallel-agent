@@ -17,6 +17,40 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _get_available_gpus(min_free_memory_gb: float = 10.0) -> List[int]:
+    """Get list of GPUs with sufficient free memory.
+
+    Args:
+        min_free_memory_gb: Minimum free memory required in GB
+
+    Returns:
+        List of GPU indices with sufficient free memory
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,memory.free', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return list(range(8))  # Fallback: assume all GPUs available
+
+        available = []
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split(',')
+            gpu_idx = int(parts[0].strip())
+            free_mb = float(parts[1].strip())
+            free_gb = free_mb / 1024
+            if free_gb >= min_free_memory_gb:
+                available.append(gpu_idx)
+        return available if available else list(range(8))
+    except Exception:
+        return list(range(8))  # Fallback
+
+
 # Prompt format with <answer> tags for answer extraction
 SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
 You MUST wrap your answer in <answer></answer> tags. Be concise.
@@ -90,13 +124,17 @@ def _baseline_worker(
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load vLLM model (same as utils.py LLMClient)
+    # enforce_eager=True disables CUDA graphs to avoid V1 engine issues
+    # Lower gpu_memory_utilization to handle memory pressure from other processes
     vllm_model = LLM(
         model=model_name,
         tensor_parallel_size=1,
         trust_remote_code=True,
         dtype="half",
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.7,
         disable_log_stats=True,
+        enforce_eager=True,
+        max_num_seqs=256,
     )
     print(f"[Worker {rank}] Model loaded", flush=True)
 
@@ -214,10 +252,19 @@ def run_vllm_baseline(
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = output_dir / "baseline_results.json"
 
-    # Auto-detect GPUs
+    # Auto-detect available GPUs with sufficient free memory
+    available_gpus = _get_available_gpus(min_free_memory_gb=10.0)
+    logger.info(f"Available GPUs with sufficient memory: {available_gpus}")
+
     if num_gpus is None:
-        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        num_gpus = len(available_gpus) if available_gpus else 1
+    else:
+        # Limit to available GPUs
+        num_gpus = min(num_gpus, len(available_gpus))
     num_gpus = max(1, num_gpus)
+
+    # Use only available GPUs
+    gpu_ids = available_gpus[:num_gpus] if available_gpus else list(range(num_gpus))
 
     # Check cache
     if cache_path.exists() and cache_baseline and not force:
@@ -247,20 +294,23 @@ def run_vllm_baseline(
     except RuntimeError:
         pass
 
+    logger.info(f"Starting {num_gpus} workers on GPUs: {gpu_ids}")
+
     # Start all workers (same as exp1_answer_dependency.py)
     processes = []
     for rank in range(num_gpus):
+        gpu_id = gpu_ids[rank]  # Use detected available GPU
         p = mp.Process(
             target=_baseline_worker,
             args=(
-                rank, num_gpus, rank, model_name,
+                rank, num_gpus, gpu_id, model_name,
                 shards[rank], str(output_dir),
                 max_new_tokens, dataset, enable_thinking,
             )
         )
         p.start()
         processes.append(p)
-        logger.info(f"Started worker {rank} on GPU {rank} (PID: {p.pid})")
+        logger.info(f"Started worker {rank} on GPU {gpu_id} (PID: {p.pid})")
 
     # Wait for all workers
     timeout = 3600  # 1 hour max
