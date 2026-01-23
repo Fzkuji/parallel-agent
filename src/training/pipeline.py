@@ -90,9 +90,10 @@ class CrossBatchPipeline:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        # Use single GPU for training (device_map="auto" would split across GPUs causing device mismatch)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            device_map="auto",
+            device_map="cuda:0",
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
         )
         self.model.eval()
@@ -161,6 +162,10 @@ class CrossBatchPipeline:
         else:  # mixer
             self.cross_batch_module = CrossBatchEmbeddingMixer(hidden_size=hidden_size, temperature=1.0)
             logger.info("Created CrossBatchEmbeddingMixer")
+
+        # Move to same device as model
+        device = next(self.model.parameters()).device
+        self.cross_batch_module = self.cross_batch_module.to(device)
 
         num_params = sum(p.numel() for p in self.cross_batch_module.parameters())
         logger.info(f"Cross-batch module parameters: {num_params:,}")
