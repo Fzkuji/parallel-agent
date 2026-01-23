@@ -677,18 +677,30 @@ def aggregate_results(output_dir: Path, num_gpus: int, strategies: List[str]) ->
         if not contexts:
             continue
 
+        total_questions = sum(ctx["num_questions"] for ctx in contexts)
+        total_contexts = len(contexts)
+        total_latency = sum(ctx["latency"] for ctx in contexts)
+        total_prompt_tokens = sum(ctx["prompt_tokens"] for ctx in contexts)
+        total_generated_tokens = sum(ctx["generated_tokens"] for ctx in contexts)
+
+        # Weighted averages for metrics
         total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in contexts)
         total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in contexts)
-        total_questions = sum(ctx["num_questions"] for ctx in contexts)
-        total_latency = sum(ctx["latency"] for ctx in contexts)
+        total_lenient = sum(ctx["metrics"].get("lenient_acc", 0) * ctx["num_questions"] for ctx in contexts)
 
         aggregated[strategy] = {
             "aggregate_metrics": {
                 "strict_acc": total_em / total_questions if total_questions > 0 else 0,
                 "f1": total_f1 / total_questions if total_questions > 0 else 0,
-                "avg_latency": total_latency / len(contexts) if contexts else 0,
-                "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in contexts),
-                "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in contexts),
+                "lenient_acc": total_lenient / total_questions if total_questions > 0 else 0,
+                "avg_latency": total_latency / total_contexts if total_contexts else 0,
+                "total_latency": total_latency,
+                "total_prompt_tokens": total_prompt_tokens,
+                "total_generated_tokens": total_generated_tokens,
+                "avg_prompt_tokens": total_prompt_tokens / total_contexts if total_contexts else 0,
+                "avg_generated_tokens": total_generated_tokens / total_contexts if total_contexts else 0,
+                "num_contexts": total_contexts,
+                "num_questions": total_questions,
             },
             "contexts": contexts,
         }
@@ -808,36 +820,57 @@ def main():
         logger.info(f"Saved results to {cache_path}")
 
     # Print summary
-    _print_summary(all_results, strategies)
+    _print_summary(all_results, strategies, dataset=args.dataset)
 
 
-def _print_summary(all_results: Dict, strategies: List[str]):
+def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squad"):
     """Print summary of results."""
-    logger.info("\n" + "=" * 60)
+    logger.info("\n" + "=" * 90)
     logger.info("RESULTS SUMMARY")
-    logger.info("=" * 60)
+    logger.info("=" * 90)
 
+    # Get sample counts from first strategy
+    first_strategy = next((s for s in strategies if s in all_results), None)
+    if first_strategy:
+        first_metrics = all_results[first_strategy]["aggregate_metrics"]
+        logger.info(f"Contexts: {first_metrics.get('num_contexts', 0)}, Questions: {first_metrics.get('num_questions', 0)}")
+
+    # Detailed per-strategy summary
     for strategy in strategies:
         if strategy not in all_results:
             continue
         metrics = all_results[strategy]["aggregate_metrics"]
         logger.info(f"\n{strategy}:")
-        logger.info(f"  EM:      {metrics['strict_acc']:.4f}")
-        logger.info(f"  F1:      {metrics['f1']:.4f}")
-        logger.info(f"  Latency: {metrics['avg_latency']:.2f}s")
+        logger.info(f"  EM:           {metrics['strict_acc']:.4f}")
+        logger.info(f"  F1:           {metrics['f1']:.4f}")
+        logger.info(f"  Lenient:      {metrics.get('lenient_acc', 0):.4f}")
+        logger.info(f"  Prompt Tok:   {metrics['total_prompt_tokens']:,} (avg: {metrics.get('avg_prompt_tokens', 0):.1f})")
+        logger.info(f"  Gen Tok:      {metrics['total_generated_tokens']:,} (avg: {metrics.get('avg_generated_tokens', 0):.1f})")
+        logger.info(f"  Latency:      {metrics.get('total_latency', 0):.2f}s (avg: {metrics['avg_latency']:.2f}s)")
 
     # Comparison table
-    logger.info("\n" + "-" * 60)
-    logger.info(f"{'Strategy':<15} {'EM':>10} {'F1':>10} {'Latency':>12}")
-    logger.info("-" * 60)
+    logger.info("\n" + "=" * 90)
+    logger.info("=== Aggregate Metrics ===")
+    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'Latency':>10}"
+    separator = "-" * len(header)
+    logger.info(header)
+    logger.info(separator)
 
     for strategy in strategies:
         if strategy not in all_results:
             continue
         metrics = all_results[strategy]["aggregate_metrics"]
-        logger.info(f"{strategy:<15} {metrics['strict_acc']:>10.4f} {metrics['f1']:>10.4f} {metrics['avg_latency']:>10.2f}s")
+        logger.info(
+            f"{strategy:<15} | "
+            f"{metrics['strict_acc']:>6.3f} | "
+            f"{metrics['f1']:>6.3f} | "
+            f"{metrics.get('lenient_acc', 0):>7.3f} | "
+            f"{metrics.get('avg_prompt_tokens', 0):>10.1f} | "
+            f"{metrics.get('avg_generated_tokens', 0):>8.1f} | "
+            f"{metrics['avg_latency']:>8.2f}s"
+        )
 
-    logger.info("=" * 60)
+    logger.info("=" * 90)
 
 
 if __name__ == "__main__":

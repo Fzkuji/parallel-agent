@@ -563,18 +563,30 @@ def run_parallel_eval(
         return {}
 
     # Aggregate metrics
+    total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
+    total_contexts = len(all_contexts)
+    total_latency = sum(ctx["latency"] for ctx in all_contexts)
+    total_prompt_tokens = sum(ctx["prompt_tokens"] for ctx in all_contexts)
+    total_generated_tokens = sum(ctx["generated_tokens"] for ctx in all_contexts)
+
+    # Weighted averages for metrics
     total_em = sum(ctx["metrics"].get("strict_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
     total_f1 = sum(ctx["metrics"].get("f1", 0) * ctx["num_questions"] for ctx in all_contexts)
-    total_questions = sum(ctx["num_questions"] for ctx in all_contexts)
-    total_latency = sum(ctx["latency"] for ctx in all_contexts)
+    total_lenient = sum(ctx["metrics"].get("lenient_acc", 0) * ctx["num_questions"] for ctx in all_contexts)
 
     return {
         "aggregate_metrics": {
             "strict_acc": total_em / total_questions if total_questions > 0 else 0,
             "f1": total_f1 / total_questions if total_questions > 0 else 0,
-            "avg_latency": total_latency / len(all_contexts) if all_contexts else 0,
-            "total_prompt_tokens": sum(ctx["prompt_tokens"] for ctx in all_contexts),
-            "total_generated_tokens": sum(ctx["generated_tokens"] for ctx in all_contexts),
+            "lenient_acc": total_lenient / total_questions if total_questions > 0 else 0,
+            "avg_latency": total_latency / total_contexts if total_contexts else 0,
+            "total_latency": total_latency,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_generated_tokens": total_generated_tokens,
+            "avg_prompt_tokens": total_prompt_tokens / total_contexts if total_contexts else 0,
+            "avg_generated_tokens": total_generated_tokens / total_contexts if total_contexts else 0,
+            "num_contexts": total_contexts,
+            "num_questions": total_questions,
         },
         "contexts": all_contexts,
     }
@@ -655,10 +667,14 @@ def main():
 
         if baseline_results:
             all_results["baseline"] = baseline_results["aggregate_metrics"]
+            m = baseline_results['aggregate_metrics']
             logger.info(f"\nBaseline Results:")
-            logger.info(f"  EM:      {baseline_results['aggregate_metrics']['strict_acc']:.4f}")
-            logger.info(f"  F1:      {baseline_results['aggregate_metrics']['f1']:.4f}")
-            logger.info(f"  Latency: {baseline_results['aggregate_metrics']['avg_latency']:.2f}s")
+            logger.info(f"  EM:           {m['strict_acc']:.4f}")
+            logger.info(f"  F1:           {m['f1']:.4f}")
+            logger.info(f"  Lenient:      {m.get('lenient_acc', 0):.4f}")
+            logger.info(f"  Prompt Tok:   {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
+            logger.info(f"  Gen Tok:      {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
+            logger.info(f"  Latency:      {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
 
     # Step 2: Training (unless eval-only)
     lora_checkpoint_path = args.checkpoint_path
@@ -724,32 +740,62 @@ def main():
 
     if sft_results:
         all_results["sft_lora"] = sft_results["aggregate_metrics"]
+        m = sft_results['aggregate_metrics']
         logger.info(f"\nSFT-LoRA Results:")
-        logger.info(f"  EM:      {sft_results['aggregate_metrics']['strict_acc']:.4f}")
-        logger.info(f"  F1:      {sft_results['aggregate_metrics']['f1']:.4f}")
-        logger.info(f"  Latency: {sft_results['aggregate_metrics']['avg_latency']:.2f}s")
+        logger.info(f"  EM:           {m['strict_acc']:.4f}")
+        logger.info(f"  F1:           {m['f1']:.4f}")
+        logger.info(f"  Lenient:      {m.get('lenient_acc', 0):.4f}")
+        logger.info(f"  Prompt Tok:   {m['total_prompt_tokens']:,} (avg: {m.get('avg_prompt_tokens', 0):.1f})")
+        logger.info(f"  Gen Tok:      {m['total_generated_tokens']:,} (avg: {m.get('avg_generated_tokens', 0):.1f})")
+        logger.info(f"  Latency:      {m.get('total_latency', 0):.2f}s (avg: {m['avg_latency']:.2f}s)")
 
     # Final summary
-    logger.info("\n" + "=" * 60)
+    logger.info("\n" + "=" * 90)
     logger.info("FINAL SUMMARY")
-    logger.info("=" * 60)
+    logger.info("=" * 90)
 
-    logger.info(f"\n{'Strategy':<15} {'EM':>10} {'F1':>10} {'Latency':>12}")
-    logger.info("-" * 50)
+    # Get sample counts
+    for key in ["baseline", "sft_lora"]:
+        if key in all_results:
+            m = all_results[key]
+            logger.info(f"Contexts: {m.get('num_contexts', 0)}, Questions: {m.get('num_questions', 0)}")
+            break
+
+    header = f"{'Strategy':<15} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'Latency':>10}"
+    separator = "-" * len(header)
+    logger.info(header)
+    logger.info(separator)
 
     if "baseline" in all_results:
         m = all_results["baseline"]
-        logger.info(f"{'baseline':<15} {m['strict_acc']:>10.4f} {m['f1']:>10.4f} {m['avg_latency']:>10.2f}s")
+        logger.info(
+            f"{'baseline':<15} | "
+            f"{m['strict_acc']:>6.3f} | "
+            f"{m['f1']:>6.3f} | "
+            f"{m.get('lenient_acc', 0):>7.3f} | "
+            f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
+            f"{m.get('avg_generated_tokens', 0):>8.1f} | "
+            f"{m['avg_latency']:>8.2f}s"
+        )
 
     if "sft_lora" in all_results:
         m = all_results["sft_lora"]
-        logger.info(f"{'sft_lora':<15} {m['strict_acc']:>10.4f} {m['f1']:>10.4f} {m['avg_latency']:>10.2f}s")
+        logger.info(
+            f"{'sft_lora':<15} | "
+            f"{m['strict_acc']:>6.3f} | "
+            f"{m['f1']:>6.3f} | "
+            f"{m.get('lenient_acc', 0):>7.3f} | "
+            f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
+            f"{m.get('avg_generated_tokens', 0):>8.1f} | "
+            f"{m['avg_latency']:>8.2f}s"
+        )
 
         if "baseline" in all_results:
             baseline_m = all_results["baseline"]
             logger.info(f"\nImprovement over baseline:")
-            logger.info(f"  EM:  {m['strict_acc'] - baseline_m['strict_acc']:+.4f}")
-            logger.info(f"  F1:  {m['f1'] - baseline_m['f1']:+.4f}")
+            logger.info(f"  EM:      {m['strict_acc'] - baseline_m['strict_acc']:+.4f}")
+            logger.info(f"  F1:      {m['f1'] - baseline_m['f1']:+.4f}")
+            logger.info(f"  Lenient: {m.get('lenient_acc', 0) - baseline_m.get('lenient_acc', 0):+.4f}")
 
     # Save results
     results_path = output_dir / f"sft_lora_results_{args.dataset}.json"
