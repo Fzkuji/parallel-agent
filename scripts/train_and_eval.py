@@ -324,8 +324,13 @@ def load_or_run_baseline(
     world_size: int,
 ) -> Dict[str, Any]:
     """Load cached baseline or run on all ranks and gather."""
-    # Rank 0 checks cache
-    if rank == 0 and cache_path.exists() and args.cache_baseline:
+    # If --force is specified, delete the cached baseline
+    if rank == 0 and args.force and cache_path.exists():
+        logging.info(f"--force specified, removing cached baseline: {cache_path}")
+        cache_path.unlink()
+
+    # Rank 0 checks cache (only if --force not specified)
+    if rank == 0 and cache_path.exists() and args.cache_baseline and not args.force:
         logging.info(f"Loading cached baseline from {cache_path}")
         with open(cache_path, 'r') as f:
             baseline_results = json.load(f)
