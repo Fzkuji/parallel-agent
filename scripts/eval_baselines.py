@@ -564,6 +564,9 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     dep_generated_tokens = int(dep_metrics.get("generated_tokens", 0))
     dep_latency = dep_metrics.get("latency", 0.0)
 
+    # Debug: print raw edges from LLM
+    print(f"  [collab_llm] LLM generated {len(edges)} edges: {[(e.source, e.target, f'{e.confidence:.2f}') for e in edges[:5]]}{'...' if len(edges) > 5 else ''}", flush=True)
+
     # Select and apply dependencies
     selected = select_dependency_edges(
         dep_question_lookup,
@@ -576,6 +579,9 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     )
     apply_dependencies(dep_question_lookup, selected)
 
+    # Debug: print selected edges and dependencies
+    print(f"  [collab_llm] Selected {len(selected)} edges after filtering", flush=True)
+
     # Build scheduler and get schedule
     scheduler = DependencyScheduler(
         "",  # Empty background, each question has its own context
@@ -587,6 +593,9 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     )
     scheduler.build_dependencies(auto_infer=False)
     schedule = scheduler.schedule()
+
+    # Debug: print schedule
+    print(f"  [collab_llm] Schedule: {len(schedule.batches)} batches", flush=True)
 
     # Generate answers in scheduled order
     answer_records = {}
