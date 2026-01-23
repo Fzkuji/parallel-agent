@@ -8,7 +8,7 @@ This project explores dependency-aware question answering and collaborative gene
 parallel-agent/
 ├── src/                       # Core library
 │   ├── models.py              # Question, StrategyResult, etc.
-│   ├── generators.py          # Dependency generators (Heuristic, LLM, BERT)
+│   ├── generators.py          # Dependency generators (Heuristic, LLM)
 │   ├── prompts.py             # Prompt building utilities
 │   ├── selection.py           # Cost-aware edge selection
 │   ├── utils.py               # Common utilities
@@ -35,11 +35,49 @@ parallel-agent/
 │       ├── trainer.py         # Training utilities
 │       └── eval.py            # Evaluation for cross-batch
 ├── scripts/                   # Runnable scripts
-│   ├── compare_strategies.py  # Multi-strategy comparison
-│   ├── train_cross_batch.py   # Train cross-batch module
-│   ├── run_parallel.py        # Single-context dependency pipeline
-│   └── test_bert_dependencies.py # BERT-based dependency experiments
+│   ├── eval_baselines.py      # Evaluate baseline strategies (vLLM, multi-GPU)
+│   ├── train_and_eval_sft.py  # Train and evaluate SFT-LoRA
+│   ├── compare_strategies.py  # Multi-strategy comparison (all strategies)
+│   ├── train_cross_batch.py   # Train cross-batch module (DDP)
+│   ├── cross_dataset_eval.py  # Cross-dataset generalization evaluation
+│   └── run_parallel.py        # Single-context dependency pipeline
 └── README.md
+```
+
+## Scripts Overview
+
+The project provides multiple scripts for different use cases:
+
+### Evaluation Scripts
+
+| Script | Purpose | Features |
+|--------|---------|----------|
+| `eval_baselines.py` | Evaluate baseline strategies (no training required) | vLLM inference, multi-GPU parallel, result caching |
+| `compare_strategies.py` | Compare all strategies including trained models | HuggingFace inference, supports all strategies, requires checkpoints for trained strategies |
+| `cross_dataset_eval.py` | Cross-dataset generalization evaluation | Evaluate on multiple datasets, supports LoRA and Cross-Batch |
+
+### Training Scripts
+
+| Script | Purpose | Features |
+|--------|---------|----------|
+| `train_and_eval_sft.py` | Train and evaluate SFT-LoRA model | LoRA fine-tuning, multi-GPU evaluation |
+| `train_cross_batch.py` | Train Cross-Batch module | DDP multi-GPU training, multiple module types |
+
+### Which Script to Use?
+
+```
+Need to evaluate baseline strategies (no training)?
+  → Use eval_baselines.py (fastest, vLLM-based)
+
+Need to train a model?
+  → SFT-LoRA: Use train_and_eval_sft.py
+  → Cross-Batch: Use train_cross_batch.py
+
+Need to compare trained models with baselines?
+  → Use compare_strategies.py (supports all strategies)
+
+Need to test generalization across datasets?
+  → Use cross_dataset_eval.py
 ```
 
 ## Strategies Overview
@@ -52,7 +90,6 @@ The main comparison script (`scripts/compare_strategies.py`) supports the follow
 | `sequential` | One question per turn (history grows) |
 | `batch` | All questions answered in one parallel batch |
 | `collab_llm` | Dependency DAG via LLM analysis, answers in dependency order |
-| `collab_bert` | Dependency DAG via BERT attention, answers in dependency order |
 | `collab_hidden` | Cross-batch hidden state mixing during generation (requires trained checkpoint) |
 
 **Note:** The `collab_hidden` strategy requires a trained checkpoint (`--collab-hidden-checkpoint`). It will be automatically skipped if no checkpoint is provided. This strategy is only available with local models, not with API-based inference.
@@ -104,7 +141,7 @@ python scripts/compare_strategies.py \
   --use-api \
   --api-model "qwen/qwen3-30b-a3b" \
   --context-count 10 \
-  --strategies "all_in_one,sequential,batch,collab_llm,collab_bert"
+  --strategies "all_in_one,sequential,batch,collab_llm"
 ```
 
 **Note:** `collab_hidden` is not supported with API inference as it requires access to model hidden states.
@@ -133,7 +170,6 @@ python scripts/compare_strategies.py \
 | `sequential` | Yes | Yes | No |
 | `batch` | Yes | Yes | No |
 | `collab_llm` | Yes | Yes | No |
-| `collab_bert` | Yes | Yes | No |
 | `finetuned` | Yes | No | `--baseline-checkpoint` |
 | `collab_hidden` | Yes | No | `--collab-hidden-checkpoint` |
 | `lora_lmhead` | Yes | No | `--lora-lmhead-checkpoint` |
@@ -146,8 +182,6 @@ python scripts/compare_strategies.py \
 | `--no-llm-deps` | Use heuristic instead of LLM for dependency generation |
 | `--max-dependencies` | Max edges per question |
 | `--min-confidence` | Minimum edge confidence threshold |
-| `--bert-model-name` | BERT model for `collab_bert` (default: `bert-base-uncased`) |
-| `--bert-attention-threshold` | Attention threshold for BERT edges |
 | `--collab-hidden-checkpoint` | Path to trained collab_hidden module checkpoint |
 | `--collab-hidden-mix-method` | Mixing method: `attention` or `mixer` |
 | `--collab-hidden-mix-layer` | Which layer to apply mixing (-1 for last) |
@@ -470,6 +504,124 @@ python scripts/compare_strategies.py \
 | `--lora-lmhead-checkpoint` | Path to LoRA + lm_head checkpoint |
 | `--lora-crossbatch-checkpoint` | Path to LoRA + cross-batch checkpoint |
 
+## Baseline Evaluation (eval_baselines.py)
+
+Fast evaluation of baseline strategies using vLLM with multi-GPU parallelism. No training required.
+
+### Supported Strategies
+
+| Strategy | Description | Token Tracking |
+|----------|-------------|----------------|
+| `all_in_one` | All questions in one prompt | PromptTok = PromptTok_API |
+| `sequential` | One question at a time, with previous answers concatenated | PromptTok_API > PromptTok (includes history) |
+| `batch` | All questions answered in parallel (no history) | PromptTok = PromptTok_API |
+| `collab_llm` | LLM-based dependency ordering with relevant answers | PromptTok_API includes dependency cost |
+
+### Usage
+
+```bash
+# Evaluate all baseline strategies
+python scripts/eval_baselines.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --eval-samples 100 \
+    --strategies all_in_one,sequential,batch,collab_llm \
+    --num-gpus 8
+
+# Evaluate specific strategies with more questions per context
+python scripts/eval_baselines.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --eval-samples 100 \
+    --strategies sequential,collab_llm \
+    --min-questions 5 \
+    --max-questions 10
+```
+
+### Output Metrics
+
+The script outputs a detailed summary table:
+
+```
+=== Results Summary ===
+Strategy        |     EM |     F1 | Lenient | Q/Ctx | PromptTok |   GenTok | PromptTok_API | GenTok_API |   DepTok |  Latency
+-----------------------------------------------------------------------------------------------------------------------------
+all_in_one      |  0.783 |  0.897 |   0.947 |   3.7 |     346.8 |     54.5 |         346.8 |       54.5 |      0.0 |   0.46s
+sequential      |  0.818 |  0.918 |   0.957 |   3.7 |     889.6 |     43.8 |        1020.7 |       43.8 |      0.0 |   0.38s
+batch           |  0.826 |  0.920 |   0.957 |   3.7 |     889.6 |     43.6 |         889.6 |       43.6 |      0.0 |   0.14s
+collab_llm      |  0.826 |  0.920 |   0.957 |   3.7 |     889.6 |     43.6 |        1050.2 |       49.3 |    160.6 |   0.16s
+```
+
+| Column | Description |
+|--------|-------------|
+| Q/Ctx | Average questions per context |
+| PromptTok | Original input tokens (context + question only) |
+| GenTok | Generated tokens |
+| PromptTok_API | Actual API tokens (includes concatenated history for sequential/collab_llm) |
+| GenTok_API | Actual generated tokens (includes dependency generation for collab_llm) |
+| DepTok | Dependency generation tokens (collab_llm only) |
+
+### Key Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--model` | HuggingFace model ID (default: `Qwen/Qwen2.5-7B-Instruct`) |
+| `--dataset` | Dataset: `squad`, `hotpot`, `quac`, `drop`, `triviaqa`, `quality`, `cmb` |
+| `--eval-samples` | Number of contexts to evaluate |
+| `--strategies` | Comma-separated list of strategies |
+| `--num-gpus` | Number of GPUs (auto-detected if not specified) |
+| `--min-questions` / `--max-questions` | Questions per context (default: 3-5) |
+| `--min-free-mem-gb` | Minimum free GPU memory in GB (default: 10) |
+| `--cache` | Enable result caching |
+
+## SFT-LoRA Training (train_and_eval_sft.py)
+
+Train a LoRA adapter on the QA task and evaluate the trained model.
+
+### Usage
+
+```bash
+# Train and evaluate
+python scripts/train_and_eval_sft.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --epochs 3 \
+    --train-samples 1000 \
+    --eval-samples 100 \
+    --num-gpus 8
+
+# Evaluate only (requires trained checkpoint)
+python scripts/train_and_eval_sft.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --eval-only \
+    --checkpoint-path outputs/checkpoints/sft_lora/xxx
+
+# Compare with baseline
+python scripts/train_and_eval_sft.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset squad \
+    --epochs 3 \
+    --compare-baseline
+```
+
+### Key Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--model` | HuggingFace model ID |
+| `--dataset` | Dataset for training and evaluation |
+| `--train-samples` | Number of training samples |
+| `--eval-samples` | Number of evaluation contexts |
+| `--epochs` | Training epochs (default: 3) |
+| `--batch-size` | Training batch size (default: 1) |
+| `--lr` | Learning rate (default: 2e-4) |
+| `--lora-r` | LoRA rank (default: 16) |
+| `--lora-alpha` | LoRA alpha (default: 32) |
+| `--eval-only` | Skip training, only evaluate |
+| `--checkpoint-path` | Path to trained checkpoint |
+| `--compare-baseline` | Also evaluate baseline (no LoRA) |
+
 ## Other Scripts
 
 ### run_parallel.py
@@ -482,20 +634,6 @@ python scripts/run_parallel.py \
   --context-count 1 \
   --min-questions 3 \
   --max-questions 5
-```
-
-### test_bert_dependencies.py
-
-Offline BERT-based dependency experiments.
-
-```bash
-python scripts/test_bert_dependencies.py \
-  --model-name bert-base-uncased \
-  --context-count 4 \
-  --attention-threshold 0.02 \
-  --dependency-threshold 0.02 \
-  --max-dependencies 3 \
-  --show-attention-summary
 ```
 
 ## Evaluation Metrics
