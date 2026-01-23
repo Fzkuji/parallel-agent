@@ -508,15 +508,6 @@ python scripts/compare_strategies.py \
 
 Fast evaluation of baseline strategies using vLLM with multi-GPU parallelism. No training required.
 
-### Supported Strategies
-
-| Strategy | Description | Token Tracking |
-|----------|-------------|----------------|
-| `all_in_one` | All questions in one prompt | PromptTok = PromptTok_API |
-| `sequential` | Multi-turn conversation, context only in first turn | PromptTok_API grows with conversation history |
-| `batch` | All questions answered in parallel (no history) | PromptTok_API = N × (context + question) |
-| `collab_llm` | Multi-turn with LLM-based ordering, dependency answers only | PromptTok_API includes conversation history + dep cost |
-
 ### Usage
 
 ```bash
@@ -527,39 +518,7 @@ python scripts/eval_baselines.py \
     --eval-samples 100 \
     --strategies all_in_one,sequential,batch,collab_llm \
     --num-gpus 8
-
-# Evaluate specific strategies with more questions per context
-python scripts/eval_baselines.py \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --dataset squad \
-    --eval-samples 100 \
-    --strategies sequential,collab_llm \
-    --min-questions 5 \
-    --max-questions 10
 ```
-
-### Output Metrics
-
-The script outputs a detailed summary table:
-
-```
-=== Results Summary ===
-Strategy        |     EM |     F1 | Lenient | Q/Ctx | PromptTok |   GenTok | PromptTok_API | GenTok_API |   DepTok |  Latency
------------------------------------------------------------------------------------------------------------------------------
-all_in_one      |  0.783 |  0.897 |   0.947 |   3.7 |     346.8 |     54.5 |         346.8 |       54.5 |      0.0 |   0.46s
-sequential      |  0.818 |  0.918 |   0.957 |   3.7 |     889.6 |     43.8 |        1020.7 |       43.8 |      0.0 |   0.38s
-batch           |  0.826 |  0.920 |   0.957 |   3.7 |     889.6 |     43.6 |         889.6 |       43.6 |      0.0 |   0.14s
-collab_llm      |  0.826 |  0.920 |   0.957 |   3.7 |     889.6 |     43.6 |        1050.2 |       49.3 |    160.6 |   0.16s
-```
-
-| Column | Description |
-|--------|-------------|
-| Q/Ctx | Average questions per context |
-| PromptTok | Deduplicated input tokens (context counted once + all questions) |
-| GenTok | Generated tokens |
-| PromptTok_API | Actual API tokens (context repeated per call, includes history for sequential/collab_llm) |
-| GenTok_API | Actual generated tokens (includes dependency generation for collab_llm) |
-| DepTok | Dependency generation tokens (collab_llm only) |
 
 ### Key Arguments
 
@@ -571,31 +530,39 @@ collab_llm      |  0.826 |  0.920 |   0.957 |   3.7 |     889.6 |     43.6 |    
 | `--strategies` | Comma-separated list of strategies |
 | `--num-gpus` | Number of GPUs (auto-detected if not specified) |
 | `--min-questions` / `--max-questions` | Questions per context (default: 3-5) |
-| `--min-free-mem-gb` | Minimum free GPU memory in GB (default: 10) |
 | `--cache` | Enable result caching |
 
 ## SFT-LoRA Training (train_and_eval_sft.py)
 
 Train a LoRA adapter on the QA task and evaluate the trained model.
 
+### Training Formats
+
+| Format | Description |
+|--------|-------------|
+| `batch` | Each question is an independent single-turn conversation. Standard SFT training. |
+| `sequential` | Multi-turn conversation format. Context only in first turn, subsequent turns only have questions. Only trains on assistant answer tokens (prompt tokens are masked). |
+
 ### Usage
 
 ```bash
-# Train and evaluate
+# Train with batch format (default)
 python scripts/train_and_eval_sft.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
+    --train-format batch \
     --epochs 3 \
     --train-samples 1000 \
-    --eval-samples 100 \
-    --num-gpus 8
+    --eval-samples 100
 
-# Evaluate only (requires trained checkpoint)
+# Train with sequential format (multi-turn, answer-only training)
 python scripts/train_and_eval_sft.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --dataset squad \
-    --eval-only \
-    --checkpoint-path outputs/checkpoints/sft_lora/xxx
+    --train-format sequential \
+    --epochs 3 \
+    --train-samples 1000 \
+    --eval-samples 100
 
 # Compare with baseline
 python scripts/train_and_eval_sft.py \
@@ -611,11 +578,10 @@ python scripts/train_and_eval_sft.py \
 |----------|-------------|
 | `--model` | HuggingFace model ID |
 | `--dataset` | Dataset for training and evaluation |
+| `--train-format` | Training format: `batch` or `sequential` |
 | `--train-samples` | Number of training samples |
 | `--eval-samples` | Number of evaluation contexts |
 | `--epochs` | Training epochs (default: 3) |
-| `--batch-size` | Training batch size (default: 1) |
-| `--lr` | Learning rate (default: 2e-4) |
 | `--lora-r` | LoRA rank (default: 16) |
 | `--lora-alpha` | LoRA alpha (default: 32) |
 | `--eval-only` | Skip training, only evaluate |
@@ -635,6 +601,57 @@ python scripts/run_parallel.py \
   --min-questions 3 \
   --max-questions 5
 ```
+
+## Token Counting Methodology
+
+The evaluation scripts track two types of token counts:
+
+### PromptTok (Deduplicated Input Tokens)
+
+Represents the unique content that needs to be processed, counting shared content (like context) only once.
+
+**Calculation:**
+- First turn: `system_prompt + context + first_question + chat_template_overhead`
+- Each subsequent turn: `question_text + chat_template_overhead_per_turn`
+
+For multi-turn strategies (sequential, collab_llm), the chat template overhead per turn is measured by comparing:
+```
+two_turn_template = [system, user1, assistant1, user2]
+one_turn_template = [system, user1, assistant1]
+overhead = len(two_turn_template) - len(one_turn_template)
+```
+
+This ensures accurate accounting of chat template markers (e.g., `<|im_start|>user\n...<|im_end|>`) for each turn.
+
+### PromptTok_API (Actual API Tokens)
+
+Represents the actual tokens sent to the model API for each call:
+
+| Strategy | PromptTok_API Calculation |
+|----------|--------------------------|
+| `all_in_one` | Single call with all questions = PromptTok |
+| `batch` | N independent calls, each with full context = N × (context + question) |
+| `sequential` | Growing conversation history (turn N includes all previous turns) |
+| `collab_llm` | Similar to sequential + dependency generation overhead |
+
+### Output Table Columns
+
+```
+Strategy   | PromptTok |   GenTok | PromptTok_API | GenTok_API |   DepTok
+-----------+-----------+----------+---------------+------------+---------
+all_in_one |     346.8 |     54.5 |         346.8 |       54.5 |      0.0
+sequential |     400.2 |     43.8 |        1020.7 |       43.8 |      0.0
+batch      |     400.2 |     43.6 |        1282.4 |       43.6 |      0.0
+collab_llm |     400.2 |     43.6 |        1050.2 |       49.3 |    160.6
+```
+
+| Column | Description |
+|--------|-------------|
+| PromptTok | Deduplicated input (context once + questions with template overhead) |
+| GenTok | Generated answer tokens |
+| PromptTok_API | Actual tokens sent to API (includes repeated context/history) |
+| GenTok_API | Actual generated tokens (includes dependency generation) |
+| DepTok | Dependency generation tokens (collab_llm only) |
 
 ## Evaluation Metrics
 

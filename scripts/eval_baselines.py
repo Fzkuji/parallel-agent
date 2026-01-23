@@ -423,32 +423,66 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
     ]
 
     # Calculate deduplicated prompt tokens for reporting
-    # Context (once) + all questions + all answers
-    context_user = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}" if items else ""
-    first_turn_messages = [
+    # For sequential multi-turn: context (once) + all questions + chat template overhead per turn
+    # We measure the incremental cost of each turn (user message + template overhead)
+    # without counting the assistant responses (which are generated, not input)
+
+    # Turn 1: system + user(context + Q1) + generation_prompt
+    first_user = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
+    first_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": context_user},
+        {"role": "user", "content": first_user},
     ]
     try:
-        first_turn_full = tokenizer.apply_chat_template(
-            first_turn_messages, tokenize=False, add_generation_prompt=True,
+        first_full = tokenizer.apply_chat_template(
+            first_messages, tokenize=False, add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
     except TypeError:
-        first_turn_full = tokenizer.apply_chat_template(
-            first_turn_messages, tokenize=False, add_generation_prompt=True,
+        first_full = tokenizer.apply_chat_template(
+            first_messages, tokenize=False, add_generation_prompt=True,
         )
-    # Base tokens = first turn (includes context)
-    base_prompt_tokens = len(tokenizer.encode(first_turn_full))
+    first_turn_tokens = len(tokenizer.encode(first_full))
 
-    # Additional question tokens (Q2, Q3, ... without context)
-    additional_question_tokens = 0
+    # For subsequent turns, measure the incremental token cost
+    # = new user message + its chat template markers (not the history)
+    # We do this by comparing: [sys, user, assistant, user2] vs [sys, user, assistant]
+    # The difference gives us the cost of adding user2 with its template markers
+    additional_turn_tokens = 0
     for item in items[1:]:
-        question_only = f"Question: {item['question']}"
-        additional_question_tokens += len(tokenizer.encode(question_only))
+        question_content = f"Question: {item['question']}"
+        # Build a two-turn conversation to measure the incremental cost
+        two_turn_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "dummy"},  # First user message
+            {"role": "assistant", "content": "dummy"},  # First assistant response
+            {"role": "user", "content": question_content},  # Second user message (what we want to measure)
+        ]
+        one_turn_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "dummy"},
+            {"role": "assistant", "content": "dummy"},
+        ]
+        try:
+            two_turn_full = tokenizer.apply_chat_template(
+                two_turn_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            one_turn_full = tokenizer.apply_chat_template(
+                one_turn_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            two_turn_full = tokenizer.apply_chat_template(
+                two_turn_messages, tokenize=False, add_generation_prompt=True,
+            )
+            one_turn_full = tokenizer.apply_chat_template(
+                one_turn_messages, tokenize=False, add_generation_prompt=True,
+            )
+        # Incremental cost = tokens added by the second user message + its template
+        additional_turn_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
 
-    # Deduplicated total: first turn + additional questions
-    total_prompt_tokens = base_prompt_tokens + additional_question_tokens
+    total_prompt_tokens = first_turn_tokens + additional_turn_tokens
 
     for i, item in enumerate(items):
         if i == 0:
@@ -503,32 +537,66 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
-    # Calculate deduplicated prompt tokens: context (once) + all questions
+    # Calculate deduplicated prompt tokens: context (once) + all questions + chat template overhead
+    # For batch: each question is independent, but we report deduplicated tokens
+    # = first question (full prompt with context) + incremental cost for each additional question
+    # This makes it comparable with sequential strategy
     context = items[0]["context"] if items else ""
-    context_prompt = f"Passage:\n{context}"
-    context_messages = [
+
+    # First question: full prompt with context
+    first_prompt = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
+    first_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": context_prompt},
+        {"role": "user", "content": first_prompt},
     ]
     try:
-        context_full = tokenizer.apply_chat_template(
-            context_messages, tokenize=False, add_generation_prompt=True,
+        first_full = tokenizer.apply_chat_template(
+            first_messages, tokenize=False, add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
     except TypeError:
-        context_full = tokenizer.apply_chat_template(
-            context_messages, tokenize=False, add_generation_prompt=True,
+        first_full = tokenizer.apply_chat_template(
+            first_messages, tokenize=False, add_generation_prompt=True,
         )
-    context_tokens = len(tokenizer.encode(context_full))
+    first_question_tokens = len(tokenizer.encode(first_full))
 
-    # Count question tokens (sum of all questions, without context)
-    total_question_tokens = 0
-    for item in items:
-        question_only = f"Question: {item['question']}"
-        total_question_tokens += len(tokenizer.encode(question_only))
+    # For additional questions, measure the incremental cost of just the question
+    # (without context, which is counted once)
+    # We use the same method as sequential: measure template overhead per question
+    additional_question_tokens = 0
+    for item in items[1:]:
+        question_content = f"Question: {item['question']}"
+        # Build a two-turn conversation to measure the incremental cost
+        two_turn_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "dummy"},
+            {"role": "assistant", "content": "dummy"},
+            {"role": "user", "content": question_content},
+        ]
+        one_turn_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "dummy"},
+            {"role": "assistant", "content": "dummy"},
+        ]
+        try:
+            two_turn_full = tokenizer.apply_chat_template(
+                two_turn_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            one_turn_full = tokenizer.apply_chat_template(
+                one_turn_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            two_turn_full = tokenizer.apply_chat_template(
+                two_turn_messages, tokenize=False, add_generation_prompt=True,
+            )
+            one_turn_full = tokenizer.apply_chat_template(
+                one_turn_messages, tokenize=False, add_generation_prompt=True,
+            )
+        additional_question_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
 
-    # Deduplicated total: context (once) + all questions
-    deduplicated_prompt_tokens = context_tokens + total_question_tokens
+    deduplicated_prompt_tokens = first_question_tokens + additional_question_tokens
 
     prompts = []
     for item in items:
@@ -642,7 +710,8 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
     # Debug: print schedule
     print(f"  [collab_llm] Schedule: {len(schedule.batches)} batches", flush=True)
 
-    # Calculate deduplicated prompt tokens: context (once) + all questions
+    # Calculate deduplicated prompt tokens: context (once) + all questions + chat template overhead
+    # Same method as sequential: measure incremental cost per turn
     context = items[0]["context"] if items else ""
 
     # First question includes context
@@ -661,16 +730,44 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
         first_full = tokenizer.apply_chat_template(
             first_messages, tokenize=False, add_generation_prompt=True,
         )
-    base_prompt_tokens = len(tokenizer.encode(first_full))
+    first_turn_tokens = len(tokenizer.encode(first_full))
 
-    # Additional question tokens (without context)
-    additional_question_tokens = 0
+    # Additional question tokens with chat template overhead
+    additional_turn_tokens = 0
     for item in items[1:]:
-        question_only = f"Question: {item['question']}"
-        additional_question_tokens += len(tokenizer.encode(question_only))
+        question_content = f"Question: {item['question']}"
+        # Build a two-turn conversation to measure the incremental cost
+        two_turn_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "dummy"},
+            {"role": "assistant", "content": "dummy"},
+            {"role": "user", "content": question_content},
+        ]
+        one_turn_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "dummy"},
+            {"role": "assistant", "content": "dummy"},
+        ]
+        try:
+            two_turn_full = tokenizer.apply_chat_template(
+                two_turn_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            one_turn_full = tokenizer.apply_chat_template(
+                one_turn_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            two_turn_full = tokenizer.apply_chat_template(
+                two_turn_messages, tokenize=False, add_generation_prompt=True,
+            )
+            one_turn_full = tokenizer.apply_chat_template(
+                one_turn_messages, tokenize=False, add_generation_prompt=True,
+            )
+        additional_turn_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
 
-    # Deduplicated total: first turn (with context) + additional questions
-    deduplicated_prompt_tokens = base_prompt_tokens + additional_question_tokens
+    # Deduplicated total: first turn (with context) + additional questions with template overhead
+    deduplicated_prompt_tokens = first_turn_tokens + additional_turn_tokens
 
     # Generate answers in scheduled order using multi-turn conversation
     # Each question in the schedule order becomes a turn in the conversation

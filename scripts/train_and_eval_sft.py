@@ -43,6 +43,12 @@ def parse_args():
     parser.add_argument("--min-questions", type=int, default=3)
     parser.add_argument("--max-questions", type=int, default=5)
 
+    # Training format
+    parser.add_argument("--train-format", type=str, default="batch",
+                       choices=["batch", "sequential"],
+                       help="Training format: 'batch' (each question independent) or "
+                            "'sequential' (multi-turn conversation, train answer only)")
+
     # Training
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -190,8 +196,14 @@ Question: What color is the sky?
 <answer>blue</answer>"""
 
 
-def prepare_training_data(train_groups: List[Dict], tokenizer, max_seq_length: int) -> List[Dict]:
-    """Prepare training data in instruction format for SFT."""
+def prepare_batch_training_data(train_groups: List[Dict], tokenizer, max_seq_length: int) -> List[Dict]:
+    """Prepare training data in batch format: each question is independent.
+
+    Each training example is a single-turn conversation:
+    - System: SYSTEM_PROMPT
+    - User: Passage + Question
+    - Assistant: <answer>...</answer>
+    """
     training_examples = []
 
     for group in train_groups:
@@ -233,6 +245,219 @@ def prepare_training_data(train_groups: List[Dict], tokenizer, max_seq_length: i
     return training_examples
 
 
+def prepare_sequential_training_data(train_groups: List[Dict], tokenizer, max_seq_length: int) -> List[Dict]:
+    """Prepare training data in sequential (multi-turn) format.
+
+    Each training example is a multi-turn conversation where:
+    - Turn 1: User provides context + Q1, Assistant answers A1
+    - Turn 2: User provides Q2 (no context), Assistant answers A2
+    - ...
+
+    Only the assistant's answer portions are trained (labels masked for prompts).
+    This mirrors the sequential evaluation strategy.
+    """
+    training_examples = []
+
+    for group in train_groups:
+        items = _context_to_items(group)
+        if not items:
+            continue
+
+        # Get context from first item (all items in a group share the same context)
+        context = items[0]["context"]
+
+        # Build multi-turn conversation
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        for i, item in enumerate(items):
+            question = item["question"]
+            references = item.get("references", [])
+            if not references:
+                continue
+            answer = references[0]
+
+            if i == 0:
+                # First turn: include context
+                user_content = f"Passage:\n{context}\n\nQuestion: {question}"
+            else:
+                # Subsequent turns: only question (context already in history)
+                user_content = f"Question: {question}"
+
+            assistant_content = f"<answer>{answer}</answer>"
+
+            messages.append({"role": "user", "content": user_content})
+            messages.append({"role": "assistant", "content": assistant_content})
+
+        # Only add if we have at least one QA pair
+        if len(messages) > 1:
+            # Format using chat template
+            try:
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=False
+                )
+            except Exception:
+                # Fallback format
+                parts = []
+                for msg in messages:
+                    role = msg["role"].capitalize()
+                    content = msg["content"]
+                    parts.append(f"{role}: {content}")
+                text = "\n\n".join(parts)
+
+            # Check sequence length
+            token_count = len(tokenizer.encode(text))
+            if token_count <= max_seq_length:
+                training_examples.append({
+                    "text": text,
+                    "qids": [item["qid"] for item in items if item.get("references")],
+                    "num_turns": len([m for m in messages if m["role"] == "assistant"]),
+                })
+            else:
+                # If too long, fall back to individual questions
+                for item in items:
+                    question = item["question"]
+                    references = item.get("references", [])
+                    if not references:
+                        continue
+                    answer = references[0]
+
+                    user_content = f"Passage:\n{context}\n\nQuestion: {question}"
+                    assistant_content = f"<answer>{answer}</answer>"
+
+                    single_messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": assistant_content},
+                    ]
+
+                    try:
+                        single_text = tokenizer.apply_chat_template(
+                            single_messages, tokenize=False, add_generation_prompt=False
+                        )
+                    except Exception:
+                        single_text = f"System: {SYSTEM_PROMPT}\n\nUser: {user_content}\n\nAssistant: {assistant_content}"
+
+                    training_examples.append({
+                        "text": single_text,
+                        "qids": [item["qid"]],
+                        "num_turns": 1,
+                    })
+
+    return training_examples
+
+
+def prepare_training_data(
+    train_groups: List[Dict],
+    tokenizer,
+    max_seq_length: int,
+    train_format: str = "batch"
+) -> List[Dict]:
+    """Prepare training data based on the specified format.
+
+    Args:
+        train_groups: List of training context groups
+        tokenizer: HuggingFace tokenizer
+        max_seq_length: Maximum sequence length
+        train_format: "batch" or "sequential"
+
+    Returns:
+        List of training examples with "text" field
+    """
+    if train_format == "sequential":
+        return prepare_sequential_training_data(train_groups, tokenizer, max_seq_length)
+    else:
+        return prepare_batch_training_data(train_groups, tokenizer, max_seq_length)
+
+
+class DataCollatorForCausalLMWithMasking:
+    """Data collator that masks non-answer tokens in the labels.
+
+    For SFT training, we want to only compute loss on the assistant's response tokens,
+    not on the system/user prompt tokens. This collator:
+    1. Creates labels as a copy of input_ids
+    2. Masks (sets to -100) all tokens before each assistant response
+    """
+
+    def __init__(self, tokenizer, assistant_token_pattern: str = "<|im_start|>assistant"):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id
+        # Find the token pattern that indicates assistant turn start
+        self.assistant_token_pattern = assistant_token_pattern
+
+    def __call__(self, features: List[Dict]) -> Dict:
+        import torch
+
+        # Stack input_ids and attention_mask
+        input_ids = torch.stack([torch.tensor(f["input_ids"]) for f in features])
+        attention_mask = torch.stack([torch.tensor(f["attention_mask"]) for f in features])
+
+        # Create labels - mask everything except assistant responses
+        labels = input_ids.clone()
+
+        # Find assistant start tokens and mask everything before them
+        for i in range(labels.shape[0]):
+            # Decode to find assistant positions (more robust than token matching)
+            text = self.tokenizer.decode(input_ids[i])
+
+            # Find all assistant turn positions
+            # For Qwen format: <|im_start|>assistant\n....<|im_end|>
+            # We want to keep only the content after <|im_start|>assistant\n
+            assistant_marker = "<|im_start|>assistant"
+            end_marker = "<|im_end|>"
+
+            # Start by masking everything
+            labels[i] = torch.full_like(labels[i], -100)
+
+            # Find positions to unmask (assistant content only)
+            current_pos = 0
+            text_so_far = ""
+            char_to_token = []
+
+            # Build character to token mapping
+            for token_idx in range(len(input_ids[i])):
+                token_text = self.tokenizer.decode([input_ids[i][token_idx]])
+                for _ in token_text:
+                    char_to_token.append(token_idx)
+                text_so_far += token_text
+
+            # Find assistant responses and unmask them
+            search_pos = 0
+            while True:
+                assistant_start = text_so_far.find(assistant_marker, search_pos)
+                if assistant_start == -1:
+                    break
+
+                # Find the newline after assistant marker
+                content_start = text_so_far.find("\n", assistant_start)
+                if content_start == -1:
+                    break
+                content_start += 1  # Skip the newline
+
+                # Find the end marker
+                content_end = text_so_far.find(end_marker, content_start)
+                if content_end == -1:
+                    content_end = len(text_so_far)
+
+                # Map character positions to token positions
+                if content_start < len(char_to_token) and content_end <= len(char_to_token):
+                    token_start = char_to_token[content_start] if content_start < len(char_to_token) else len(input_ids[i])
+                    token_end = char_to_token[content_end - 1] + 1 if content_end <= len(char_to_token) and content_end > 0 else len(input_ids[i])
+
+                    # Unmask assistant content tokens
+                    labels[i, token_start:token_end] = input_ids[i, token_start:token_end]
+
+                search_pos = content_end + 1
+
+            # Also mask padding tokens
+            labels[i][input_ids[i] == self.pad_token_id] = -100
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
 def train_lora(
     model_name: str,
     train_groups: List[Dict],
@@ -248,8 +473,13 @@ def train_lora(
     lora_dropout: float,
     lora_target_modules: List[str],
     seed: int,
+    train_format: str = "batch",
 ) -> str:
-    """Train LoRA adapter using SFT."""
+    """Train LoRA adapter using SFT.
+
+    Args:
+        train_format: "batch" (each question independent) or "sequential" (multi-turn)
+    """
     import torch
     from transformers import (
         AutoTokenizer,
@@ -288,9 +518,18 @@ def train_lora(
     model.print_trainable_parameters()
 
     # Prepare training data
-    logger.info("Preparing training data...")
-    training_examples = prepare_training_data(train_groups, tokenizer, max_seq_length)
+    logger.info(f"Preparing training data (format: {train_format})...")
+    training_examples = prepare_training_data(train_groups, tokenizer, max_seq_length, train_format)
     logger.info(f"Prepared {len(training_examples)} training examples")
+
+    # Determine columns to remove
+    columns_to_remove = ["text"]
+    if "qid" in training_examples[0]:
+        columns_to_remove.append("qid")
+    if "qids" in training_examples[0]:
+        columns_to_remove.append("qids")
+    if "num_turns" in training_examples[0]:
+        columns_to_remove.append("num_turns")
 
     # Tokenize
     def tokenize_function(examples):
@@ -305,14 +544,18 @@ def train_lora(
     tokenized_dataset = dataset.map(
         tokenize_function,
         batched=True,
-        remove_columns=["text", "qid"],
+        remove_columns=columns_to_remove,
     )
 
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    # Data collator - use custom masking for sequential format
+    if train_format == "sequential":
+        logger.info("Using custom data collator with assistant-only masking")
+        data_collator = DataCollatorForCausalLMWithMasking(tokenizer)
+    else:
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False,
+        )
 
     # Training arguments
     training_args = TrainingArguments(
@@ -364,6 +607,7 @@ def _eval_worker(
     enable_thinking: bool,
     lora_checkpoint_path: Optional[str],
     strategy_name: str,
+    eval_format: str = "batch",
 ):
     """Worker process for evaluation on a single GPU."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -420,6 +664,8 @@ def _eval_worker(
         if idx % 10 == 0:
             print(f"[Worker {rank}] Processing {idx}/{len(eval_contexts)}", flush=True)
 
+        context = items[0]["context"]
+
         # Build question lookup
         question_lookup = {
             item["qid"]: Question(
@@ -433,67 +679,242 @@ def _eval_worker(
             for item in items
         }
 
-        # Batch inference
-        prompts = []
-        for item in items:
-            prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
+        if eval_format == "sequential":
+            # Sequential evaluation: multi-turn conversation
+            answer_records = {}
+            total_latency = 0
+            total_prompt_tokens_api = 0
+            total_generated_tokens = 0
 
+            # Build conversation history
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+            # Calculate deduplicated prompt tokens (context once + all questions with template overhead)
+            first_user = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
+            first_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": first_user},
+            ]
             try:
-                full_prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                first_full = tokenizer.apply_chat_template(
+                    first_messages, tokenize=False, add_generation_prompt=True,
                     enable_thinking=enable_thinking,
                 )
             except TypeError:
-                full_prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                first_full = tokenizer.apply_chat_template(
+                    first_messages, tokenize=False, add_generation_prompt=True,
                 )
-            prompts.append(full_prompt)
+            first_turn_tokens = len(tokenizer.encode(first_full))
 
-        # Tokenize
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            # For subsequent turns, measure incremental token cost with template overhead
+            additional_turn_tokens = 0
+            for item in items[1:]:
+                question_content = f"Question: {item['question']}"
+                # Measure incremental cost by comparing two-turn vs one-turn template
+                two_turn_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "dummy"},
+                    {"role": "assistant", "content": "dummy"},
+                    {"role": "user", "content": question_content},
+                ]
+                one_turn_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "dummy"},
+                    {"role": "assistant", "content": "dummy"},
+                ]
+                try:
+                    two_turn_full = tokenizer.apply_chat_template(
+                        two_turn_messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                    one_turn_full = tokenizer.apply_chat_template(
+                        one_turn_messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                except TypeError:
+                    two_turn_full = tokenizer.apply_chat_template(
+                        two_turn_messages, tokenize=False, add_generation_prompt=True,
+                    )
+                    one_turn_full = tokenizer.apply_chat_template(
+                        one_turn_messages, tokenize=False, add_generation_prompt=True,
+                    )
+                additional_turn_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
 
-        # Generate
-        start_time = time.perf_counter()
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        latency = time.perf_counter() - start_time
+            total_prompt_tokens = first_turn_tokens + additional_turn_tokens
 
-        # Decode and extract answers
-        answer_records = {}
-        total_prompt_tokens = inputs["input_ids"].numel()
-        total_generated_tokens = 0
+            for i, item in enumerate(items):
+                if i == 0:
+                    user_content = f"Passage:\n{context}\n\nQuestion: {item['question']}"
+                else:
+                    user_content = f"Question: {item['question']}"
 
-        for i, item in enumerate(items):
-            input_len = inputs["input_ids"][i].shape[0]
-            generated = outputs[i][input_len:]
-            total_generated_tokens += generated.shape[0]
+                messages.append({"role": "user", "content": user_content})
 
-            raw_text = tokenizer.decode(generated, skip_special_tokens=True)
-            final_answer, strict_valid = extract_answer(raw_text, dataset)
-            answer_records[item["qid"]] = (final_answer, strict_valid)
+                try:
+                    full_prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                except TypeError:
+                    full_prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                    )
 
-        metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+                inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048)
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-        shard_results["contexts"].append({
-            "title": title,
-            "metrics": metrics,
-            "latency": latency,
-            "prompt_tokens": total_prompt_tokens,
-            "generated_tokens": total_generated_tokens,
-            "prompt_tokens_api": total_prompt_tokens,  # Same as original for batch inference
-            "generated_tokens_api": total_generated_tokens,  # Same as original
-            "num_questions": len(items),
-        })
+                start_time = time.perf_counter()
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                total_latency += time.perf_counter() - start_time
+
+                input_len = inputs["input_ids"].shape[1]
+                generated = outputs[0][input_len:]
+                total_generated_tokens += generated.shape[0]
+                total_prompt_tokens_api += input_len
+
+                raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+                final_answer, strict_valid = extract_answer(raw_text, dataset)
+                answer_records[item["qid"]] = (final_answer, strict_valid)
+
+                # Add assistant response to history
+                messages.append({"role": "assistant", "content": raw_text})
+
+            metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+
+            shard_results["contexts"].append({
+                "title": title,
+                "metrics": metrics,
+                "latency": total_latency,
+                "prompt_tokens": total_prompt_tokens,
+                "generated_tokens": total_generated_tokens,
+                "prompt_tokens_api": total_prompt_tokens_api,
+                "generated_tokens_api": total_generated_tokens,
+                "num_questions": len(items),
+            })
+        else:
+            # Batch inference (default)
+            # Calculate deduplicated prompt tokens (context once + all questions with template overhead)
+            first_prompt = f"Passage:\n{context}\n\nQuestion: {items[0]['question']}"
+            first_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": first_prompt},
+            ]
+            try:
+                first_full = tokenizer.apply_chat_template(
+                    first_messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                first_full = tokenizer.apply_chat_template(
+                    first_messages, tokenize=False, add_generation_prompt=True,
+                )
+            first_question_tokens = len(tokenizer.encode(first_full))
+
+            # For additional questions, measure incremental cost with template overhead
+            additional_question_tokens = 0
+            for item in items[1:]:
+                question_content = f"Question: {item['question']}"
+                two_turn_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "dummy"},
+                    {"role": "assistant", "content": "dummy"},
+                    {"role": "user", "content": question_content},
+                ]
+                one_turn_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "dummy"},
+                    {"role": "assistant", "content": "dummy"},
+                ]
+                try:
+                    two_turn_full = tokenizer.apply_chat_template(
+                        two_turn_messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                    one_turn_full = tokenizer.apply_chat_template(
+                        one_turn_messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                except TypeError:
+                    two_turn_full = tokenizer.apply_chat_template(
+                        two_turn_messages, tokenize=False, add_generation_prompt=True,
+                    )
+                    one_turn_full = tokenizer.apply_chat_template(
+                        one_turn_messages, tokenize=False, add_generation_prompt=True,
+                    )
+                additional_question_tokens += len(tokenizer.encode(two_turn_full)) - len(tokenizer.encode(one_turn_full))
+
+            deduplicated_prompt_tokens = first_question_tokens + additional_question_tokens
+
+            prompts = []
+            for item in items:
+                prompt = f"Passage:\n{item['context']}\n\nQuestion: {item['question']}"
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ]
+
+                try:
+                    full_prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                    )
+                except TypeError:
+                    full_prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                    )
+                prompts.append(full_prompt)
+
+            # Tokenize
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+            # Generate
+            start_time = time.perf_counter()
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            latency = time.perf_counter() - start_time
+
+            # Decode and extract answers
+            answer_records = {}
+            total_prompt_tokens_api = 0
+            total_generated_tokens = 0
+
+            for i, item in enumerate(items):
+                # Count non-padding tokens for API cost
+                attention_mask = inputs["attention_mask"][i]
+                input_len = attention_mask.sum().item()
+                total_prompt_tokens_api += input_len
+
+                generated = outputs[i][inputs["input_ids"][i].shape[0]:]
+                total_generated_tokens += generated.shape[0]
+
+                raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+                final_answer, strict_valid = extract_answer(raw_text, dataset)
+                answer_records[item["qid"]] = (final_answer, strict_valid)
+
+            metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+
+            shard_results["contexts"].append({
+                "title": title,
+                "metrics": metrics,
+                "latency": latency,
+                "prompt_tokens": deduplicated_prompt_tokens,  # Deduplicated: context once + questions
+                "generated_tokens": total_generated_tokens,
+                "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (context repeated N times)
+                "generated_tokens_api": total_generated_tokens,
+                "num_questions": len(items),
+            })
 
     # Save results
     os.makedirs(output_dir, exist_ok=True)
@@ -515,8 +936,13 @@ def run_parallel_eval(
     strategy_name: str,
     num_gpus: int,
     gpu_ids: List[int],
+    eval_format: str = "batch",
 ) -> Dict[str, Any]:
-    """Run parallel evaluation across multiple GPUs."""
+    """Run parallel evaluation across multiple GPUs.
+
+    Args:
+        eval_format: "batch" (each question independent) or "sequential" (multi-turn)
+    """
     # Shard data across GPUs
     shards = [[] for _ in range(num_gpus)]
     for i, ctx in enumerate(eval_contexts):
@@ -527,7 +953,7 @@ def run_parallel_eval(
     except RuntimeError:
         pass
 
-    logger.info(f"Starting {num_gpus} eval workers on GPUs: {gpu_ids}")
+    logger.info(f"Starting {num_gpus} eval workers on GPUs: {gpu_ids} (eval_format: {eval_format})")
 
     processes = []
     for rank in range(num_gpus):
@@ -538,6 +964,7 @@ def run_parallel_eval(
                 rank, num_gpus, gpu_id, model_name,
                 shards[rank], output_dir, max_new_tokens, dataset,
                 enable_thinking, lora_checkpoint_path, strategy_name,
+                eval_format,
             ),
         )
         p.start()
@@ -657,6 +1084,7 @@ def main():
             "lora_alpha": args.lora_alpha,
             "train_samples": args.train_samples,
             "eval_samples": args.eval_samples,
+            "train_format": args.train_format,
         },
     }
 
@@ -677,6 +1105,7 @@ def main():
             strategy_name="baseline",
             num_gpus=num_gpus,
             gpu_ids=gpu_ids,
+            eval_format=args.train_format,  # Use same format as training
         )
 
         if baseline_results:
@@ -715,10 +1144,11 @@ def main():
         lora_target_modules = [m.strip() for m in args.lora_target_modules.split(',')]
 
         # Train
+        logger.info(f"Training format: {args.train_format}")
         lora_checkpoint_path = train_lora(
             model_name=args.model,
             train_groups=train_groups,
-            output_dir=str(checkpoint_dir / args.dataset / args.model.replace('/', '_')),
+            output_dir=str(checkpoint_dir / args.dataset / args.model.replace('/', '_') / args.train_format),
             epochs=args.epochs,
             batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -730,6 +1160,7 @@ def main():
             lora_dropout=args.lora_dropout,
             lora_target_modules=lora_target_modules,
             seed=args.seed,
+            train_format=args.train_format,
         )
 
     if not lora_checkpoint_path:
@@ -752,6 +1183,7 @@ def main():
         strategy_name="sft_lora",
         num_gpus=num_gpus,
         gpu_ids=gpu_ids,
+        eval_format=args.train_format,  # Use same format as training
     )
 
     if sft_results:
