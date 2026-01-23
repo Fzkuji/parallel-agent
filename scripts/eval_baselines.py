@@ -272,6 +272,10 @@ def _eval_worker(
                 "prompt_tokens_api": result.get("prompt_tokens_api", result["prompt_tokens"]),
                 "generated_tokens_api": result.get("generated_tokens_api", result["generated_tokens"]),
                 "num_questions": len(items),
+                # Dependency generation cost (for collab_llm)
+                "dep_prompt_tokens": result.get("dep_prompt_tokens", 0),
+                "dep_generated_tokens": result.get("dep_generated_tokens", 0),
+                "dep_latency": result.get("dep_latency", 0),
             })
 
     # Save results
