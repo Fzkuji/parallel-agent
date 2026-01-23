@@ -127,6 +127,8 @@ def baseline_worker(
     os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
     os.environ["TQDM_DISABLE"] = "1"
 
+    # Debug: confirm GPU assignment
+    print(f"[Worker {rank}] PID={os.getpid()}, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}", flush=True)
     logger.info(f"[Worker {rank}] GPU {gpu_id}: Starting baseline, {len(eval_contexts)} contexts")
 
     # Now import vLLM and torch
@@ -136,6 +138,10 @@ def baseline_worker(
     from src.models import Question
     from src.evaluation import evaluate_predictions
     from src.inference import extract_answer
+
+    # Debug: verify CUDA setup after import
+    if torch.cuda.is_available():
+        print(f"[Worker {rank}] torch.cuda.device_count()={torch.cuda.device_count()}, current_device={torch.cuda.current_device()}", flush=True)
 
     # Load model
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -282,8 +288,12 @@ def run_baseline_parallel(
         except RuntimeError:
             pass
 
+        logger.info(f"Spawning {num_gpus} worker processes...")
+
         processes = []
         for rank in range(num_gpus):
+            shard_size = len(shards[rank])
+            logger.info(f"Creating worker {rank} for GPU {rank} with {shard_size} contexts")
             p = mp.Process(
                 target=baseline_worker,
                 args=(
@@ -295,6 +305,8 @@ def run_baseline_parallel(
             p.start()
             processes.append(p)
             logger.info(f"Started baseline worker {rank} on GPU {rank} (PID: {p.pid})")
+
+        logger.info(f"All {len(processes)} workers started, waiting for completion...")
 
         # Wait for all workers with timeout
         timeout = 3600  # 1 hour max
