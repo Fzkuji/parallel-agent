@@ -792,6 +792,8 @@ def _eval_worker(
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Set left padding for decoder-only models
+    tokenizer.padding_side = "left"
 
     # Load model (with LoRA if specified)
     if lora_checkpoint_path:
