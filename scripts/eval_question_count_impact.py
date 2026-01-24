@@ -337,14 +337,28 @@ def main():
 
         results_by_count[q_count] = {}
 
-        # Step 1: Pretrained evaluation
-        if not args.skip_pretrained:
+        # Step 1: Pretrained evaluation (or load from cache)
+        pretrained_file = output_dir / f"pretrained_q{q_count}.json"
+        if pretrained_file.exists():
+            # Load existing results
+            logger.info(f"Loading pretrained results from {pretrained_file}")
+            with open(pretrained_file, 'r') as f:
+                results_by_count[q_count]["pretrained"] = json.load(f)
+        elif not args.skip_pretrained:
+            # Run evaluation
             pretrained_results = run_pretrained_eval(args, q_count, output_dir)
             if pretrained_results:
                 results_by_count[q_count]["pretrained"] = pretrained_results
 
-        # Step 2: SFT training and evaluation
-        if not args.skip_sft:
+        # Step 2: SFT training and evaluation (or load from cache)
+        sft_file = output_dir / f"sft_q{q_count}.json"
+        if sft_file.exists():
+            # Load existing results
+            logger.info(f"Loading SFT results from {sft_file}")
+            with open(sft_file, 'r') as f:
+                results_by_count[q_count]["sft"] = json.load(f)
+        elif not args.skip_sft:
+            # Run training and evaluation
             sft_results = run_sft_training(args, q_count, output_dir)
             if sft_results:
                 results_by_count[q_count]["sft"] = sft_results
