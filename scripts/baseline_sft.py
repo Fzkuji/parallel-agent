@@ -1423,6 +1423,7 @@ def main():
     logger.info(f"Using {num_gpus} GPU(s): {gpu_ids}")
 
     # Load evaluation data
+    # Use same seed as baseline_pretrained.py for consistent evaluation samples
     logger.info(f"Loading evaluation data: {args.eval_samples} samples from {args.dataset}")
     eval_contexts = load_dataset(
         args.dataset,
@@ -1430,7 +1431,7 @@ def main():
         max_contexts=args.eval_samples,
         min_questions=args.min_questions,
         max_questions=args.max_questions,
-        seed=args.seed + 1000,
+        seed=args.seed,  # Use same seed as pretrained for consistency
     )
     logger.info(f"Loaded {len(eval_contexts)} evaluation contexts")
 
