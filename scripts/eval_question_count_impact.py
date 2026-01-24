@@ -74,6 +74,12 @@ def run_pretrained_eval(args, question_count: int, output_dir: Path) -> Dict:
 
     result_file = output_dir / f"pretrained_q{question_count}.json"
 
+    # Check if already exists
+    if result_file.exists():
+        logger.info(f"Loading existing results from {result_file}")
+        with open(result_file, 'r') as f:
+            return json.load(f)
+
     cmd = [
         sys.executable, "scripts/baseline_pretrained.py",
         "--model", args.model,
@@ -95,8 +101,7 @@ def run_pretrained_eval(args, question_count: int, output_dir: Path) -> Dict:
         logger.error(f"Pretrained evaluation failed for {question_count} questions")
         return {}
 
-    # Try to load results from the script's output directory
-    # The results are saved in outputs/eval_baselines/results_{dataset}.json
+    # Load results from the script's output directory
     baseline_results_file = Path("outputs/eval_baselines") / f"results_{args.dataset}.json"
     if baseline_results_file.exists():
         with open(baseline_results_file, 'r') as f:
@@ -106,6 +111,8 @@ def run_pretrained_eval(args, question_count: int, output_dir: Path) -> Dict:
             json.dump(results, f, indent=2)
         logger.info(f"Saved results to {result_file}")
         return results
+    else:
+        logger.warning(f"Results file not found: {baseline_results_file}")
 
     return {}
 
@@ -173,10 +180,10 @@ def generate_summary_table(args, results_by_count: Dict[int, Dict], output_dir: 
         f.write(f"# Train Samples: {args.train_samples}\n")
         f.write(f"# Date: 2026-01-24\n\n")
 
-        # Pretrained Results
-        f.write("## Pretrained Baseline Results\n\n")
-        f.write(f"{'Q/Ctx':<6} | {'all_in_one EM':>12} | {'sequential EM':>14} | {'batch EM':>10} | {'collab_llm EM':>14}\n")
-        f.write("-" * 80 + "\n")
+        # Pretrained Results - EM
+        f.write("## Pretrained Baseline Results - EM (Exact Match)\n\n")
+        f.write(f"{'Q/Ctx':<6} | {'all_in_one':>11} | {'sequential':>11} | {'batch':>11} | {'collab_llm':>11}\n")
+        f.write("-" * 70 + "\n")
 
         for q_count in sorted(results_by_count.keys()):
             data = results_by_count[q_count]
@@ -187,14 +194,33 @@ def generate_summary_table(args, results_by_count: Dict[int, Dict], output_dir: 
             strategies = pretrained.get("strategies", {})
 
             f.write(f"{q_count:<6} | ")
-            f.write(f"{strategies.get('all_in_one', {}).get('strict_acc', 0):>12.3f} | ")
-            f.write(f"{strategies.get('sequential', {}).get('strict_acc', 0):>14.3f} | ")
-            f.write(f"{strategies.get('batch', {}).get('strict_acc', 0):>10.3f} | ")
-            f.write(f"{strategies.get('collab_llm', {}).get('strict_acc', 0):>14.3f}\n")
+            f.write(f"{strategies.get('all_in_one', {}).get('strict_acc', 0):>11.3f} | ")
+            f.write(f"{strategies.get('sequential', {}).get('strict_acc', 0):>11.3f} | ")
+            f.write(f"{strategies.get('batch', {}).get('strict_acc', 0):>11.3f} | ")
+            f.write(f"{strategies.get('collab_llm', {}).get('strict_acc', 0):>11.3f}\n")
 
-        # SFT Results
-        f.write("\n## SFT-LoRA Results\n\n")
-        f.write(f"{'Q/Ctx':<6} | {'batch baseline':>14} | {'batch SFT':>10} | {'Δ':>6} | {'seq baseline':>13} | {'seq SFT':>8} | {'Δ':>6}\n")
+        # Pretrained Results - F1
+        f.write("\n## Pretrained Baseline Results - F1\n\n")
+        f.write(f"{'Q/Ctx':<6} | {'all_in_one':>11} | {'sequential':>11} | {'batch':>11} | {'collab_llm':>11}\n")
+        f.write("-" * 70 + "\n")
+
+        for q_count in sorted(results_by_count.keys()):
+            data = results_by_count[q_count]
+            if "pretrained" not in data:
+                continue
+
+            pretrained = data["pretrained"]
+            strategies = pretrained.get("strategies", {})
+
+            f.write(f"{q_count:<6} | ")
+            f.write(f"{strategies.get('all_in_one', {}).get('f1', 0):>11.3f} | ")
+            f.write(f"{strategies.get('sequential', {}).get('f1', 0):>11.3f} | ")
+            f.write(f"{strategies.get('batch', {}).get('f1', 0):>11.3f} | ")
+            f.write(f"{strategies.get('collab_llm', {}).get('f1', 0):>11.3f}\n")
+
+        # SFT Results - EM
+        f.write("\n## SFT-LoRA Results - EM (Exact Match)\n\n")
+        f.write(f"{'Q/Ctx':<6} | {'batch baseline':>14} | {'batch SFT':>10} | {'Δ':>7} | {'seq baseline':>13} | {'seq SFT':>9} | {'Δ':>7}\n")
         f.write("-" * 100 + "\n")
 
         for q_count in sorted(results_by_count.keys()):
@@ -217,10 +243,40 @@ def generate_summary_table(args, results_by_count: Dict[int, Dict], output_dir: 
             f.write(f"{q_count:<6} | ")
             f.write(f"{batch_baseline:>14.3f} | ")
             f.write(f"{batch_sft:>10.3f} | ")
-            f.write(f"{batch_delta:>+6.3f} | ")
+            f.write(f"{batch_delta:>+7.3f} | ")
             f.write(f"{seq_baseline:>13.3f} | ")
-            f.write(f"{seq_sft:>8.3f} | ")
-            f.write(f"{seq_delta:>+6.3f}\n")
+            f.write(f"{seq_sft:>9.3f} | ")
+            f.write(f"{seq_delta:>+7.3f}\n")
+
+        # SFT Results - F1
+        f.write("\n## SFT-LoRA Results - F1\n\n")
+        f.write(f"{'Q/Ctx':<6} | {'batch baseline':>14} | {'batch SFT':>10} | {'Δ':>7} | {'seq baseline':>13} | {'seq SFT':>9} | {'Δ':>7}\n")
+        f.write("-" * 100 + "\n")
+
+        for q_count in sorted(results_by_count.keys()):
+            data = results_by_count[q_count]
+            if "sft" not in data:
+                continue
+
+            sft = data["sft"]
+            batch_data = sft.get("batch", {})
+            seq_data = sft.get("sequential", {})
+
+            batch_baseline_f1 = batch_data.get("baseline", {}).get("f1", 0)
+            batch_sft_f1 = batch_data.get("sft_lora", {}).get("f1", 0)
+            batch_delta_f1 = batch_sft_f1 - batch_baseline_f1
+
+            seq_baseline_f1 = seq_data.get("baseline", {}).get("f1", 0)
+            seq_sft_f1 = seq_data.get("sft_lora", {}).get("f1", 0)
+            seq_delta_f1 = seq_sft_f1 - seq_baseline_f1
+
+            f.write(f"{q_count:<6} | ")
+            f.write(f"{batch_baseline_f1:>14.3f} | ")
+            f.write(f"{batch_sft_f1:>10.3f} | ")
+            f.write(f"{batch_delta_f1:>+7.3f} | ")
+            f.write(f"{seq_baseline_f1:>13.3f} | ")
+            f.write(f"{seq_sft_f1:>9.3f} | ")
+            f.write(f"{seq_delta_f1:>+7.3f}\n")
 
         # Token efficiency
         f.write("\n## Token Efficiency (Pretrained)\n\n")
