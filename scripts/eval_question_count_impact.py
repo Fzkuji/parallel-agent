@@ -125,6 +125,12 @@ def run_sft_training(args, question_count: int, output_dir: Path) -> Dict:
 
     result_file = output_dir / f"sft_q{question_count}.json"
 
+    # Check if already exists
+    if result_file.exists():
+        logger.info(f"Loading existing results from {result_file}")
+        with open(result_file, 'r') as f:
+            return json.load(f)
+
     cmd = [
         sys.executable, "scripts/baseline_sft.py",
         "--model", args.model,
