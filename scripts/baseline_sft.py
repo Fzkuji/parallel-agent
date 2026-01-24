@@ -474,9 +474,19 @@ class DataCollatorForCausalLMWithMasking:
     def __call__(self, features: List[Dict]) -> Dict:
         import torch
 
-        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
+        # Manual dynamic padding to avoid fast-tokenizer pad warning
+        batch_size = len(features)
+        to_list = lambda x: x.tolist() if hasattr(x, "tolist") else x
+        input_lists = [to_list(f["input_ids"]) for f in features]
+
+        max_len = max(len(ids) for ids in input_lists)
+        input_ids = torch.full((batch_size, max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+
+        for i, ids in enumerate(input_lists):
+            length = len(ids)
+            input_ids[i, :length] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, :length] = 1
 
         labels = torch.full_like(input_ids, -100)
 
@@ -484,10 +494,11 @@ class DataCollatorForCausalLMWithMasking:
             for start, end in self._find_assistant_spans(token_row):
                 labels[row_idx, start:end] = input_ids[row_idx, start:end]
 
-        batch["labels"] = labels
-        batch["input_ids"] = input_ids
-        batch["attention_mask"] = attention_mask
-        return batch
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
 
 def _train_lora_worker(
