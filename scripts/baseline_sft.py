@@ -576,16 +576,10 @@ def _train_lora_worker(
         remove_columns=columns_to_remove,
     )
 
-    # Data collator - use custom masking for sequential format
-    if train_format == "sequential":
-        if is_main_process:
-            logger.info("Using custom data collator with assistant-only masking")
-        data_collator = DataCollatorForCausalLMWithMasking(tokenizer)
-    else:
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=tokenizer,
-            mlm=False,
-        )
+    # Data collator - always use custom masking to train only on assistant answer tokens
+    if is_main_process:
+        logger.info("Using custom data collator with assistant-only masking")
+    data_collator = DataCollatorForCausalLMWithMasking(tokenizer)
 
     # Training arguments with DDP support
     training_args = TrainingArguments(
