@@ -101,18 +101,24 @@ def run_pretrained_eval(args, question_count: int, output_dir: Path) -> Dict:
         logger.error(f"Pretrained evaluation failed for {question_count} questions")
         return {}
 
-    # Load results from the script's output directory
+    # IMMEDIATELY load results from the script's output directory before it gets overwritten
     baseline_results_file = Path("outputs/eval_baselines") / f"results_{args.dataset}.json"
+    logger.info(f"Looking for results at: {baseline_results_file}")
+    logger.info(f"File exists: {baseline_results_file.exists()}")
+
     if baseline_results_file.exists():
+        logger.info(f"Reading results file...")
         with open(baseline_results_file, 'r') as f:
             results = json.load(f)
+        logger.info(f"Loaded {len(results.get('strategies', {}))} strategies")
         # Save a copy with question count in name
         with open(result_file, 'w') as f:
             json.dump(results, f, indent=2)
-        logger.info(f"Saved results to {result_file}")
+        logger.info(f"Saved copy to {result_file}")
         return results
     else:
-        logger.warning(f"Results file not found: {baseline_results_file}")
+        logger.error(f"Results file not found: {baseline_results_file}")
+        logger.error(f"Check if baseline_pretrained.py actually saves this file")
 
     return {}
 
