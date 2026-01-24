@@ -1081,6 +1081,23 @@ def main():
     # Print summary
     _print_summary(all_results, strategies, dataset=args.dataset)
 
+    # Save summary results to JSON for easy access by other scripts
+    results_file = output_dir / f"results_{args.dataset}.json"
+    summary_data = {
+        "config": {
+            "model": args.model,
+            "dataset": args.dataset,
+            "eval_samples": args.eval_samples,
+            "min_questions": args.min_questions,
+            "max_questions": args.max_questions,
+            "seed": args.seed,
+        },
+        "strategies": all_results,
+    }
+    with open(results_file, 'w') as f:
+        json.dump(summary_data, f, indent=2)
+    logger.info(f"\nResults saved to {results_file}")
+
 
 def _print_summary(all_results: Dict, strategies: List[str], dataset: str = "squad"):
     """Print summary of results."""
