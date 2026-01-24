@@ -89,6 +89,7 @@ def run_pretrained_eval(args, question_count: int, output_dir: Path) -> Dict:
         "--max-questions", str(question_count),
         "--strategies", "all_in_one,sequential,batch,collab_llm",
         "--seed", str(args.seed),
+        "--force",  # Force evaluation to ensure results_squad.json is created
     ]
 
     if args.num_gpus:
