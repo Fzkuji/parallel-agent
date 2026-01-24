@@ -1312,7 +1312,7 @@ def _print_comparison_table(all_format_results: Dict[str, Dict], formats: List[s
             break
 
     # Combined results table
-    header = f"{'Strategy':<20} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'Latency':>8}"
+    header = f"{'Strategy':<20} | {'EM':>6} | {'F1':>6} | {'Lenient':>7} | {'Q/Ctx':>5} | {'PromptTok':>10} | {'GenTok':>8} | {'PromptTok_API':>13} | {'GenTok_API':>10} | {'DepTok':>8} | {'Latency':>8}"
     separator = "-" * len(header)
     logger.info("\n" + header)
     logger.info(separator)
@@ -1327,15 +1327,18 @@ def _print_comparison_table(all_format_results: Dict[str, Dict], formats: List[s
         if "baseline" in results:
             m = results["baseline"]
             strategy_name = f"baseline_{fmt}"
+            avg_q_per_ctx = m.get('num_questions', 0) / max(m.get('num_contexts', 1), 1)
             logger.info(
                 f"{strategy_name:<20} | "
                 f"{m['strict_acc']:>6.3f} | "
                 f"{m['f1']:>6.3f} | "
                 f"{m.get('lenient_acc', 0):>7.3f} | "
+                f"{avg_q_per_ctx:>5.1f} | "
                 f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
                 f"{m.get('avg_generated_tokens', 0):>8.1f} | "
                 f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
                 f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
+                f"{m.get('avg_dependency_tokens', 0):>8.1f} | "
                 f"{m['avg_latency']:>6.2f}s"
             )
 
@@ -1343,15 +1346,18 @@ def _print_comparison_table(all_format_results: Dict[str, Dict], formats: List[s
         if "sft_lora" in results:
             m = results["sft_lora"]
             strategy_name = f"sft_lora_{fmt}"
+            avg_q_per_ctx = m.get('num_questions', 0) / max(m.get('num_contexts', 1), 1)
             logger.info(
                 f"{strategy_name:<20} | "
                 f"{m['strict_acc']:>6.3f} | "
                 f"{m['f1']:>6.3f} | "
                 f"{m.get('lenient_acc', 0):>7.3f} | "
+                f"{avg_q_per_ctx:>5.1f} | "
                 f"{m.get('avg_prompt_tokens', 0):>10.1f} | "
                 f"{m.get('avg_generated_tokens', 0):>8.1f} | "
                 f"{m.get('avg_prompt_tokens_api', 0):>13.1f} | "
                 f"{m.get('avg_generated_tokens_api', 0):>10.1f} | "
+                f"{m.get('avg_dependency_tokens', 0):>8.1f} | "
                 f"{m['avg_latency']:>6.2f}s"
             )
 
