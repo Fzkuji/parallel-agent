@@ -1,0 +1,60 @@
+# SFT-LoRA Training Results
+# Dataset: SQuAD
+# Model: Qwen/Qwen2.5-7B-Instruct
+# Train Samples: 200 QA pairs
+# Eval Samples: 100 contexts
+# Questions per Context: 5-10
+# Training Config: epochs=1, batch_size=2, lr=5e-5, lora_r=16, lora_alpha=32
+# Date: 2026-01-24
+
+## SFT-LoRA Results
+
+Strategy             |     EM |     F1 | Lenient |  PromptTok |   GenTok | PromptTok_API | GenTok_API |  Latency
+----------------------------------------------------------------------------------------------------------------
+sft_lora_batch       |  0.818 |  0.907 |   0.948 |      586.3 |     90.7 |        1330.4 |       90.7 |   0.49s
+sft_lora_sequential  |  0.780 |  0.895 |   0.954 |      353.6 |     64.3 |        1734.0 |       64.3 |   1.20s
+
+## Pretrained Baseline (for comparison)
+
+Strategy        |     EM |     F1 | Lenient |  PromptTok |   GenTok | PromptTok_API | GenTok_API |   DepTok |  Latency
+------------------------------------------------------------------------------------------------------------------------
+all_in_one      |  0.759 |  0.850 |   0.953 |      381.1 |     74.4 |         381.1 |       74.4 |      0.0 |   0.62s
+sequential      |  0.813 |  0.908 |   0.951 |      349.1 |     65.9 |        1745.4 |       65.9 |      0.0 |   0.56s
+batch           |  0.817 |  0.912 |   0.957 |      588.4 |     65.4 |        1308.9 |       65.4 |      0.0 |   0.16s
+collab_llm      |  0.826 |  0.919 |   0.963 |      465.4 |     65.6 |        2311.5 |       94.0 |    277.6 |   1.03s
+
+## Key Findings:
+
+### 1. SFT-LoRA Training Effects:
+
+**Batch Format:**
+- Pretrained: EM=0.817, F1=0.912
+- SFT-LoRA: EM=0.818, F1=0.907
+- **Change**: +0.001 EM, -0.005 F1 (minimal change, essentially maintained performance)
+
+**Sequential Format:**
+- Pretrained: EM=0.813, F1=0.908
+- SFT-LoRA: EM=0.780, F1=0.895
+- **Change**: -0.033 EM, -0.013 F1 (slight degradation)
+
+### 2. Training Data Imbalance:
+
+With 200 QA pairs target and avg 7.5 questions/context:
+- Loaded ~37 contexts (200/7.5 + 10)
+- **Batch**: ~280 training samples (each question is one sample)
+- **Sequential**: ~37 training samples (each context is one sample, containing ~7.5 QA pairs)
+
+Despite batch having 7.5x more training samples, both formats show similar behavior (minimal change or slight degradation). This suggests:
+- The pretrained model already performs very well on this task
+- Small-scale SFT (200 QA pairs) has limited effect
+- More training data may be needed to see significant improvements
+
+### 3. Critical Fix Applied:
+
+Fixed tokenizer padding_side='left' for decoder-only models. Previously, right-padding caused severe generation quality issues (EM dropped to 0.226 for batch). This fix restored normal performance.
+
+### 4. Recommendations:
+
+- Increase training samples to 1000+ for more noticeable SFT effects
+- Consider that pretrained model's strong baseline (0.81+ EM) leaves limited room for improvement
+- Batch format maintains performance better than sequential with current training scale
