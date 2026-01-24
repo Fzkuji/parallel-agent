@@ -1,0 +1,106 @@
+# Question Count Impact Study
+# Dataset: SQuAD
+# Model: Qwen/Qwen2.5-7B-Instruct
+# Eval Samples: 100 contexts
+# Train Samples: 1000 QA pairs
+# Training: epochs=1, batch_size=2, lr=5e-5
+# Date: 2026-01-24
+
+## SFT-LoRA Results (Batch Format)
+
+Q/Ctx  | Baseline EM | SFT-LoRA EM |      Δ | Baseline F1 | SFT-LoRA F1 |      Δ
+----------------------------------------------------------------------------------
+1      |       0.740 |       0.800 | +0.060 |       0.819 |       0.856 | +0.037
+5      |       0.816 |       0.840 | +0.024 |       0.910 |       0.924 | +0.014
+10     |       0.803 |       0.819 | +0.016 |       0.893 |       0.907 | +0.014
+20     |       0.883 |       0.883 | +0.000 |       0.909 |       0.908 | -0.001
+
+## SFT-LoRA Results (Sequential Format)
+
+Q/Ctx  | Baseline EM | SFT-LoRA EM |      Δ | Baseline F1 | SFT-LoRA F1 |      Δ
+----------------------------------------------------------------------------------
+1      |       0.740 |       0.790 | +0.050 |       0.829 |       0.863 | +0.034
+5      |       0.822 |       0.830 | +0.008 |       0.916 |       0.918 | +0.002
+10     |       0.782 |       0.802 | +0.020 |       0.892 |       0.905 | +0.013
+20     |       0.894 |       0.894 | +0.000 |       0.933 |       0.933 | +0.000
+
+## Key Findings
+
+### 1. SFT Training Effectiveness vs Question Count
+
+**Largest improvements with 1 question/context:**
+- Batch: +6.0% EM, +3.7% F1
+- Sequential: +5.0% EM, +3.4% F1
+
+**Diminishing returns with more questions:**
+- 5 questions: +2.4% / +0.8% EM (batch/sequential)
+- 10 questions: +1.6% / +2.0% EM
+- 20 questions: No improvement (0.0%)
+
+**Interpretation:**
+- With fewer questions per context, there's more room for improvement via SFT
+- With 20 questions, the pretrained model already performs very well (88-89% EM)
+- SFT is most effective when baseline performance has gaps
+
+### 2. Baseline Performance vs Question Count
+
+**Accuracy trend:**
+- 1 question: EM=0.740 (both formats)
+- 5 questions: EM=0.816-0.822
+- 10 questions: EM=0.782-0.803
+- 20 questions: EM=0.883-0.894 (highest!)
+
+**Observation:**
+Sequential format shows non-monotonic behavior (drops at 10Q, peaks at 20Q).
+This suggests:
+- More questions provide richer context for multi-turn reasoning
+- 10 questions might be a challenging intermediate point
+- 20 questions benefit from extensive context
+
+### 3. Batch vs Sequential After SFT
+
+**1 question/context:**
+- Batch wins: 0.800 vs 0.790 EM
+
+**5 questions/context:**
+- Tied: 0.840 vs 0.830 EM
+
+**10 questions/context:**
+- Batch wins: 0.819 vs 0.802 EM
+
+**20 questions/context:**
+- Sequential wins: 0.883 vs 0.894 EM
+
+**Pattern:**
+- Batch format is better for fewer questions
+- Sequential format excels with many questions (20+)
+- This aligns with sequential's design for multi-turn conversations
+
+### 4. Token Efficiency
+
+From the detailed output:
+- **1 Q/Ctx**: Minimal context sharing benefit
+- **20 Q/Ctx**:
+  - Sequential PromptTok: 723.3 (very efficient)
+  - Batch PromptTok: 1768.4 (2.4x more)
+  - Sequential PromptTok_API: 11759.1 (growing conversation history)
+  - Batch PromptTok_API: 5315.1 (repeated context)
+
+Sequential saves deduplicated tokens but uses more API tokens due to
+growing conversation history.
+
+### 5. Recommendations
+
+**For SFT Training:**
+- Focus on contexts with 1-10 questions where SFT has the most impact
+- 20+ questions show diminishing returns (baseline already strong)
+
+**For Deployment:**
+- Use **batch** for 1-10 questions (better accuracy, faster)
+- Use **sequential** for 20+ questions (better accuracy, token-efficient on dedup)
+- Use **collab_llm** when maximum accuracy is needed regardless of cost
+
+**For Further Training:**
+- Increase training samples for 10-20 question scenarios
+- Try higher learning rates or more epochs for larger question counts
+- Consider curriculum learning: start with simple (1Q) then progress to complex (20Q)
