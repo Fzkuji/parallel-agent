@@ -1256,7 +1256,9 @@ def _train_and_eval_single_format(
             train_format=train_format,
             num_gpus=num_gpus,
             gpu_ids=gpu_ids,
-            max_train_samples=args.train_samples if train_format == "batch" else None,
+            # Don't limit batch samples - use all questions from loaded contexts
+            # This ensures batch and sequential train on the same amount of data
+            max_train_samples=None,
         )
 
     if not lora_checkpoint_path:
@@ -1432,20 +1434,13 @@ def main():
     # Load training data (unless eval-only)
     train_groups = None
     if not args.eval_only:
-        # For batch format, we sample individual questions, so load more contexts
-        # to ensure we have enough questions to sample from
+        # train_samples represents the number of QA pairs to train on
+        # For fair comparison, both formats should train on the same number of QA pairs
         avg_questions_per_context = (args.min_questions + args.max_questions) / 2
-        if args.train_format == "batch":
-            # Load enough contexts to have at least train_samples questions
-            max_contexts = int(args.train_samples / avg_questions_per_context) + 10
-        elif args.train_format == "all":
-            # Load enough for batch format (sequential will use all contexts)
-            max_contexts = max(args.train_samples, int(args.train_samples / avg_questions_per_context) + 10)
-        else:
-            # Sequential format: each context is one sample
-            max_contexts = args.train_samples
+        # Load enough contexts to have at least train_samples questions
+        max_contexts = int(args.train_samples / avg_questions_per_context) + 10
 
-        logger.info(f"Loading training data: target {args.train_samples} samples, loading {max_contexts} contexts")
+        logger.info(f"Loading training data: target {args.train_samples} QA pairs, loading {max_contexts} contexts")
         train_groups = load_dataset(
             args.dataset,
             split="train",
@@ -1454,7 +1449,11 @@ def main():
             max_questions=args.max_questions,
             seed=args.seed,
         )
-        logger.info(f"Loaded {len(train_groups)} training contexts")
+        # Count actual questions loaded
+        total_questions = sum(
+            len(_context_to_items(g)) for g in train_groups
+        )
+        logger.info(f"Loaded {len(train_groups)} training contexts ({total_questions} QA pairs)")
 
     # Determine which formats to evaluate
     if args.train_format == "all":
