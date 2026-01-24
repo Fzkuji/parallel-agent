@@ -207,10 +207,10 @@ def generate_summary_table(args, results_by_count: Dict[int, Dict], output_dir: 
             strategies = pretrained.get("strategies", {})
 
             f.write(f"{q_count:<6} | ")
-            f.write(f"{strategies.get('all_in_one', {}).get('strict_acc', 0):>11.3f} | ")
-            f.write(f"{strategies.get('sequential', {}).get('strict_acc', 0):>11.3f} | ")
-            f.write(f"{strategies.get('batch', {}).get('strict_acc', 0):>11.3f} | ")
-            f.write(f"{strategies.get('collab_llm', {}).get('strict_acc', 0):>11.3f}\n")
+            f.write(f"{strategies.get('all_in_one', {}).get('aggregate_metrics', {}).get('strict_acc', 0):>11.3f} | ")
+            f.write(f"{strategies.get('sequential', {}).get('aggregate_metrics', {}).get('strict_acc', 0):>11.3f} | ")
+            f.write(f"{strategies.get('batch', {}).get('aggregate_metrics', {}).get('strict_acc', 0):>11.3f} | ")
+            f.write(f"{strategies.get('collab_llm', {}).get('aggregate_metrics', {}).get('strict_acc', 0):>11.3f}\n")
 
         # Pretrained Results - F1
         f.write("\n## Pretrained Baseline Results - F1\n\n")
@@ -226,10 +226,10 @@ def generate_summary_table(args, results_by_count: Dict[int, Dict], output_dir: 
             strategies = pretrained.get("strategies", {})
 
             f.write(f"{q_count:<6} | ")
-            f.write(f"{strategies.get('all_in_one', {}).get('f1', 0):>11.3f} | ")
-            f.write(f"{strategies.get('sequential', {}).get('f1', 0):>11.3f} | ")
-            f.write(f"{strategies.get('batch', {}).get('f1', 0):>11.3f} | ")
-            f.write(f"{strategies.get('collab_llm', {}).get('f1', 0):>11.3f}\n")
+            f.write(f"{strategies.get('all_in_one', {}).get('aggregate_metrics', {}).get('f1', 0):>11.3f} | ")
+            f.write(f"{strategies.get('sequential', {}).get('aggregate_metrics', {}).get('f1', 0):>11.3f} | ")
+            f.write(f"{strategies.get('batch', {}).get('aggregate_metrics', {}).get('f1', 0):>11.3f} | ")
+            f.write(f"{strategies.get('collab_llm', {}).get('aggregate_metrics', {}).get('f1', 0):>11.3f}\n")
 
         # SFT Results - EM
         f.write("\n## SFT-LoRA Results - EM (Exact Match)\n\n")
@@ -305,9 +305,9 @@ def generate_summary_table(args, results_by_count: Dict[int, Dict], output_dir: 
             strategies = pretrained.get("strategies", {})
 
             f.write(f"{q_count:<6} | ")
-            f.write(f"{strategies.get('sequential', {}).get('avg_prompt_tokens', 0):>20.1f} | ")
-            f.write(f"{strategies.get('batch', {}).get('avg_prompt_tokens', 0):>16.1f} | ")
-            f.write(f"{strategies.get('collab_llm', {}).get('avg_prompt_tokens', 0):>20.1f}\n")
+            f.write(f"{strategies.get('sequential', {}).get('aggregate_metrics', {}).get('avg_prompt_tokens', 0):>20.1f} | ")
+            f.write(f"{strategies.get('batch', {}).get('aggregate_metrics', {}).get('avg_prompt_tokens', 0):>16.1f} | ")
+            f.write(f"{strategies.get('collab_llm', {}).get('aggregate_metrics', {}).get('avg_prompt_tokens', 0):>20.1f}\n")
 
     logger.info(f"\nSummary table saved to {summary_file}")
 
