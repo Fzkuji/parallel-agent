@@ -92,7 +92,7 @@ def parse_args():
     # Evaluation
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation (requires trained checkpoint)")
     parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to trained LoRA checkpoint")
-    parser.add_argument("--compare-baseline", action="store_true", help="Also evaluate baseline (no LoRA)")
+    parser.add_argument("--compare-baseline", action="store_true", help="(Deprecated: baseline is always evaluated now)")
 
     # vLLM
     parser.add_argument("--enable-thinking", action="store_true")
@@ -1199,35 +1199,34 @@ def _train_and_eval_single_format(
     logger.info(f"FORMAT: {train_format.upper()}")
     logger.info(f"{'='*60}")
 
-    # Step 1: Evaluate baseline if requested
-    if args.compare_baseline:
-        logger.info(f"\n[{train_format}] Evaluating Baseline (no LoRA)")
+    # Step 1: Always evaluate baseline (pretrained model) for comparison
+    logger.info(f"\n[{train_format}] Evaluating Baseline (pretrained, no LoRA)")
 
-        baseline_cache_key = _get_eval_cache_key(args, "baseline", train_format, None)
-        baseline_results = None
+    baseline_cache_key = _get_eval_cache_key(args, "baseline", train_format, None)
+    baseline_results = None
 
-        if not args.force:
-            baseline_results = _load_eval_cache(output_dir, baseline_cache_key)
+    if not args.force:
+        baseline_results = _load_eval_cache(output_dir, baseline_cache_key)
 
-        if baseline_results is None:
-            baseline_results = run_parallel_eval(
-                model_name=args.model,
-                eval_contexts=eval_contexts,
-                output_dir=str(output_dir),
-                max_new_tokens=args.max_new_tokens,
-                dataset=args.dataset,
-                enable_thinking=args.enable_thinking,
-                lora_checkpoint_path=None,
-                strategy_name=f"baseline_{train_format}",
-                num_gpus=num_gpus,
-                gpu_ids=gpu_ids,
-                eval_format=train_format,
-            )
-            if baseline_results:
-                _save_eval_cache(output_dir, baseline_cache_key, baseline_results, args, train_format)
-
+    if baseline_results is None:
+        baseline_results = run_parallel_eval(
+            model_name=args.model,
+            eval_contexts=eval_contexts,
+            output_dir=str(output_dir),
+            max_new_tokens=args.max_new_tokens,
+            dataset=args.dataset,
+            enable_thinking=args.enable_thinking,
+            lora_checkpoint_path=None,
+            strategy_name=f"baseline_{train_format}",
+            num_gpus=num_gpus,
+            gpu_ids=gpu_ids,
+            eval_format=train_format,
+        )
         if baseline_results:
-            results["baseline"] = baseline_results.get("aggregate_metrics", baseline_results)
+            _save_eval_cache(output_dir, baseline_cache_key, baseline_results, args, train_format)
+
+    if baseline_results:
+        results["baseline"] = baseline_results.get("aggregate_metrics", baseline_results)
 
     # Step 2: Training (unless eval-only)
     lora_checkpoint_path = args.checkpoint_path
