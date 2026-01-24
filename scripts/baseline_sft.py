@@ -24,6 +24,10 @@ Usage:
         --train-samples 1000
 """
 
+# Disable tokenizers parallelism to avoid fork deadlock warnings in multiprocessing
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import json
 import logging
@@ -212,14 +216,29 @@ Question: What color is the sky?
 <answer>blue</answer>"""
 
 
-def prepare_batch_training_data(train_groups: List[Dict], tokenizer, max_seq_length: int) -> List[Dict]:
+def prepare_batch_training_data(
+    train_groups: List[Dict],
+    tokenizer,
+    max_seq_length: int,
+    max_samples: Optional[int] = None,
+    seed: int = 42,
+) -> List[Dict]:
     """Prepare training data in batch format: each question is independent.
 
     Each training example is a single-turn conversation:
     - System: SYSTEM_PROMPT
     - User: Passage + Question
     - Assistant: <answer>...</answer>
+
+    Args:
+        train_groups: List of training context groups
+        tokenizer: HuggingFace tokenizer
+        max_seq_length: Maximum sequence length
+        max_samples: Maximum number of samples to return (random sampling if exceeded)
+        seed: Random seed for sampling
     """
+    import random
+
     training_examples = []
 
     for group in train_groups:
@@ -257,6 +276,11 @@ def prepare_batch_training_data(train_groups: List[Dict], tokenizer, max_seq_len
                 "text": text,
                 "qid": item["qid"],
             })
+
+    # Random sampling if max_samples is specified and we have more examples
+    if max_samples is not None and len(training_examples) > max_samples:
+        rng = random.Random(seed)
+        training_examples = rng.sample(training_examples, max_samples)
 
     return training_examples
 
@@ -366,7 +390,9 @@ def prepare_training_data(
     train_groups: List[Dict],
     tokenizer,
     max_seq_length: int,
-    train_format: str = "batch"
+    train_format: str = "batch",
+    max_samples: Optional[int] = None,
+    seed: int = 42,
 ) -> List[Dict]:
     """Prepare training data based on the specified format.
 
@@ -375,6 +401,8 @@ def prepare_training_data(
         tokenizer: HuggingFace tokenizer
         max_seq_length: Maximum sequence length
         train_format: "batch" or "sequential"
+        max_samples: For batch format, maximum number of samples (random sampling)
+        seed: Random seed for sampling
 
     Returns:
         List of training examples with "text" field
@@ -382,7 +410,10 @@ def prepare_training_data(
     if train_format == "sequential":
         return prepare_sequential_training_data(train_groups, tokenizer, max_seq_length)
     else:
-        return prepare_batch_training_data(train_groups, tokenizer, max_seq_length)
+        return prepare_batch_training_data(
+            train_groups, tokenizer, max_seq_length,
+            max_samples=max_samples, seed=seed
+        )
 
 
 class DataCollatorForCausalLMWithMasking:
@@ -643,6 +674,7 @@ def train_lora(
     train_format: str = "batch",
     num_gpus: int = 1,
     gpu_ids: Optional[List[int]] = None,
+    max_train_samples: Optional[int] = None,
 ) -> str:
     """Train LoRA adapter using SFT with DDP multi-GPU support.
 
@@ -652,6 +684,7 @@ def train_lora(
         train_format: "batch" (each question independent) or "sequential" (multi-turn)
         num_gpus: Number of GPUs for DDP training
         gpu_ids: List of GPU IDs to use
+        max_train_samples: For batch format, maximum number of question samples
     """
     import subprocess
     from transformers import AutoTokenizer
@@ -662,7 +695,11 @@ def train_lora(
         tokenizer.pad_token = tokenizer.eos_token
 
     # Prepare training data
-    training_examples = prepare_training_data(train_groups, tokenizer, max_seq_length, train_format)
+    # For batch format, max_train_samples controls random sampling of individual questions
+    training_examples = prepare_training_data(
+        train_groups, tokenizer, max_seq_length, train_format,
+        max_samples=max_train_samples, seed=seed
+    )
     logger.info(f"Prepared {len(training_examples)} training examples")
 
     # Save training data to temp file for DDP workers to load
@@ -1219,6 +1256,7 @@ def _train_and_eval_single_format(
             train_format=train_format,
             num_gpus=num_gpus,
             gpu_ids=gpu_ids,
+            max_train_samples=args.train_samples if train_format == "batch" else None,
         )
 
     if not lora_checkpoint_path:
@@ -1394,11 +1432,24 @@ def main():
     # Load training data (unless eval-only)
     train_groups = None
     if not args.eval_only:
-        logger.info(f"Loading training data: {args.train_samples} samples")
+        # For batch format, we sample individual questions, so load more contexts
+        # to ensure we have enough questions to sample from
+        avg_questions_per_context = (args.min_questions + args.max_questions) / 2
+        if args.train_format == "batch":
+            # Load enough contexts to have at least train_samples questions
+            max_contexts = int(args.train_samples / avg_questions_per_context) + 10
+        elif args.train_format == "all":
+            # Load enough for batch format (sequential will use all contexts)
+            max_contexts = max(args.train_samples, int(args.train_samples / avg_questions_per_context) + 10)
+        else:
+            # Sequential format: each context is one sample
+            max_contexts = args.train_samples
+
+        logger.info(f"Loading training data: target {args.train_samples} samples, loading {max_contexts} contexts")
         train_groups = load_dataset(
             args.dataset,
             split="train",
-            max_contexts=args.train_samples,
+            max_contexts=max_contexts,
             min_questions=args.min_questions,
             max_questions=args.max_questions,
             seed=args.seed,
