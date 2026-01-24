@@ -155,18 +155,12 @@ def _eval_worker(
     """Worker process for evaluation on a single GPU."""
     # Set environment variables BEFORE any CUDA imports
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ["VLLM_USE_V1"] = "0"
-    os.environ["VLLM_DISABLE_FRONTEND_MULTIPROCESSING"] = "1"
-    os.environ["VLLM_NO_PROGRESS_BAR"] = "1"
-    os.environ["TQDM_DISABLE"] = "1"
-    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
-    os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
 
     print(f"[Worker {rank}] GPU {gpu_id}: Starting, {len(eval_contexts)} contexts, strategies: {strategies}", flush=True)
 
     # Now import CUDA-related modules
-    from vllm import LLM, SamplingParams
-    from transformers import AutoTokenizer
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from src.models import Question
     from src.evaluation import evaluate_predictions
     from src.inference import extract_answer
@@ -176,37 +170,24 @@ def _eval_worker(
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Set left padding for decoder-only models
+    tokenizer.padding_side = "left"
 
-    # Load vLLM model
-    vllm_model = LLM(
-        model=model_name,
-        tensor_parallel_size=1,
+    # Load model using Transformers
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="cuda:0",
         trust_remote_code=True,
-        dtype="half",
-        gpu_memory_utilization=0.7,
-        disable_log_stats=True,
-        enforce_eager=True,
-        max_num_seqs=256,
     )
+    model.eval()
     print(f"[Worker {rank}] Model loaded", flush=True)
 
-    # For collab_llm, we need the HF model for dependency generation
-    hf_model = None
+    # For collab_llm, reuse the same model for dependency generation
     dep_generator = None
     if "collab_llm" in strategies:
-        import torch
-        from transformers import AutoModelForCausalLM
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cuda:0",
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        )
-        hf_model.eval()
-        dep_generator = LocalLLMDependencyGenerator(tokenizer, hf_model)
-        print(f"[Worker {rank}] HF model loaded for dependency generation", flush=True)
-
-    sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+        dep_generator = LocalLLMDependencyGenerator(tokenizer, model)
+        print(f"[Worker {rank}] Dependency generator initialized", flush=True)
 
     # Results per strategy
     shard_results = {strategy: {"contexts": []} for strategy in strategies}
@@ -241,23 +222,23 @@ def _eval_worker(
         for strategy in strategies:
             if strategy == "all_in_one":
                 result = _run_all_in_one(
-                    vllm_model, tokenizer, context, questions, items,
-                    question_lookup, sampling_params, dataset, enable_thinking
+                    model, tokenizer, context, questions, items,
+                    question_lookup, max_new_tokens, dataset, enable_thinking
                 )
             elif strategy == "sequential":
                 result = _run_sequential(
-                    vllm_model, tokenizer, items, question_lookup,
-                    sampling_params, dataset, enable_thinking
+                    model, tokenizer, items, question_lookup,
+                    max_new_tokens, dataset, enable_thinking
                 )
             elif strategy == "batch":
                 result = _run_batch(
-                    vllm_model, tokenizer, items, question_lookup,
-                    sampling_params, dataset, enable_thinking
+                    model, tokenizer, items, question_lookup,
+                    max_new_tokens, dataset, enable_thinking
                 )
             elif strategy == "collab_llm":
                 result = _run_collab_llm(
-                    vllm_model, tokenizer, items, question_lookup,
-                    sampling_params, dataset, enable_thinking,
+                    model, tokenizer, items, question_lookup,
+                    max_new_tokens, dataset, enable_thinking,
                     dep_generator, dep_args
                 )
             else:
@@ -286,21 +267,10 @@ def _eval_worker(
 
     print(f"[Worker {rank}] Done, saved to {temp_file}", flush=True)
 
-    # Clean up vLLM and HF models to ensure process exits properly
-    # vLLM spawns background processes (EngineCore) that need explicit shutdown
+    # Clean up models to free GPU memory
     print(f"[Worker {rank}] Cleaning up models...", flush=True)
-    try:
-        # Try to shutdown vLLM engine properly
-        if hasattr(vllm_model, 'llm_engine') and hasattr(vllm_model.llm_engine, 'shutdown'):
-            vllm_model.llm_engine.shutdown()
-        elif hasattr(vllm_model, 'shutdown'):
-            vllm_model.shutdown()
-    except Exception as e:
-        print(f"[Worker {rank}] vLLM shutdown warning: {e}", flush=True)
-
-    del vllm_model
-    if hf_model is not None:
-        del hf_model
+    del model
+    if dep_generator is not None:
         del dep_generator
 
     import gc
@@ -316,9 +286,10 @@ def _eval_worker(
     print(f"[Worker {rank}] Cleanup complete, exiting", flush=True)
 
 
-def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_lookup,
-                    sampling_params, dataset, enable_thinking):
+def _run_all_in_one(model, tokenizer, context, questions, items, question_lookup,
+                    max_new_tokens, dataset, enable_thinking):
     """Run all-in-one strategy: all questions in one prompt."""
+    import torch
     import re
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
@@ -355,11 +326,26 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
             messages, tokenize=False, add_generation_prompt=True,
         )
 
+    # Tokenize
+    inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    # Generate
     start_time = time.perf_counter()
-    outputs = vllm_model.generate([full_prompt], sampling_params, use_tqdm=False)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
     latency = time.perf_counter() - start_time
 
-    raw_text = outputs[0].outputs[0].text
+    # Extract generated text
+    prompt_tokens = inputs["input_ids"].shape[1]
+    generated = outputs[0][prompt_tokens:]
+    generated_tokens = generated.shape[0]
+    raw_text = tokenizer.decode(generated, skip_special_tokens=True)
 
     # Parse all-in-one response: Q1: <answer>text</answer>
     pattern = re.compile(r"(Q\d+)\s*:\s*<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
@@ -382,9 +368,6 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
-    prompt_tokens = len(outputs[0].prompt_token_ids)
-    generated_tokens = len(outputs[0].outputs[0].token_ids)
-
     return {
         "metrics": metrics,
         "latency": latency,
@@ -395,8 +378,8 @@ def _run_all_in_one(vllm_model, tokenizer, context, questions, items, question_l
     }
 
 
-def _run_sequential(vllm_model, tokenizer, items, question_lookup,
-                    sampling_params, dataset, enable_thinking):
+def _run_sequential(model, tokenizer, items, question_lookup,
+                    max_new_tokens, dataset, enable_thinking):
     """Run sequential strategy: multi-turn conversation, context only in first turn.
 
     Uses multi-turn chat format:
@@ -406,6 +389,7 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
 
     This avoids repeating context in each turn's user message.
     """
+    import torch
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
@@ -446,17 +430,29 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
                 messages, tokenize=False, add_generation_prompt=True,
             )
 
+        # Tokenize
+        inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        # Generate
         start_time = time.perf_counter()
-        outputs = vllm_model.generate([full_prompt], sampling_params, use_tqdm=False)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
         total_latency += time.perf_counter() - start_time
 
-        raw_text = outputs[0].outputs[0].text
+        # Extract generated text
+        current_prompt_tokens = inputs["input_ids"].shape[1]
+        generated = outputs[0][current_prompt_tokens:]
+        generated_tokens = generated.shape[0]
+        raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
-
-        # Get actual prompt tokens from vLLM output
-        current_prompt_tokens = len(outputs[0].prompt_token_ids)
-        generated_tokens = len(outputs[0].outputs[0].token_ids)
 
         # API tokens (actual tokens sent for this turn)
         total_prompt_tokens_api += current_prompt_tokens
@@ -493,9 +489,10 @@ def _run_sequential(vllm_model, tokenizer, items, question_lookup,
     }
 
 
-def _run_batch(vllm_model, tokenizer, items, question_lookup,
-               sampling_params, dataset, enable_thinking):
+def _run_batch(model, tokenizer, items, question_lookup,
+               max_new_tokens, dataset, enable_thinking):
     """Run batch strategy: all questions in parallel."""
+    import torch
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
 
@@ -521,12 +518,22 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
             )
         prompts.append(full_prompt)
 
+    # Tokenize batch
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    # Generate
     start_time = time.perf_counter()
-    outputs = vllm_model.generate(prompts, sampling_params, use_tqdm=False)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+        )
     latency = time.perf_counter() - start_time
 
-    # Calculate context tokens from actual vLLM tokenization
-    # We measure what vLLM would count for the context portion
+    # Calculate context tokens
     context_tokens = len(tokenizer.encode(context))
 
     answer_records = {}
@@ -535,15 +542,18 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     deduplicated_prompt_tokens = 0
 
     for i, item in enumerate(items):
-        output = outputs[i]
-        raw_text = output.outputs[0].text
+        # Count non-padding tokens for API cost
+        prompt_tokens = inputs["attention_mask"][i].sum().item()
+        total_prompt_tokens_api += prompt_tokens
+
+        # Extract generated tokens
+        generated = outputs[i][inputs["input_ids"][i].shape[0]:]
+        total_generated_tokens += generated.shape[0]
+
+        # Decode
+        raw_text = tokenizer.decode(generated, skip_special_tokens=True)
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
-
-        # Get actual prompt tokens from vLLM output
-        prompt_tokens = len(output.prompt_token_ids)
-        total_prompt_tokens_api += prompt_tokens
-        total_generated_tokens += len(output.outputs[0].token_ids)
 
         # Calculate deduplicated prompt tokens:
         # First question: full prompt tokens
@@ -565,10 +575,11 @@ def _run_batch(vllm_model, tokenizer, items, question_lookup,
     }
 
 
-def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
-                    sampling_params, dataset, enable_thinking,
+def _run_collab_llm(model, tokenizer, items, question_lookup,
+                    max_new_tokens, dataset, enable_thinking,
                     dep_generator, dep_args):
     """Run collab_llm strategy: LLM decides execution order based on dependencies."""
+    import torch
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
     from src.models import Question
@@ -691,19 +702,30 @@ def _run_collab_llm(vllm_model, tokenizer, items, question_lookup,
                 messages, tokenize=False, add_generation_prompt=True,
             )
 
+        # Tokenize
+        inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        # Generate
         start_time = time.perf_counter()
-        outputs = vllm_model.generate([full_prompt], sampling_params, use_tqdm=False)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
         total_latency += time.perf_counter() - start_time
 
-        output = outputs[0]
-        raw_text = output.outputs[0].text
+        # Extract generated text
+        current_prompt_tokens = inputs["input_ids"].shape[1]
+        generated = outputs[0][current_prompt_tokens:]
+        generated_tokens = generated.shape[0]
+        raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+
         final_answer, strict_valid = extract_answer(raw_text, dataset)
         answer_records[item["qid"]] = (final_answer, strict_valid)
         answers_text[item["qid"]] = final_answer
-
-        # Get actual prompt tokens from vLLM output
-        current_prompt_tokens = len(output.prompt_token_ids)
-        generated_tokens = len(output.outputs[0].token_ids)
 
         # API tokens (actual tokens sent)
         total_prompt_tokens_api += current_prompt_tokens
