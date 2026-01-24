@@ -417,92 +417,77 @@ def prepare_training_data(
 
 
 class DataCollatorForCausalLMWithMasking:
-    """Data collator that masks non-answer tokens in the labels.
+    """Mask everything except assistant responses for causal LM training.
 
-    For SFT training, we want to only compute loss on the assistant's response tokens,
-    not on the system/user prompt tokens. This collator:
-    1. Creates labels as a copy of input_ids
-    2. Masks (sets to -100) all tokens before each assistant response
+    This collator pads dynamically and finds assistant spans by matching token
+    patterns instead of decoding full strings, which is both faster and more
+    robust. Only tokens between the assistant start marker and the following
+    end marker contribute to the loss.
     """
 
-    def __init__(self, tokenizer, assistant_token_pattern: str = "<|im_start|>assistant"):
+    def __init__(
+        self,
+        tokenizer,
+        assistant_token_pattern: str = "<|im_start|>assistant",
+        end_token_pattern: str = "<|im_end|>",
+    ):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
-        # Find the token pattern that indicates assistant turn start
-        self.assistant_token_pattern = assistant_token_pattern
+
+        # Pre-compute token ID patterns so we can scan input_ids directly
+        self.assistant_start_ids = tokenizer.encode(
+            assistant_token_pattern, add_special_tokens=False
+        )
+        self.end_ids = tokenizer.encode(end_token_pattern, add_special_tokens=False)
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        self.newline_id = newline_ids[0] if len(newline_ids) == 1 else None
+
+        if not self.assistant_start_ids or not self.end_ids:
+            raise ValueError("Failed to build assistant/end token patterns for masking")
+
+    def _find_assistant_spans(self, token_ids: List[int]) -> List[tuple]:
+        """Return (start, end) token indices for each assistant response."""
+        spans = []
+        i = 0
+        n = len(token_ids)
+        start_len = len(self.assistant_start_ids)
+        end_len = len(self.end_ids)
+
+        while i <= n - start_len:
+            if token_ids[i:i + start_len] == self.assistant_start_ids:
+                start = i + start_len
+                # Skip optional newline immediately after the assistant marker
+                if self.newline_id is not None and start < n and token_ids[start] == self.newline_id:
+                    start += 1
+
+                end = start
+                while end <= n - end_len and token_ids[end:end + end_len] != self.end_ids:
+                    end += 1
+
+                spans.append((start, end))
+                i = end + end_len
+            else:
+                i += 1
+
+        return spans
 
     def __call__(self, features: List[Dict]) -> Dict:
         import torch
 
-        # Stack input_ids and attention_mask
-        input_ids = torch.stack([torch.tensor(f["input_ids"]) for f in features])
-        attention_mask = torch.stack([torch.tensor(f["attention_mask"]) for f in features])
+        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
 
-        # Create labels - mask everything except assistant responses
-        labels = input_ids.clone()
+        labels = torch.full_like(input_ids, -100)
 
-        # Find assistant start tokens and mask everything before them
-        for i in range(labels.shape[0]):
-            # Decode to find assistant positions (more robust than token matching)
-            text = self.tokenizer.decode(input_ids[i])
+        for row_idx, token_row in enumerate(input_ids.tolist()):
+            for start, end in self._find_assistant_spans(token_row):
+                labels[row_idx, start:end] = input_ids[row_idx, start:end]
 
-            # Find all assistant turn positions
-            # For Qwen format: <|im_start|>assistant\n....<|im_end|>
-            # We want to keep only the content after <|im_start|>assistant\n
-            assistant_marker = "<|im_start|>assistant"
-            end_marker = "<|im_end|>"
-
-            # Start by masking everything
-            labels[i] = torch.full_like(labels[i], -100)
-
-            # Find positions to unmask (assistant content only)
-            current_pos = 0
-            text_so_far = ""
-            char_to_token = []
-
-            # Build character to token mapping
-            for token_idx in range(len(input_ids[i])):
-                token_text = self.tokenizer.decode([input_ids[i][token_idx]])
-                for _ in token_text:
-                    char_to_token.append(token_idx)
-                text_so_far += token_text
-
-            # Find assistant responses and unmask them
-            search_pos = 0
-            while True:
-                assistant_start = text_so_far.find(assistant_marker, search_pos)
-                if assistant_start == -1:
-                    break
-
-                # Find the newline after assistant marker
-                content_start = text_so_far.find("\n", assistant_start)
-                if content_start == -1:
-                    break
-                content_start += 1  # Skip the newline
-
-                # Find the end marker
-                content_end = text_so_far.find(end_marker, content_start)
-                if content_end == -1:
-                    content_end = len(text_so_far)
-
-                # Map character positions to token positions
-                if content_start < len(char_to_token) and content_end <= len(char_to_token):
-                    token_start = char_to_token[content_start] if content_start < len(char_to_token) else len(input_ids[i])
-                    token_end = char_to_token[content_end - 1] + 1 if content_end <= len(char_to_token) and content_end > 0 else len(input_ids[i])
-
-                    # Unmask assistant content tokens
-                    labels[i, token_start:token_end] = input_ids[i, token_start:token_end]
-
-                search_pos = content_end + 1
-
-            # Also mask padding tokens
-            labels[i][input_ids[i] == self.pad_token_id] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
+        batch["labels"] = labels
+        batch["input_ids"] = input_ids
+        batch["attention_mask"] = attention_mask
+        return batch
 
 
 def _train_lora_worker(
@@ -597,7 +582,7 @@ def _train_lora_worker(
             examples["text"],
             truncation=True,
             max_length=max_seq_length,
-            padding="max_length",
+            padding=False,
         )
 
     dataset = Dataset.from_list(training_examples)
