@@ -57,6 +57,8 @@ def parse_args():
 
     # Inference
     parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--batch-size", type=int, default=None,
+                       help="Batch size for batch strategy. If None, batch entire context together.")
 
     # Hardware
     parser.add_argument("--num-gpus", type=int, default=None, help="Override auto GPU detection")
@@ -153,6 +155,7 @@ def _eval_worker(
     dataset: str,
     enable_thinking: bool,
     dep_args: Dict[str, Any],
+    batch_size: Optional[int] = None,
 ):
     """Worker process for evaluation on a single GPU."""
     # Set environment variables BEFORE any CUDA imports
@@ -235,7 +238,7 @@ def _eval_worker(
             elif strategy == "batch":
                 result = _run_batch(
                     model, tokenizer, items, question_lookup,
-                    max_new_tokens, dataset, enable_thinking
+                    max_new_tokens, dataset, enable_thinking, batch_size
                 )
             elif strategy == "collab_llm":
                 result = _run_collab_llm(
@@ -492,8 +495,8 @@ def _run_sequential(model, tokenizer, items, question_lookup,
 
 
 def _run_batch(model, tokenizer, items, question_lookup,
-               max_new_tokens, dataset, enable_thinking):
-    """Run batch strategy: all questions in parallel."""
+               max_new_tokens, dataset, enable_thinking, batch_size=None):
+    """Run batch strategy: questions in parallel with configurable batch size."""
     import torch
     from src.inference import extract_answer
     from src.evaluation import evaluate_predictions
@@ -520,56 +523,65 @@ def _run_batch(model, tokenizer, items, question_lookup,
             )
         prompts.append(full_prompt)
 
-    # Tokenize batch
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    # Determine batch size
+    if batch_size is None:
+        batch_size = len(prompts)  # Process all at once (original behavior)
 
-    # Generate
-    start_time = time.perf_counter()
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-    latency = time.perf_counter() - start_time
-
-    # Calculate context tokens
-    context_tokens = len(tokenizer.encode(context))
-
+    # Process in batches
     answer_records = {}
     total_prompt_tokens_api = 0
     total_generated_tokens = 0
     deduplicated_prompt_tokens = 0
+    total_latency = 0
+    context_tokens = len(tokenizer.encode(context))
 
-    for i, item in enumerate(items):
-        # Count non-padding tokens for API cost
-        prompt_tokens = inputs["attention_mask"][i].sum().item()
-        total_prompt_tokens_api += prompt_tokens
+    for batch_start in range(0, len(prompts), batch_size):
+        batch_end = min(batch_start + batch_size, len(prompts))
+        batch_prompts = prompts[batch_start:batch_end]
+        batch_items = items[batch_start:batch_end]
 
-        # Extract generated tokens
-        generated = outputs[i][inputs["input_ids"][i].shape[0]:]
-        total_generated_tokens += generated.shape[0]
+        # Tokenize batch
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-        # Decode
-        raw_text = tokenizer.decode(generated, skip_special_tokens=True)
-        final_answer, strict_valid = extract_answer(raw_text, dataset)
-        answer_records[item["qid"]] = (final_answer, strict_valid)
+        # Generate
+        start_time = time.perf_counter()
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        total_latency += time.perf_counter() - start_time
 
-        # Calculate deduplicated prompt tokens:
-        # First question: full prompt tokens
-        # Subsequent questions: prompt tokens - context tokens (context counted only once)
-        if i == 0:
-            deduplicated_prompt_tokens += prompt_tokens
-        else:
-            deduplicated_prompt_tokens += prompt_tokens - context_tokens
+        # Extract answers
+        for i, item in enumerate(batch_items):
+            # Count non-padding tokens for API cost
+            prompt_tokens = inputs["attention_mask"][i].sum().item()
+            total_prompt_tokens_api += prompt_tokens
+
+            # Extract generated tokens
+            generated = outputs[i][inputs["input_ids"][i].shape[0]:]
+            total_generated_tokens += generated.shape[0]
+
+            # Decode
+            raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+            final_answer, strict_valid = extract_answer(raw_text, dataset)
+            answer_records[item["qid"]] = (final_answer, strict_valid)
+
+            # Calculate deduplicated prompt tokens
+            global_idx = batch_start + i
+            if global_idx == 0:
+                deduplicated_prompt_tokens += prompt_tokens
+            else:
+                deduplicated_prompt_tokens += prompt_tokens - context_tokens
 
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
 
     return {
         "metrics": metrics,
-        "latency": latency,
+        "latency": total_latency,
         "prompt_tokens": deduplicated_prompt_tokens,  # Deduplicated: context (once) + all questions
         "generated_tokens": total_generated_tokens,
         "prompt_tokens_api": total_prompt_tokens_api,  # API tokens (context repeated N times)
@@ -1050,7 +1062,7 @@ def main():
                 rank, num_gpus, gpu_id, args.model,
                 shards[rank], strategies_to_run, str(output_dir),
                 args.max_new_tokens, args.dataset, args.enable_thinking,
-                dep_args,
+                dep_args, args.batch_size,
             )
         )
         p.start()
