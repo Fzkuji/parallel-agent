@@ -66,15 +66,20 @@ def load_squad_groups(
                 # Skip contexts that don't have enough questions
                 continue
         elif max_questions:
-            # Randomly sample number of questions between min_questions and max_questions
             # Determine actual range based on available questions
             actual_max = min(max_questions, len(rows))
             actual_min = min(min_questions, actual_max)
-            # Random sample count between min and max
-            num_questions = rng.randint(actual_min, actual_max)
-            # Shuffle and take first num_questions
-            rng.shuffle(rows)
-            rows = rows[:num_questions]
+
+            # If min == max, take exactly that many questions in order (no shuffle)
+            if actual_min == actual_max:
+                num_questions = actual_max
+                rows = rows[:num_questions]
+            else:
+                # Random sample count between min and max
+                num_questions = rng.randint(actual_min, actual_max)
+                # Shuffle and take first num_questions
+                rng.shuffle(rows)
+                rows = rows[:num_questions]
         questions = []
         for idx, row in enumerate(rows):
             qid = f"Q{idx + 1}"
