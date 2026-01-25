@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument("--eval-samples", type=int, default=100)
     parser.add_argument("--min-questions", type=int, default=3)
     parser.add_argument("--max-questions", type=int, default=5)
+    parser.add_argument("--fixed-question-count", type=int, default=None,
+                       help="Take exactly this many questions (in order) from each context")
 
     # Strategies
     parser.add_argument("--strategies", type=str, default="all_in_one,sequential,batch,collab_llm",
@@ -766,7 +768,7 @@ def _run_collab_llm(model, tokenizer, items, question_lookup,
 
 
 def load_dataset(dataset: str, split: str, max_contexts: int, min_questions: int,
-                 max_questions: int, seed: int) -> List[Dict]:
+                 max_questions: int, seed: int, fixed_question_count: Optional[int] = None) -> List[Dict]:
     """Load dataset based on name."""
     if dataset == "hotpot":
         from src.datasets.hotpot import load_hotpot_groups
@@ -778,7 +780,8 @@ def load_dataset(dataset: str, split: str, max_contexts: int, min_questions: int
         from src.datasets.squad import load_squad_groups
         return load_squad_groups(
             split=split, max_contexts=max_contexts,
-            min_questions=min_questions, max_questions=max_questions, seed=seed
+            min_questions=min_questions, max_questions=max_questions, seed=seed,
+            fixed_question_count=fixed_question_count
         )
     elif dataset == "quac":
         from src.datasets.quac import load_quac_groups
@@ -991,6 +994,8 @@ def main():
 
     # Load evaluation data
     logger.info(f"Loading evaluation data: {args.eval_samples} samples from {args.dataset}")
+    if args.fixed_question_count:
+        logger.info(f"Using fixed question count: {args.fixed_question_count} questions per context")
     eval_contexts = load_dataset(
         args.dataset,
         split="validation",
@@ -998,6 +1003,7 @@ def main():
         min_questions=args.min_questions,
         max_questions=args.max_questions,
         seed=args.seed,
+        fixed_question_count=args.fixed_question_count,
     )
     logger.info(f"Loaded {len(eval_contexts)} evaluation contexts")
 
