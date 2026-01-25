@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Experiment 4: N-Shot Effect Analysis
+Experiment 3: N-Shot Effect Analysis
 
 Tests how the number of consecutive questions (N-shot) affects model performance
 across different question types.
@@ -28,10 +28,10 @@ Metrics:
 
 Usage:
   # Single GPU:
-  python exp4_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
+  python exp3_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
 
   # Multi-GPU with DDP (e.g., 4 GPUs):
-  torchrun --nproc_per_node=4 exp4_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
+  torchrun --nproc_per_node=4 exp3_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
 """
 
 import sys
@@ -242,7 +242,7 @@ def run_nshot_condition(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Experiment 4: N-Shot Effect Analysis")
+    parser = argparse.ArgumentParser(description="Experiment 3: N-Shot Effect Analysis")
 
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
                        help="Model to use")
@@ -257,7 +257,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=64,
                        help="Maximum tokens to generate")
     parser.add_argument("--output-dir", type=str,
-                       default="outputs/preliminary/exp4",
+                       default="outputs/preliminary/exp3",
                        help="Output directory")
 
     args = parser.parse_args()
@@ -414,7 +414,7 @@ def main():
 
     # Save results (only on rank 0)
     if is_main:
-        output_file = output_dir / "exp4_nshot_results.json"
+        output_file = output_dir / "exp3_nshot_results.json"
         with open(output_file, 'w') as f:
             json.dump({
                 "model": args.model,
