@@ -20,6 +20,7 @@ def load_squad_groups(
     max_questions: Optional[int] = None,
     max_contexts: int = 3,
     seed: int = 13,
+    fixed_question_count: Optional[int] = None,
 ) -> List[dict]:
     """
     Load SQuAD questions grouped by shared context.
@@ -30,6 +31,8 @@ def load_squad_groups(
         max_questions: Maximum questions per context (truncate if exceeded).
         max_contexts: Maximum number of contexts to return.
         seed: Random seed for shuffling.
+        fixed_question_count: If set, take exactly this many questions from each context
+                            (in order, not random). Useful for controlled experiments.
 
     Returns:
         List of context dictionaries with questions.
@@ -54,8 +57,16 @@ def load_squad_groups(
 
     formatted: List[dict] = []
     for context_text, rows in selected:
-        # Randomly sample number of questions between min_questions and max_questions
-        if max_questions:
+        # Handle question sampling
+        if fixed_question_count is not None:
+            # Take exactly N questions in order (for controlled experiments)
+            if len(rows) >= fixed_question_count:
+                rows = rows[:fixed_question_count]
+            else:
+                # Skip contexts that don't have enough questions
+                continue
+        elif max_questions:
+            # Randomly sample number of questions between min_questions and max_questions
             # Determine actual range based on available questions
             actual_max = min(max_questions, len(rows))
             actual_min = min(min_questions, actual_max)
