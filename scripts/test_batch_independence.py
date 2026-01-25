@@ -34,20 +34,21 @@ model = AutoModelForCausalLM.from_pretrained(
 model.eval()
 print("Model loaded")
 
-# Load one 20-question context
+# Load contexts with 5 questions each (to match the degradation scenario)
 contexts = load_squad_groups(
     split="validation",
-    max_contexts=1,
+    max_contexts=1000,
     min_questions=20,
     max_questions=20,
     seed=42,
-    fixed_question_count=20
+    fixed_question_count=5
 )
 
 if len(contexts) == 0:
-    print("No 20-question contexts found!")
+    print("No contexts found!")
     sys.exit(1)
 
+# Test the first context (same one that showed degradation)
 context_data = contexts[0]
 items = []
 for q in context_data["questions"]:
@@ -59,6 +60,7 @@ for q in context_data["questions"]:
     })
 
 print(f"\nTesting with {len(items)} questions from context: {context_data.get('title', 'Unknown')}")
+print(f"This is context 0, which showed degradation from 100% (1Q) to 80% (5Q)")
 
 SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
 You MUST wrap your answer in <answer></answer> tags. Be concise.
@@ -97,7 +99,7 @@ for i, item in enumerate(items):
     generated = outputs[i][inputs["input_ids"][i].shape[0]:]
     raw_text = tokenizer.decode(generated, skip_special_tokens=True)
     batch_answers.append(raw_text)
-    print(f"Q{i+1} batch: {raw_text[:50]}...")
+    print(f"Q{i+1} batch: {raw_text}")
 
 # Method 2: Individual inference
 print("\n=== Method 2: Individual Inference ===")
@@ -127,7 +129,7 @@ for i, item in enumerate(items):
     generated = output_single[0][prompt_len:]
     raw_text = tokenizer.decode(generated, skip_special_tokens=True)
     individual_answers.append(raw_text)
-    print(f"Q{i+1} indiv: {raw_text[:50]}...")
+    print(f"Q{i+1} indiv: {raw_text}")
 
 # Compare
 print("\n=== Comparison ===")
