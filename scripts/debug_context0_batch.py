@@ -13,7 +13,8 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from src.datasets.squad import load_squad_groups
 from src.inference import extract_answer
-from src.evaluation import evaluate_predictions, Question
+from src.evaluation import evaluate_predictions
+from src.models import Question
 
 # Load model
 model_name = "Qwen/Qwen2.5-7B-Instruct"
