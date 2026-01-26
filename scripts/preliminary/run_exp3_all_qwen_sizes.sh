@@ -17,7 +17,7 @@ MODELS=(
 DATASETS="squad drop triviaqa mmlu gsm8k"
 SHOTS="0 1 2 3 4 5"
 MAX_CONTEXTS=100
-MAX_NEW_TOKENS=64
+MAX_NEW_TOKENS=1024
 
 for MODEL in "${MODELS[@]}"; do
     echo "========================================"
