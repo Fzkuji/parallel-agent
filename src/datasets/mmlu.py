@@ -34,9 +34,11 @@ def load_mmlu(
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
 
-    # Map split names
+    # Map split names - use test split for more questions per subject
+    # dev split only has 5 questions per subject (for few-shot examples)
+    # test split has 100+ questions per subject (for evaluation)
     if split == "validation":
-        split = "dev"  # MMLU uses 'dev' for validation
+        split = "test"  # Use test split for more questions
 
     # Load MMLU dataset (all subjects)
     if subjects is None:
@@ -74,54 +76,67 @@ def load_mmlu(
             print(f"Warning: Could not load subject '{subject}': {e}")
             continue
 
-    # Sample subjects
+    # Create multiple groups per subject to maximize data usage
     rng = random.Random(seed)
+    formatted: List[Dict] = []
+    group_idx = 0
+
+    # Shuffle subjects for variety
     available_subjects = list(subject_groups.keys())
     rng.shuffle(available_subjects)
-    selected_subjects = available_subjects[:max_contexts] if max_contexts else available_subjects
 
-    formatted: List[Dict] = []
+    # Create groups from each subject until we hit max_contexts
+    for subject in available_subjects:
+        if max_contexts and group_idx >= max_contexts:
+            break
 
-    for subject in selected_subjects:
         items = subject_groups[subject]
-
-        # Sample questions for this subject
         rng.shuffle(items)
-        num_questions = rng.randint(min_questions, min(max_questions, len(items)))
-        selected_items = items[:num_questions]
 
-        # Build context (just subject name)
-        context = f"Subject: {subject.replace('_', ' ').title()}"
+        # Create multiple groups from this subject
+        num_questions = min_questions if min_questions == max_questions else rng.randint(min_questions, max_questions)
+        start_idx = 0
 
-        questions = []
-        for i, item in enumerate(selected_items):
-            question_text = item["question"].strip()
-            choices = item["choices"]
-            correct_idx = item["answer"]  # 0-3 for A-D
+        while start_idx + num_questions <= len(items):
+            if max_contexts and group_idx >= max_contexts:
+                break
 
-            # Format as multiple choice
-            choice_letters = ["A", "B", "C", "D"]
-            formatted_choices = "\n".join(
-                f"{letter}. {choice}"
-                for letter, choice in zip(choice_letters, choices)
-            )
-            full_question = f"{question_text}\n{formatted_choices}"
+            selected_items = items[start_idx:start_idx + num_questions]
+            start_idx += num_questions
 
-            # Answer is the letter (A, B, C, or D)
-            correct_answer = choice_letters[correct_idx]
+            # Build context (subject name with group number)
+            context = f"Subject: {subject.replace('_', ' ').title()}"
 
-            questions.append({
-                "qid": f"Q{i+1}",
-                "question": full_question,
-                "answer_tokens": 5,  # MCQ answers are typically short
-                "references": [correct_answer, correct_answer.lower()],
-            })
+            questions = []
+            for i, item in enumerate(selected_items):
+                question_text = item["question"].strip()
+                choices = item["choices"]
+                correct_idx = item["answer"]  # 0-3 for A-D
 
-        if questions:
-            formatted.append({
-                "context": context,
-                "title": subject,
-                "questions": questions,
-            })
+                # Format as multiple choice
+                choice_letters = ["A", "B", "C", "D"]
+                formatted_choices = "\n".join(
+                    f"{letter}. {choice}"
+                    for letter, choice in zip(choice_letters, choices)
+                )
+                full_question = f"{question_text}\n{formatted_choices}"
+
+                # Answer is the letter (A, B, C, or D)
+                correct_answer = choice_letters[correct_idx]
+
+                questions.append({
+                    "qid": f"Q{i+1}",
+                    "question": full_question,
+                    "answer_tokens": 5,  # MCQ answers are typically short
+                    "references": [correct_answer, correct_answer.lower()],
+                })
+
+            if questions:
+                formatted.append({
+                    "context": context,
+                    "title": f"{subject}-{group_idx}",
+                    "questions": questions,
+                })
+                group_idx += 1
 
     return formatted
