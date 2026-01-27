@@ -109,11 +109,11 @@ def load_dataset_questions(dataset: str, seed: int, min_questions: int, max_cont
 
     # Flatten to list of questions
     all_questions = []
-    for ctx in contexts:
+    for ctx_idx, ctx in enumerate(contexts):
         context_text = ctx["context"]
         for q in ctx["questions"]:
             all_questions.append({
-                "qid": f"{ctx['title']}_{q['qid']}",
+                "qid": f"ctx{ctx_idx}_{q['qid']}",  # Use numeric index to avoid title collisions
                 "question": q["text"],
                 "context": context_text,
                 "references": q.get("references", []),
