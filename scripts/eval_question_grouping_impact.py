@@ -658,8 +658,10 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, gpu_id
 
     summary = {}
     num_groups = len(groups)
+    # Use mapped dataset name for evaluation (e.g., "cmb" -> "cmb_exam_context" for accuracy metrics)
+    eval_dataset = EVAL_DATASET_MAP.get(args.dataset, args.dataset)
     for strategy_name, result_data in all_results.items():
-        metrics = evaluate_predictions(result_data["predictions"], question_lookup, dataset=args.dataset)
+        metrics = evaluate_predictions(result_data["predictions"], question_lookup, dataset=eval_dataset)
         summary[strategy_name] = {
             "metrics": metrics,
             "latency": result_data["latency"],
@@ -695,6 +697,12 @@ STRATEGY_DISPLAY = {
     "sequential": "Sequential",
     "memory": "Memory",
     "cross_batch": "Cross-Batch",
+}
+
+# Mapping from loader dataset name to evaluation dataset name
+# CMB loader uses "cmb" but loads CMB-Exam (multiple choice), so evaluation should use "cmb_exam_context"
+EVAL_DATASET_MAP = {
+    "cmb": "cmb_exam_context",  # CMB-Exam context groups -> accuracy metric
 }
 
 
