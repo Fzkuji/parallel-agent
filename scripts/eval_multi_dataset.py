@@ -289,6 +289,13 @@ Question: What color is the sky?
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
+                # Debug: print first 2 examples from first group
+                if local_idx == 0 and i < 2:
+                    print(f"\n[DEBUG GPU {physical_gpu_id}] Question: {q['question'][:80]}...")
+                    print(f"[DEBUG] Raw response: {response[:200]}...")
+                    print(f"[DEBUG] Extracted answer: '{answer}' (valid={valid})")
+                    print(f"[DEBUG] References: {q.get('references', [])[:2]}")
+
     print(f"[GPU {physical_gpu_id}] Done processing {len(groups)} groups")
     result_queue.put((worker_id, results))
 
