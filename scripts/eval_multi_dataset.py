@@ -233,9 +233,9 @@ Question: What color is the sky?
                 results["sequential"]["latency"] += time.perf_counter() - start
 
                 response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                answer = extract_answer(response)
+                answer, valid = extract_answer(response)  # extract_answer returns (str, bool)
                 conversation.append({"role": "assistant", "content": response})
-                results["sequential"]["predictions"][q["qid"]] = (answer, True)
+                results["sequential"]["predictions"][q["qid"]] = (answer, valid)
 
         # Strategy: batch (independent)
         if "batch" in results:
@@ -256,8 +256,8 @@ Question: What color is the sky?
                 results["batch"]["latency"] += time.perf_counter() - start
 
                 response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                answer = extract_answer(response)
-                results["batch"]["predictions"][q["qid"]] = (answer, True)
+                answer, valid = extract_answer(response)  # extract_answer returns (str, bool)
+                results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
     print(f"[GPU {physical_gpu_id}] Done processing {len(groups)} groups")
     result_queue.put((worker_id, results))
