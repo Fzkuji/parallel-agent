@@ -419,20 +419,29 @@ def main():
             logger.error(f"Failed to load {dataset}: {e}")
             continue
 
+        # Calculate LCM of all group sizes to ensure all tests use exactly the same questions
+        from math import gcd
+        from functools import reduce
+        def lcm(a, b):
+            return a * b // gcd(a, b)
+        lcm_value = reduce(lcm, group_sizes)
+
+        # Trim to largest multiple of LCM so all group sizes work with same questions
+        total_questions = len(all_questions)
+        usable_questions = (total_questions // lcm_value) * lcm_value
+        if usable_questions < total_questions:
+            logger.info(f"Trimming from {total_questions} to {usable_questions} questions (divisible by LCM={lcm_value})")
+            all_questions = all_questions[:usable_questions]
+
+        if len(all_questions) == 0:
+            logger.warning(f"No questions after trimming for dataset {dataset}")
+            continue
+
+        logger.info(f"All group sizes will test the same {len(all_questions)} questions")
+
         dataset_results = {}
         for group_size in group_sizes:
-            if len(all_questions) % group_size != 0:
-                # Trim questions to fit group size
-                trim_to = (len(all_questions) // group_size) * group_size
-                questions_subset = all_questions[:trim_to]
-            else:
-                questions_subset = all_questions
-
-            if len(questions_subset) == 0:
-                logger.warning(f"No questions for group size {group_size}")
-                continue
-
-            summary = run_evaluation(args, dataset, group_size, questions_subset, output_dir, gpu_ids)
+            summary = run_evaluation(args, dataset, group_size, all_questions, output_dir, gpu_ids)
             dataset_results[group_size] = summary
 
         all_results[dataset] = dataset_results
