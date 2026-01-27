@@ -265,30 +265,26 @@ Question: What color is the sky?
                 conversation.append({"role": "assistant", "content": response})
                 results["sequential"]["predictions"][q["qid"]] = (answer, valid)
 
-        # Strategy: batch (independent) - batched generation like working script
+        # Strategy: batch (independent) - process one at a time for consistent results
         if "batch" in results:
-            prompts = []
             for q in group:
                 prompt = f"Passage:\n{q['context']}\n\nQuestion: {q['question']}"
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
                 full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                prompts.append(full_prompt)
 
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
+                inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
 
-            start = time.perf_counter()
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=1024,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            results["batch"]["latency"] += time.perf_counter() - start
+                start = time.perf_counter()
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=1024,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                results["batch"]["latency"] += time.perf_counter() - start
 
-            for i, q in enumerate(group):
-                generated = outputs[i][inputs["input_ids"][i].shape[0]:]
-                response = tokenizer.decode(generated, skip_special_tokens=True)
+                response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
