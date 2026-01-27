@@ -49,8 +49,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Question grouping impact experiment")
 
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--dataset", type=str, default="squad", choices=["squad", "cmb"],
-                       help="Dataset to use (squad or cmb)")
+    parser.add_argument("--dataset", type=str, default="squad",
+                       choices=["squad", "hotpot", "quac", "quality", "drop", "cmb", "triviaqa", "coqa"],
+                       help="Dataset to use")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--group-sizes", type=str, default="1,4,8,12,16",
                        help="Group sizes to test (questions per group)")
@@ -69,27 +70,30 @@ def parse_args():
 
 def load_all_questions(dataset="squad", seed=42, min_questions=16, max_contexts=100):
     """Load questions from contexts with at least min_questions questions each."""
-    if dataset == "squad":
-        from src.datasets.squad import load_squad_groups
-        contexts = load_squad_groups(
-            split="validation",
-            max_contexts=max_contexts,
-            min_questions=min_questions,
-            max_questions=1000,  # No upper limit
-            seed=seed,
-            fixed_question_count=min_questions  # Load exactly min_questions questions per context
-        )
-    elif dataset == "cmb":
-        from src.datasets.cmb import load_cmb_exam_context_groups
-        contexts = load_cmb_exam_context_groups(
-            split="test",
-            min_questions=min_questions,
-            max_questions=min_questions,  # fixed count
-            max_contexts=max_contexts,
-            seed=seed,
-        )
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+    from src.eval_utils import load_dataset_groups
+
+    # Determine appropriate split for each dataset
+    split_map = {
+        "squad": "validation",
+        "hotpot": "validation",
+        "quac": "validation",
+        "quality": "dev",
+        "drop": "validation",
+        "cmb": "test",
+        "triviaqa": "validation",
+        "coqa": "validation",
+    }
+    split = split_map.get(dataset, "validation")
+
+    contexts = load_dataset_groups(
+        dataset=dataset,
+        split=split,
+        max_contexts=max_contexts,
+        min_questions=min_questions,
+        max_questions=1000,  # No upper limit
+        seed=seed,
+        fixed_question_count=min_questions if dataset in ["squad", "cmb"] else None
+    )
 
     logger.info(f"Loaded {len(contexts)} contexts (each with {min_questions} questions)")
 
@@ -113,26 +117,29 @@ def load_all_questions(dataset="squad", seed=42, min_questions=16, max_contexts=
 
 def load_memory_bank(dataset="squad", seed=42, max_samples=1000):
     """Load training set QA pairs as memory bank for few-shot retrieval."""
-    if dataset == "squad":
-        from src.datasets.squad import load_squad_groups
-        contexts = load_squad_groups(
-            split="train",
-            max_contexts=max_samples,
-            min_questions=1,
-            max_questions=5,
-            seed=seed,
-        )
-    elif dataset == "cmb":
-        from src.datasets.cmb import load_cmb_exam_context_groups
-        contexts = load_cmb_exam_context_groups(
-            split="train",
-            min_questions=1,
-            max_questions=5,
-            max_contexts=max_samples,
-            seed=seed,
-        )
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+    from src.eval_utils import load_dataset_groups
+
+    # Determine appropriate train split for each dataset
+    train_split_map = {
+        "squad": "train",
+        "hotpot": "train",
+        "quac": "train",
+        "quality": "train",
+        "drop": "train",
+        "cmb": "train",
+        "triviaqa": "train",
+        "coqa": "train",
+    }
+    split = train_split_map.get(dataset, "train")
+
+    contexts = load_dataset_groups(
+        dataset=dataset,
+        split=split,
+        max_contexts=max_samples,
+        min_questions=1,
+        max_questions=5,
+        seed=seed,
+    )
 
     # Flatten to QA pairs
     memory_bank = []
