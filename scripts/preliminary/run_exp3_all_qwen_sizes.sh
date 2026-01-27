@@ -17,7 +17,8 @@ MODELS=(
 DATASETS="squad drop triviaqa mmlu gsm8k"
 SHOTS="0 1 2 3 4 5"
 MAX_CONTEXTS=100
-MAX_NEW_TOKENS=1024
+MAX_NEW_TOKENS=512
+BATCH_SIZE=16
 
 for MODEL in "${MODELS[@]}"; do
     echo "========================================"
@@ -34,6 +35,7 @@ for MODEL in "${MODELS[@]}"; do
         --shots $SHOTS \
         --max-contexts $MAX_CONTEXTS \
         --max-new-tokens $MAX_NEW_TOKENS \
+        --batch-size $BATCH_SIZE \
         --output-dir "$OUTPUT_DIR"
 
     echo ""

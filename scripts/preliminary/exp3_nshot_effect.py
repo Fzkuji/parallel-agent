@@ -40,9 +40,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import json
 import argparse
+import time
 from typing import Dict, List, Any, Optional, Tuple
 import torch
 import torch.distributed as dist
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from scripts.preliminary.utils import (
@@ -54,7 +56,10 @@ from src.datasets.triviaqa import load_triviaqa_groups
 from src.datasets.mmlu import load_mmlu
 from src.datasets.gsm8k import load_gsm8k
 from src.models import Question
-from src.strategies import run_sequential_strategy, run_full_batch_strategy
+from src.strategies import run_sequential_strategy
+from src.prompts import build_single_prompt, MULTIPLE_CHOICE_DATASETS
+from src.inference import extract_answer
+from src.evaluation import evaluate_predictions
 
 
 def load_dataset_for_nshot(
@@ -140,6 +145,123 @@ def load_dataset_for_nshot(
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
+def run_batched_0shot(
+    data: List[Dict],
+    tokenizer,
+    model,
+    max_new_tokens: int,
+    dataset: str,
+    batch_size: int = 8,
+    is_main: bool = True,
+) -> Dict[str, Any]:
+    """
+    Run 0-shot with batched parallel inference.
+
+    Collects all questions across contexts and processes them in batches.
+    """
+    # Collect all questions with their contexts
+    all_items = []
+    question_lookup = {}
+
+    for ctx_idx, context_data in enumerate(data):
+        background = context_data["context"]
+        for q_data in context_data["questions"]:
+            qid = f"ctx{ctx_idx}_{q_data['qid']}"
+            question = Question(
+                qid=qid,
+                text=q_data.get("text", q_data.get("question", "")),
+                priority=1.0,
+                answer_tokens=q_data.get("answer_tokens", 32),
+                type_hint=None,
+                references=q_data.get("references", [])
+            )
+            question_lookup[qid] = question
+            all_items.append({
+                "qid": qid,
+                "question": question,
+                "background": background,
+            })
+
+    if not all_items:
+        return {
+            "n_shot": 0,
+            "accuracy": 0.0,
+            "total_questions": 0,
+            "total_correct": 0,
+            "position_metrics": {},
+        }
+
+    # Build all prompts
+    all_prompts = []
+    for item in all_items:
+        system_prompt, user_prompt = build_single_prompt(
+            item["background"], item["question"], dataset
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        all_prompts.append(prompt)
+
+    # Batch inference
+    answer_records = {}
+    total_batches = (len(all_prompts) + batch_size - 1) // batch_size
+
+    pbar = tqdm(total=total_batches, desc="0-shot batch", disable=not is_main)
+
+    for batch_start in range(0, len(all_prompts), batch_size):
+        batch_end = min(batch_start + batch_size, len(all_prompts))
+        batch_prompts = all_prompts[batch_start:batch_end]
+        batch_items = all_items[batch_start:batch_end]
+
+        # Tokenize batch
+        inputs = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096,
+        ).to(model.device)
+
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        # Decode and extract answers
+        for i, item in enumerate(batch_items):
+            input_len = inputs["input_ids"][i].shape[0]
+            generated = outputs[i][input_len:]
+            response = tokenizer.decode(generated, skip_special_tokens=True)
+
+            answer, valid = extract_answer(response, dataset)
+            answer_records[item["qid"]] = (answer, valid)
+
+        pbar.update(1)
+
+    pbar.close()
+
+    # Evaluate
+    metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
+    total_questions = len(answer_records)
+    total_correct = int(round(metrics.get("strict_acc", 0) * total_questions))
+
+    return {
+        "n_shot": 0,
+        "accuracy": metrics.get("strict_acc", 0),
+        "total_questions": total_questions,
+        "total_correct": total_correct,
+        "position_metrics": {},
+    }
+
+
 def run_nshot_condition(
     data: List[Dict],
     n_shot: int,
@@ -147,6 +269,8 @@ def run_nshot_condition(
     model,
     max_new_tokens: int,
     dataset: str,
+    batch_size: int = 8,
+    is_main: bool = True,
 ) -> Dict[str, Any]:
     """
     Run N-shot experiment condition.
@@ -158,15 +282,27 @@ def run_nshot_condition(
         model: Language model
         max_new_tokens: Max tokens to generate
         dataset: Dataset name for evaluation
+        batch_size: Batch size for 0-shot inference
+        is_main: Whether this is the main process (for progress bar)
 
     Returns:
         Result dictionary with aggregated metrics
     """
-    all_results = []
-    position_correct = {}  # Track accuracy by position
-    position_total = {}
+    # 0-shot: Use batched parallel inference
+    if n_shot == 0:
+        return run_batched_0shot(
+            data, tokenizer, model, max_new_tokens, dataset, batch_size, is_main
+        )
 
-    for context_data in data:
+    # N-shot: Sequential processing with context accumulation
+    position_correct = {}
+    position_total = {}
+    all_correct = 0
+    all_total = 0
+
+    pbar = tqdm(data, desc=f"{n_shot}-shot", disable=not is_main)
+
+    for context_data in pbar:
         background = context_data["context"]
         questions = [
             Question(
@@ -180,47 +316,31 @@ def run_nshot_condition(
             for q in context_data["questions"]
         ]
 
-        if n_shot == 0:
-            # 0-shot: Independent batch processing
-            result = run_full_batch_strategy(
-                background=background,
-                questions=questions,
-                tokenizer=tokenizer,
-                model=model,
-                max_new_tokens=max_new_tokens,
-                strategy_name="batch",
-                dataset=dataset,
-            )
-        else:
-            # N-shot: Sequential with context accumulation
-            result = run_sequential_strategy(
-                background=background,
-                questions=questions,
-                tokenizer=tokenizer,
-                model=model,
-                max_new_tokens=max_new_tokens,
-                dataset=dataset,
-            )
+        result = run_sequential_strategy(
+            background=background,
+            questions=questions,
+            tokenizer=tokenizer,
+            model=model,
+            max_new_tokens=max_new_tokens,
+            dataset=dataset,
+        )
 
-        all_results.append((result, len(questions)))
+        # Aggregate metrics
+        n_questions = len(questions)
+        n_correct = int(round(result.metrics.get("strict_acc", 0) * n_questions))
+        all_correct += n_correct
+        all_total += n_questions
 
         # Track per-position metrics
-        if n_shot > 0 and "turns" in result.details:
+        if "turns" in result.details:
             for i, turn in enumerate(result.details["turns"]):
                 pos = i + 1
                 if pos not in position_correct:
                     position_correct[pos] = 0
                     position_total[pos] = 0
                 position_total[pos] += 1
-                # Check if this turn was correct
                 if turn.get("strict_valid", False):
                     position_correct[pos] += 1
-
-    # Aggregate metrics (strict_acc is EM accuracy as ratio 0-1)
-    total_questions = sum(n_q for _, n_q in all_results)
-    weighted_acc = sum(r.metrics.get("strict_acc", 0) * n_q for r, n_q in all_results)
-    accuracy = weighted_acc / total_questions if total_questions > 0 else 0.0
-    total_correct = int(round(weighted_acc))
 
     # Compute position-wise accuracy
     position_metrics = {}
@@ -232,11 +352,13 @@ def run_nshot_condition(
                 "total": position_total[pos],
             }
 
+    accuracy = all_correct / all_total if all_total > 0 else 0.0
+
     return {
         "n_shot": n_shot,
         "accuracy": accuracy,
-        "total_questions": total_questions,
-        "total_correct": total_correct,
+        "total_questions": all_total,
+        "total_correct": all_correct,
         "position_metrics": position_metrics,
     }
 
@@ -254,8 +376,10 @@ def main():
                        help="N-shot values to test (0 = batch mode)")
     parser.add_argument("--max-contexts", type=int, default=100,
                        help="Maximum contexts per dataset per shot")
-    parser.add_argument("--max-new-tokens", type=int, default=64,
+    parser.add_argument("--max-new-tokens", type=int, default=512,
                        help="Maximum tokens to generate")
+    parser.add_argument("--batch-size", type=int, default=8,
+                       help="Batch size for 0-shot inference")
     parser.add_argument("--output-dir", type=str,
                        default="outputs/preliminary/exp3",
                        help="Output directory")
@@ -345,6 +469,8 @@ def main():
                 model=model,
                 max_new_tokens=args.max_new_tokens,
                 dataset=dataset_key,
+                batch_size=args.batch_size,
+                is_main=is_main,
             )
 
             # Gather results from all ranks
