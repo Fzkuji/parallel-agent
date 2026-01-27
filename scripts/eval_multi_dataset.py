@@ -104,6 +104,15 @@ def load_dataset_questions(dataset: str, seed: int, min_questions: int, max_cont
             max_contexts=max_contexts,
             seed=seed,
         )
+    elif dataset == "cmb":
+        from src.datasets.cmb import load_cmb_exam_context_groups
+        contexts = load_cmb_exam_context_groups(
+            split="test",
+            min_questions=min_questions,
+            max_questions=min_questions,
+            max_contexts=max_contexts,
+            seed=seed,
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -176,8 +185,8 @@ Question: What color is the sky?
     # Import extract_answer
     from src.inference import extract_answer
 
-    # Initialize results
-    results = {s: {"predictions": {}, "latency": 0.0} for s in strategies_to_run}
+    # Initialize results with token tracking
+    results = {s: {"predictions": {}, "latency": 0.0, "input_tokens": 0, "output_tokens": 0} for s in strategies_to_run}
 
     # Process each group
     for local_idx, (group_idx, group) in enumerate(zip(group_indices, groups)):
@@ -205,7 +214,13 @@ Question: What color is the sky?
                 )
             results["all_in_one"]["latency"] += time.perf_counter() - start
 
-            response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            # Track tokens
+            input_len = inputs["input_ids"].shape[1]
+            output_len = outputs[0].shape[0] - input_len
+            results["all_in_one"]["input_tokens"] += input_len
+            results["all_in_one"]["output_tokens"] += output_len
+
+            response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
             # Try multiple parsing strategies
             answers = []
@@ -260,7 +275,13 @@ Question: What color is the sky?
                     )
                 results["sequential"]["latency"] += time.perf_counter() - start
 
-                response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                # Track tokens
+                input_len = inputs["input_ids"].shape[1]
+                output_len = outputs[0].shape[0] - input_len
+                results["sequential"]["input_tokens"] += input_len
+                results["sequential"]["output_tokens"] += output_len
+
+                response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 conversation.append({"role": "assistant", "content": response})
                 results["sequential"]["predictions"][q["qid"]] = (answer, valid)
@@ -284,7 +305,13 @@ Question: What color is the sky?
                     )
                 results["batch"]["latency"] += time.perf_counter() - start
 
-                response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                # Track tokens
+                input_len = inputs["input_ids"].shape[1]
+                output_len = outputs[0].shape[0] - input_len
+                results["batch"]["input_tokens"] += input_len
+                results["batch"]["output_tokens"] += output_len
+
+                response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
@@ -330,12 +357,14 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
         processes.append(p)
 
     # Collect results
-    all_results = {s: {"predictions": {}, "latency": 0.0} for s in strategies_to_run}
+    all_results = {s: {"predictions": {}, "latency": 0.0, "input_tokens": 0, "output_tokens": 0} for s in strategies_to_run}
     for _ in range(len(processes)):
         worker_id, worker_results = result_queue.get()
         for strategy, data in worker_results.items():
             all_results[strategy]["predictions"].update(data["predictions"])
             all_results[strategy]["latency"] += data["latency"]
+            all_results[strategy]["input_tokens"] += data.get("input_tokens", 0)
+            all_results[strategy]["output_tokens"] += data.get("output_tokens", 0)
 
     for p in processes:
         p.join()
@@ -363,15 +392,24 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
                 predictions_for_eval[qid] = (pred_ans, valid)  # 2-tuple: (prediction, strict_valid)
 
         metrics = evaluate_predictions(predictions_for_eval, lookup, dataset=dataset)
+        input_tokens = all_results[strategy]["input_tokens"]
+        output_tokens = all_results[strategy]["output_tokens"]
+        total_tokens = input_tokens + output_tokens
+        latency = all_results[strategy]["latency"]
+
         summary[strategy] = {
             "metrics": {
                 "strict_acc": metrics["strict_acc"],
                 "f1": metrics["f1"],
             },
-            "latency": all_results[strategy]["latency"],
+            "latency": latency,
+            "wall_time": wall_time,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
             "num_questions": len(all_questions),
         }
-        logger.info(f"{strategy}: EM={metrics['strict_acc']:.3f}, F1={metrics['f1']:.3f}")
+        logger.info(f"{strategy}: EM={metrics['strict_acc']:.3f}, F1={metrics['f1']:.3f}, Latency={latency:.2f}s, Tokens={total_tokens}")
 
     return summary
 
@@ -460,6 +498,9 @@ def main():
                 continue
 
             f.write(f"\n## {dataset.upper()}\n\n")
+
+            # Accuracy table
+            f.write("### Accuracy (EM)\n\n")
             header = f"{'GroupSize':<10}"
             for s in strategies:
                 header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
@@ -472,6 +513,42 @@ def main():
                     if s in all_results[dataset][gs]:
                         acc = all_results[dataset][gs][s]["metrics"]["strict_acc"]
                         row += f" | {acc*100:>11.1f}%"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            # Latency table
+            f.write("\n### Latency (GPU seconds)\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        lat = all_results[dataset][gs][s]["latency"]
+                        row += f" | {lat:>11.1f}s"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            # Token count table
+            f.write("\n### Total Tokens\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        tokens = all_results[dataset][gs][s].get("total_tokens", 0)
+                        row += f" | {tokens:>12,}"
                     else:
                         row += f" | {'--':>12}"
                 f.write(row + "\n")
