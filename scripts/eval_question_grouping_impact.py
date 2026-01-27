@@ -79,7 +79,7 @@ def load_all_questions(dataset="squad", seed=42, min_questions=16, max_contexts=
         "quac": "validation",
         "quality": "dev",
         "drop": "validation",
-        "cmb": "test",
+        "cmb": "train",
         "triviaqa": "validation",
         "coqa": "validation",
     }
