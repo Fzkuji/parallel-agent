@@ -933,6 +933,87 @@ def main():
                     line += f" | {'--':>12}"
             f.write(line + "\n")
 
+        # Per-question average tables
+        f.write("\n## Avg Prompt Tokens per Question (Deduplicated)\n\n")
+        header = f"{'GroupSize':<10}"
+        for strategy in actual_strategies:
+            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for gs in sorted(results_by_group_size.keys()):
+            result = results_by_group_size[gs]
+            line = f"{gs:<10}"
+            for strategy in actual_strategies:
+                if strategy in result:
+                    tokens = result[strategy].get('total_prompt_tokens', 0)
+                    num_q = result[strategy].get('num_questions', 1)
+                    avg = tokens / num_q if num_q > 0 else 0
+                    line += f" | {avg:>12.1f}"
+                else:
+                    line += f" | {'--':>12}"
+            f.write(line + "\n")
+
+        f.write("\n## Avg Prompt Tokens per Question (API)\n\n")
+        header = f"{'GroupSize':<10}"
+        for strategy in actual_strategies:
+            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for gs in sorted(results_by_group_size.keys()):
+            result = results_by_group_size[gs]
+            line = f"{gs:<10}"
+            for strategy in actual_strategies:
+                if strategy in result:
+                    tokens = result[strategy].get('total_prompt_tokens_api', 0)
+                    num_q = result[strategy].get('num_questions', 1)
+                    avg = tokens / num_q if num_q > 0 else 0
+                    line += f" | {avg:>12.1f}"
+                else:
+                    line += f" | {'--':>12}"
+            f.write(line + "\n")
+
+        f.write("\n## Avg Generated Tokens per Question\n\n")
+        header = f"{'GroupSize':<10}"
+        for strategy in actual_strategies:
+            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for gs in sorted(results_by_group_size.keys()):
+            result = results_by_group_size[gs]
+            line = f"{gs:<10}"
+            for strategy in actual_strategies:
+                if strategy in result:
+                    tokens = result[strategy].get('total_generated_tokens', 0)
+                    num_q = result[strategy].get('num_questions', 1)
+                    avg = tokens / num_q if num_q > 0 else 0
+                    line += f" | {avg:>12.1f}"
+                else:
+                    line += f" | {'--':>12}"
+            f.write(line + "\n")
+
+        f.write("\n## Avg Latency per Question (seconds)\n\n")
+        header = f"{'GroupSize':<10}"
+        for strategy in actual_strategies:
+            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for gs in sorted(results_by_group_size.keys()):
+            result = results_by_group_size[gs]
+            line = f"{gs:<10}"
+            for strategy in actual_strategies:
+                if strategy in result:
+                    latency = result[strategy].get('latency', 0)
+                    num_q = result[strategy].get('num_questions', 1)
+                    avg = latency / num_q if num_q > 0 else 0
+                    line += f" | {avg:>12.4f}"
+                else:
+                    line += f" | {'--':>12}"
+            f.write(line + "\n")
+
     logger.info(f"Summary saved to {summary_file}\n")
     with open(summary_file, 'r') as f:
         print(f.read())

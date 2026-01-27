@@ -681,6 +681,83 @@ def main():
                         row += f" | {'--':>12}"
                 f.write(row + "\n")
 
+            # Per-question average tables
+            f.write("\n### Avg Prompt Tokens per Question (Deduplicated)\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        tokens = all_results[dataset][gs][s].get("total_prompt_tokens", 0)
+                        num_q = all_results[dataset][gs][s].get("num_questions", 1)
+                        avg = tokens / num_q if num_q > 0 else 0
+                        row += f" | {avg:>12.1f}"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            f.write("\n### Avg Prompt Tokens per Question (API)\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        tokens = all_results[dataset][gs][s].get("total_prompt_tokens_api", 0)
+                        num_q = all_results[dataset][gs][s].get("num_questions", 1)
+                        avg = tokens / num_q if num_q > 0 else 0
+                        row += f" | {avg:>12.1f}"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            f.write("\n### Avg Generated Tokens per Question\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        tokens = all_results[dataset][gs][s].get("total_generated_tokens", 0)
+                        num_q = all_results[dataset][gs][s].get("num_questions", 1)
+                        avg = tokens / num_q if num_q > 0 else 0
+                        row += f" | {avg:>12.1f}"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            f.write("\n### Avg Latency per Question (seconds)\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        latency = all_results[dataset][gs][s].get("latency", 0)
+                        num_q = all_results[dataset][gs][s].get("num_questions", 1)
+                        avg = latency / num_q if num_q > 0 else 0
+                        row += f" | {avg:>12.4f}"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
     logger.info(f"\n{'='*80}")
     logger.info("SUMMARY")
     logger.info(f"{'='*80}")
