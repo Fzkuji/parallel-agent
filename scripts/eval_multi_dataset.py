@@ -206,10 +206,35 @@ Question: What color is the sky?
             results["all_in_one"]["latency"] += time.perf_counter() - start
 
             response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-            answers = re.findall(r"<answer>(.*?)</answer>", response, re.DOTALL)
+
+            # Try multiple parsing strategies
+            answers = []
+
+            # Strategy 1: Look for numbered <answer> tags
+            numbered_answers = re.findall(r'\d+\.\s*<answer>(.*?)</answer>', response, re.DOTALL | re.IGNORECASE)
+            if len(numbered_answers) >= len(group):
+                answers = numbered_answers
+
+            # Strategy 2: Look for any <answer> tags
+            if not answers:
+                answers = re.findall(r'<answer>(.*?)</answer>', response, re.DOTALL | re.IGNORECASE)
+
+            # Strategy 3: Look for numbered answers without tags
+            if len(answers) < len(group):
+                lines = response.strip().split('\n')
+                numbered_lines = []
+                for line in lines:
+                    match = re.match(r'^(\d+)[\.\)]\s*(.+)', line.strip())
+                    if match:
+                        numbered_lines.append((int(match.group(1)), match.group(2).strip()))
+                if len(numbered_lines) >= len(group):
+                    numbered_lines.sort(key=lambda x: x[0])
+                    answers = [a[1] for a in numbered_lines[:len(group)]]
+
             for i, q in enumerate(group):
                 ans = answers[i].strip() if i < len(answers) else ""
-                results["all_in_one"]["predictions"][q["qid"]] = (ans, True)
+                ans = re.sub(r'</?answer>', '', ans).strip()
+                results["all_in_one"]["predictions"][q["qid"]] = (ans, len(ans) > 0)
 
         # Strategy: sequential
         if "sequential" in results:
@@ -233,7 +258,7 @@ Question: What color is the sky?
                 results["sequential"]["latency"] += time.perf_counter() - start
 
                 response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                answer, valid = extract_answer(response)  # extract_answer returns (str, bool)
+                answer, valid = extract_answer(response, args_dict.get("dataset"))
                 conversation.append({"role": "assistant", "content": response})
                 results["sequential"]["predictions"][q["qid"]] = (answer, valid)
 
@@ -256,7 +281,7 @@ Question: What color is the sky?
                 results["batch"]["latency"] += time.perf_counter() - start
 
                 response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                answer, valid = extract_answer(response)  # extract_answer returns (str, bool)
+                answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
     print(f"[GPU {physical_gpu_id}] Done processing {len(groups)} groups")
@@ -276,7 +301,7 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
     num_groups = len(groups)
     groups_per_gpu = (num_groups + num_gpus - 1) // num_gpus
 
-    args_dict = {"model": args.model}
+    args_dict = {"model": args.model, "dataset": dataset}
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -333,7 +358,7 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
                 pred_ans, valid = preds[qid]
                 predictions_for_eval[qid] = (pred_ans, valid)  # 2-tuple: (prediction, strict_valid)
 
-        metrics = evaluate_predictions(predictions_for_eval, lookup)
+        metrics = evaluate_predictions(predictions_for_eval, lookup, dataset=dataset)
         summary[strategy] = {
             "metrics": {
                 "strict_acc": metrics["strict_acc"],
