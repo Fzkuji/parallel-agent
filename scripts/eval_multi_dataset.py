@@ -320,20 +320,20 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
     summary = {"wall_time": wall_time}
     for strategy in strategies_to_run:
         preds = all_results[strategy]["predictions"]
-        questions_for_eval = []
-        predictions_for_eval = {}
+        lookup = {}  # Dict[str, Question]
+        predictions_for_eval = {}  # Dict[str, Tuple[str, bool]]
 
         for q in all_questions:
             qid = q["qid"]
-            questions_for_eval.append(Question(
+            lookup[qid] = Question(
                 qid=qid, text=q["question"], priority=1.0, answer_tokens=32,
                 references=q.get("references", []),
-            ))
+            )
             if qid in preds:
                 pred_ans, valid = preds[qid]
-                predictions_for_eval[qid] = (pred_ans, True, valid)
+                predictions_for_eval[qid] = (pred_ans, valid)  # 2-tuple: (prediction, strict_valid)
 
-        metrics = evaluate_predictions(questions_for_eval, predictions_for_eval)
+        metrics = evaluate_predictions(predictions_for_eval, lookup)
         summary[strategy] = {
             "metrics": {
                 "strict_acc": metrics["strict_acc"],
