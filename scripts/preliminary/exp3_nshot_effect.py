@@ -27,39 +27,36 @@ Metrics:
   - N-shot benefit = N-shot_acc - 0-shot_acc
 
 Usage:
-  # Single GPU:
-  python exp3_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
+  # Auto-detect GPUs and run in parallel:
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python exp3_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
 
-  # Multi-GPU with DDP (e.g., 4 GPUs):
-  torchrun --nproc_per_node=4 exp3_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad drop
+  # Single GPU:
+  CUDA_VISIBLE_DEVICES=0 python exp3_nshot_effect.py --model Qwen/Qwen2.5-7B-Instruct --datasets squad
 """
 
 import sys
+import os
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import json
 import argparse
-import time
-from typing import Dict, List, Any, Optional, Tuple
-import torch
-import torch.distributed as dist
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import multiprocessing as mp
+from typing import Dict, List, Any, Tuple
 
-from scripts.preliminary.utils import (
-    setup_distributed, cleanup_distributed, shard_data, gather_results
-)
-from src.datasets.squad import load_squad_groups
-from src.datasets.drop import load_drop_groups
-from src.datasets.triviaqa import load_triviaqa_groups
-from src.datasets.mmlu import load_mmlu
-from src.datasets.gsm8k import load_gsm8k
-from src.models import Question
-from src.strategies import run_sequential_strategy
-from src.prompts import build_single_prompt, MULTIPLE_CHOICE_DATASETS
-from src.inference import extract_answer
-from src.evaluation import evaluate_predictions
+
+def get_available_gpus() -> List[int]:
+    """Get list of available GPU IDs from CUDA_VISIBLE_DEVICES or detect all GPUs."""
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible:
+        gpu_ids = [int(x.strip()) for x in cuda_visible.split(",") if x.strip()]
+        return gpu_ids
+    else:
+        try:
+            import torch
+            return list(range(torch.cuda.device_count()))
+        except:
+            return [0]
 
 
 def load_dataset_for_nshot(
@@ -69,107 +66,134 @@ def load_dataset_for_nshot(
     n_shot: int,
     seed: int = 42,
 ) -> Tuple[List[Dict], str]:
-    """
-    Load dataset with exactly n_shot questions per context.
+    """Load dataset with exactly n_shot questions per context."""
+    from src.datasets.squad import load_squad_groups
+    from src.datasets.drop import load_drop_groups
+    from src.datasets.triviaqa import load_triviaqa_groups
+    from src.datasets.mmlu import load_mmlu
+    from src.datasets.gsm8k import load_gsm8k
 
-    For n_shot=0 (batch mode), we load single questions per context
-    to measure baseline performance.
-
-    Args:
-        dataset_name: Name of the dataset
-        split: Dataset split ('validation', 'test', etc.)
-        max_contexts: Maximum number of contexts to load
-        n_shot: Number of questions per context (0 = single question batch)
-        seed: Random seed
-
-    Returns:
-        Tuple of (data, dataset_key)
-    """
-    # For 0-shot, we still need at least 1 question per context
     effective_n = max(1, n_shot)
 
     if dataset_name == "squad":
         data = load_squad_groups(
-            split=split,
-            max_contexts=max_contexts,
-            min_questions=effective_n,
-            max_questions=effective_n,
-            seed=seed
+            split=split, max_contexts=max_contexts,
+            min_questions=effective_n, max_questions=effective_n, seed=seed
         )
         return data, "squad"
-
     elif dataset_name == "drop":
         data = load_drop_groups(
-            split=split,
-            max_contexts=max_contexts,
-            min_questions=effective_n,
-            max_questions=effective_n,
-            seed=seed
+            split=split, max_contexts=max_contexts,
+            min_questions=effective_n, max_questions=effective_n, seed=seed
         )
         return data, "drop"
-
     elif dataset_name == "triviaqa":
-        # TriviaQA: open-domain, group random questions together
         data = load_triviaqa_groups(
-            split=split,
-            max_groups=max_contexts,
-            min_questions=effective_n,
-            max_questions=effective_n,
-            seed=seed
+            split=split, max_groups=max_contexts,
+            min_questions=effective_n, max_questions=effective_n, seed=seed
         )
         return data, "triviaqa"
-
     elif dataset_name == "mmlu":
         data = load_mmlu(
-            split=split,
-            max_contexts=max_contexts,
-            min_questions=effective_n,
-            max_questions=effective_n,
-            seed=seed
+            split=split, max_contexts=max_contexts,
+            min_questions=effective_n, max_questions=effective_n, seed=seed
         )
         return data, "mmlu"
-
     elif dataset_name == "gsm8k":
-        # GSM8K uses 'test' split for validation
         gsm_split = "test" if split == "validation" else split
         data = load_gsm8k(
-            split=gsm_split,
-            max_contexts=max_contexts,
-            min_questions=effective_n,
-            max_questions=effective_n,
-            seed=seed
+            split=gsm_split, max_contexts=max_contexts,
+            min_questions=effective_n, max_questions=effective_n, seed=seed
         )
         return data, "gsm8k"
-
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
-def run_batched_0shot(
+def gpu_worker(
+    worker_id: int,
+    gpu_id: int,
+    data_chunk: List[Dict],
+    n_shot: int,
+    args_dict: Dict,
+    result_queue: mp.Queue,
+):
+    """Worker process that runs on a specific GPU."""
+    import torch
+    from tqdm import tqdm
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from src.models import Question
+    from src.strategies import run_sequential_strategy
+    from src.prompts import build_single_prompt, MULTIPLE_CHOICE_DATASETS
+    from src.inference import extract_answer
+    from src.evaluation import evaluate_predictions
+    from src.evaluation.basic import compute_em, compute_choice_accuracy
+
+    # Set device
+    device = f"cuda:{gpu_id}"
+    print(f"[Worker {worker_id}] Loading model on GPU {gpu_id}...")
+
+    # Load model
+    tokenizer = AutoTokenizer.from_pretrained(args_dict["model"])
+    model = AutoModelForCausalLM.from_pretrained(
+        args_dict["model"],
+        torch_dtype=torch.bfloat16,
+        device_map=None,
+        low_cpu_mem_usage=True,
+    )
+    model = model.to(device)
+    model.eval()
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = args_dict["dataset"]
+    max_new_tokens = args_dict["max_new_tokens"]
+    batch_size = args_dict["batch_size"]
+
+    print(f"[Worker {worker_id}] Processing {len(data_chunk)} contexts...")
+
+    # Run inference
+    if n_shot == 0:
+        # 0-shot: batched inference
+        result = run_batched_0shot_worker(
+            data_chunk, tokenizer, model, max_new_tokens, dataset, batch_size, worker_id
+        )
+    else:
+        # N-shot: sequential inference
+        result = run_nshot_worker(
+            data_chunk, n_shot, tokenizer, model, max_new_tokens, dataset, worker_id
+        )
+
+    print(f"[Worker {worker_id}] Done. Correct: {result['total_correct']}/{result['total_questions']}")
+    result_queue.put((worker_id, result))
+
+
+def run_batched_0shot_worker(
     data: List[Dict],
     tokenizer,
     model,
     max_new_tokens: int,
     dataset: str,
-    batch_size: int = 8,
-    is_main: bool = True,
+    batch_size: int,
+    worker_id: int,
 ) -> Dict[str, Any]:
-    """
-    Run 0-shot with batched parallel inference.
+    """Run 0-shot batched inference on a worker."""
+    import torch
+    from tqdm import tqdm
+    from src.models import Question
+    from src.prompts import build_single_prompt, MULTIPLE_CHOICE_DATASETS
+    from src.inference import extract_answer
+    from src.evaluation import evaluate_predictions
+    from src.evaluation.basic import compute_em, compute_choice_accuracy
 
-    Collects all questions across contexts and processes them in batches.
-    """
-    from src.evaluation.basic import compute_em, compute_f1, compute_choice_accuracy
-    from src.prompts import MULTIPLE_CHOICE_DATASETS
-
-    # Collect all questions with their contexts
     all_items = []
     question_lookup = {}
 
     for ctx_idx, context_data in enumerate(data):
         background = context_data["context"]
         for q_data in context_data["questions"]:
-            qid = f"ctx{ctx_idx}_{q_data['qid']}"
+            qid = f"w{worker_id}_ctx{ctx_idx}_{q_data['qid']}"
             question = Question(
                 qid=qid,
                 text=q_data.get("text", q_data.get("question", "")),
@@ -187,15 +211,11 @@ def run_batched_0shot(
 
     if not all_items:
         return {
-            "n_shot": 0,
-            "accuracy": 0.0,
-            "total_questions": 0,
-            "total_correct": 0,
-            "position_metrics": {},
-            "details": [],
+            "total_correct": 0, "total_questions": 0,
+            "position_metrics": {}, "details": [],
         }
 
-    # Build all prompts
+    # Build prompts
     all_prompts = []
     for item in all_items:
         system_prompt, user_prompt = build_single_prompt(
@@ -213,34 +233,24 @@ def run_batched_0shot(
     # Batch inference
     answer_records = {}
     detail_records = []
-    total_batches = (len(all_prompts) + batch_size - 1) // batch_size
 
-    pbar = tqdm(total=total_batches, desc="0-shot batch", disable=not is_main)
-
-    for batch_start in range(0, len(all_prompts), batch_size):
+    for batch_start in tqdm(range(0, len(all_prompts), batch_size),
+                            desc=f"[W{worker_id}] 0-shot", disable=(worker_id != 0)):
         batch_end = min(batch_start + batch_size, len(all_prompts))
         batch_prompts = all_prompts[batch_start:batch_end]
         batch_items = all_items[batch_start:batch_end]
 
-        # Tokenize batch
         inputs = tokenizer(
-            batch_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=4096,
+            batch_prompts, return_tensors="pt", padding=True,
+            truncation=True, max_length=4096,
         ).to(model.device)
 
-        # Generate
         with torch.no_grad():
             outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
+                **inputs, max_new_tokens=max_new_tokens,
+                do_sample=False, pad_token_id=tokenizer.pad_token_id,
             )
 
-        # Decode and extract answers
         for i, item in enumerate(batch_items):
             input_len = inputs["input_ids"][i].shape[0]
             generated = outputs[i][input_len:]
@@ -249,7 +259,6 @@ def run_batched_0shot(
             answer, valid = extract_answer(response, dataset)
             answer_records[item["qid"]] = (answer, valid)
 
-            # Compute correctness
             refs = item["question"].references
             if dataset in MULTIPLE_CHOICE_DATASETS:
                 correct = compute_choice_accuracy(answer, refs) > 0
@@ -267,67 +276,40 @@ def run_batched_0shot(
                 "position": 1,
             })
 
-        pbar.update(1)
-
-    pbar.close()
-
-    # Evaluate
     metrics = evaluate_predictions(answer_records, question_lookup, dataset=dataset)
     total_questions = len(answer_records)
     total_correct = int(round(metrics.get("strict_acc", 0) * total_questions))
 
     return {
-        "n_shot": 0,
-        "accuracy": metrics.get("strict_acc", 0),
-        "total_questions": total_questions,
         "total_correct": total_correct,
+        "total_questions": total_questions,
         "position_metrics": {},
         "details": detail_records,
     }
 
 
-def run_nshot_condition(
+def run_nshot_worker(
     data: List[Dict],
     n_shot: int,
     tokenizer,
     model,
     max_new_tokens: int,
     dataset: str,
-    batch_size: int = 8,
-    is_main: bool = True,
+    worker_id: int,
 ) -> Dict[str, Any]:
-    """
-    Run N-shot experiment condition.
+    """Run N-shot sequential inference on a worker."""
+    from tqdm import tqdm
+    from src.models import Question
+    from src.strategies import run_sequential_strategy
 
-    Args:
-        data: List of contexts, each with n_shot questions
-        n_shot: Number of questions per session (0 = batch mode)
-        tokenizer: Model tokenizer
-        model: Language model
-        max_new_tokens: Max tokens to generate
-        dataset: Dataset name for evaluation
-        batch_size: Batch size for 0-shot inference
-        is_main: Whether this is the main process (for progress bar)
-
-    Returns:
-        Result dictionary with aggregated metrics
-    """
-    # 0-shot: Use batched parallel inference
-    if n_shot == 0:
-        return run_batched_0shot(
-            data, tokenizer, model, max_new_tokens, dataset, batch_size, is_main
-        )
-
-    # N-shot: Sequential processing with context accumulation
     position_correct = {}
     position_total = {}
     all_correct = 0
     all_total = 0
     detail_records = []
 
-    pbar = tqdm(data, desc=f"{n_shot}-shot", disable=not is_main)
-
-    for ctx_idx, context_data in enumerate(pbar):
+    for ctx_idx, context_data in enumerate(tqdm(data, desc=f"[W{worker_id}] {n_shot}-shot",
+                                                  disable=(worker_id != 0))):
         background = context_data["context"]
         questions = [
             Question(
@@ -350,13 +332,11 @@ def run_nshot_condition(
             dataset=dataset,
         )
 
-        # Aggregate metrics
         n_questions = len(questions)
         n_correct = int(round(result.metrics.get("strict_acc", 0) * n_questions))
         all_correct += n_correct
         all_total += n_questions
 
-        # Track per-position metrics and collect details
         if "turns" in result.details:
             for i, turn in enumerate(result.details["turns"]):
                 pos = i + 1
@@ -368,9 +348,8 @@ def run_nshot_condition(
                 if is_correct:
                     position_correct[pos] += 1
 
-                # Collect detailed record (field names from run_sequential_strategy)
                 detail_records.append({
-                    "qid": turn.get("question_id", f"ctx{ctx_idx}_q{i}"),
+                    "qid": turn.get("question_id", f"w{worker_id}_ctx{ctx_idx}_q{i}"),
                     "question": turn.get("question", questions[i].text if i < len(questions) else ""),
                     "references": turn.get("gold_answers", questions[i].references if i < len(questions) else []),
                     "response": turn.get("raw_response", ""),
@@ -380,7 +359,6 @@ def run_nshot_condition(
                     "position": pos,
                 })
 
-    # Compute position-wise accuracy
     position_metrics = {}
     for pos in sorted(position_correct.keys()):
         if position_total[pos] > 0:
@@ -390,263 +368,219 @@ def run_nshot_condition(
                 "total": position_total[pos],
             }
 
-    accuracy = all_correct / all_total if all_total > 0 else 0.0
-
     return {
-        "n_shot": n_shot,
-        "accuracy": accuracy,
-        "total_questions": all_total,
         "total_correct": all_correct,
+        "total_questions": all_total,
         "position_metrics": position_metrics,
         "details": detail_records,
     }
 
 
+def run_nshot_parallel(
+    data: List[Dict],
+    n_shot: int,
+    args_dict: Dict,
+    gpu_ids: List[int],
+) -> Dict[str, Any]:
+    """Run N-shot experiment in parallel across GPUs."""
+    num_gpus = len(gpu_ids)
+    num_contexts = len(data)
+    contexts_per_gpu = (num_contexts + num_gpus - 1) // num_gpus
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    processes = []
+
+    for worker_id, gpu_id in enumerate(gpu_ids):
+        start_idx = worker_id * contexts_per_gpu
+        end_idx = min(start_idx + contexts_per_gpu, num_contexts)
+        if start_idx >= num_contexts:
+            break
+
+        data_chunk = data[start_idx:end_idx]
+        p = ctx.Process(
+            target=gpu_worker,
+            args=(worker_id, gpu_id, data_chunk, n_shot, args_dict, result_queue),
+        )
+        p.start()
+        processes.append(p)
+
+    # Collect results
+    all_results = []
+    for _ in range(len(processes)):
+        worker_id, result = result_queue.get()
+        all_results.append(result)
+
+    for p in processes:
+        p.join()
+
+    # Aggregate results
+    total_correct = sum(r["total_correct"] for r in all_results)
+    total_questions = sum(r["total_questions"] for r in all_results)
+    accuracy = total_correct / total_questions if total_questions > 0 else 0.0
+
+    # Aggregate position metrics
+    combined_position = {}
+    for r in all_results:
+        for pos, pm in r["position_metrics"].items():
+            if pos not in combined_position:
+                combined_position[pos] = {"correct": 0, "total": 0}
+            combined_position[pos]["correct"] += pm["correct"]
+            combined_position[pos]["total"] += pm["total"]
+
+    for pos in combined_position:
+        combined_position[pos]["accuracy"] = (
+            combined_position[pos]["correct"] / combined_position[pos]["total"]
+            if combined_position[pos]["total"] > 0 else 0.0
+        )
+
+    # Collect all details
+    all_details = []
+    for r in all_results:
+        all_details.extend(r.get("details", []))
+
+    return {
+        "n_shot": n_shot,
+        "accuracy": accuracy,
+        "total_questions": total_questions,
+        "total_correct": total_correct,
+        "position_metrics": combined_position,
+        "details": all_details,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Experiment 3: N-Shot Effect Analysis")
-
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct",
-                       help="Model to use")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--datasets", type=str, nargs="+",
-                       default=["squad", "drop", "triviaqa", "mmlu", "gsm8k"],
-                       help="Datasets to test")
-    parser.add_argument("--shots", type=int, nargs="+",
-                       default=[0, 1, 2, 3, 4, 5],
-                       help="N-shot values to test (0 = batch mode)")
-    parser.add_argument("--max-contexts", type=int, default=100,
-                       help="Maximum contexts per dataset per shot")
-    parser.add_argument("--max-new-tokens", type=int, default=512,
-                       help="Maximum tokens to generate")
-    parser.add_argument("--batch-size", type=int, default=8,
-                       help="Batch size for 0-shot inference")
-    parser.add_argument("--output-dir", type=str,
-                       default="outputs/preliminary/exp3",
-                       help="Output directory")
-
+                       default=["squad", "drop", "triviaqa", "mmlu", "gsm8k"])
+    parser.add_argument("--shots", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5])
+    parser.add_argument("--max-contexts", type=int, default=100)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--output-dir", type=str, default="outputs/preliminary/exp3")
     args = parser.parse_args()
 
-    # Setup distributed (DDP)
-    rank, world_size = setup_distributed()
-    is_main = (rank == 0)
+    # Get available GPUs
+    gpu_ids = get_available_gpus()
+    print(f"Using GPUs: {gpu_ids}")
 
-    # Create output directory (only on rank 0)
     output_dir = Path(args.output_dir)
-    if is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine device for this rank
-    if torch.cuda.is_available():
-        device = f"cuda:{rank % torch.cuda.device_count()}"
-    else:
-        device = "cpu"
-
-    # Load model
-    if is_main:
-        print(f"Loading model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        device_map=None,
-        low_cpu_mem_usage=True,
-    )
-    model = model.to(device)
-    model.eval()
-
-    if is_main:
-        print(f"Model loaded on {device} (rank {rank}/{world_size})")
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Ensure shots are sorted
     shots = sorted(args.shots)
-    max_shot = max(shots)
-
-    # Run experiments for each dataset
     all_results = {}
 
     for dataset_name in args.datasets:
-        if is_main:
-            print(f"\n{'='*60}")
-            print(f"Dataset: {dataset_name}")
-            print(f"{'='*60}\n")
+        print(f"\n{'='*60}")
+        print(f"Dataset: {dataset_name}")
+        print(f"{'='*60}\n")
 
         dataset_results = {}
 
         for n_shot in shots:
-            if is_main:
-                print(f"\n--- Testing {n_shot}-shot ---")
-
-            # Load dataset with appropriate question count
-            # For fair comparison, load same number of contexts for each shot
-            if is_main:
-                print(f"Loading {dataset_name} data for {n_shot}-shot...")
+            print(f"\n--- Testing {n_shot}-shot ---")
 
             data, dataset_key = load_dataset_for_nshot(
-                dataset_name,
-                split="validation",
-                max_contexts=args.max_contexts,
-                n_shot=n_shot,
-                seed=42
+                dataset_name, split="validation",
+                max_contexts=args.max_contexts, n_shot=n_shot, seed=42
             )
+            print(f"Loaded {len(data)} contexts")
 
-            total_contexts = len(data)
-            if is_main:
-                print(f"Loaded {total_contexts} contexts")
-
-            # Shard data across ranks
-            local_data = shard_data(data, rank, world_size)
-            if is_main:
-                print(f"Rank {rank} processing {len(local_data)} contexts")
-
-            # Run condition
-            local_result = run_nshot_condition(
-                data=local_data,
-                n_shot=n_shot,
-                tokenizer=tokenizer,
-                model=model,
-                max_new_tokens=args.max_new_tokens,
-                dataset=dataset_key,
-                batch_size=args.batch_size,
-                is_main=is_main,
-            )
-
-            # Gather results from all ranks
-            local_metrics = {
-                "total_correct": local_result["total_correct"],
-                "total_questions": local_result["total_questions"],
-                "position_metrics": local_result["position_metrics"],
-                "details": local_result.get("details", []),
+            args_dict = {
+                "model": args.model,
+                "dataset": dataset_key,
+                "max_new_tokens": args.max_new_tokens,
+                "batch_size": args.batch_size,
             }
-            all_metrics = gather_results([local_metrics], world_size)
 
-            # Aggregate across all ranks
-            total_correct = sum(m["total_correct"] for m in all_metrics)
-            total_questions = sum(m["total_questions"] for m in all_metrics)
-            accuracy = total_correct / total_questions if total_questions > 0 else 0.0
+            result = run_nshot_parallel(data, n_shot, args_dict, gpu_ids)
 
-            # Aggregate position metrics
-            combined_position = {}
-            for m in all_metrics:
-                for pos, pm in m["position_metrics"].items():
-                    if pos not in combined_position:
-                        combined_position[pos] = {"correct": 0, "total": 0}
-                    combined_position[pos]["correct"] += pm["correct"]
-                    combined_position[pos]["total"] += pm["total"]
-
-            for pos in combined_position:
-                combined_position[pos]["accuracy"] = (
-                    combined_position[pos]["correct"] / combined_position[pos]["total"]
-                    if combined_position[pos]["total"] > 0 else 0.0
-                )
-
-            # Collect all details from all ranks
-            all_details = []
-            for m in all_metrics:
-                all_details.extend(m.get("details", []))
-
-            result = {
+            dataset_results[str(n_shot)] = {
                 "n_shot": n_shot,
-                "accuracy": accuracy,
-                "total_questions": total_questions,
-                "total_correct": total_correct,
-                "position_metrics": combined_position,
+                "accuracy": result["accuracy"],
+                "total_questions": result["total_questions"],
+                "total_correct": result["total_correct"],
+                "position_metrics": result["position_metrics"],
             }
 
-            dataset_results[str(n_shot)] = result
-
-            # Save detailed results for this dataset/shot combination
-            if is_main and all_details:
+            # Save detailed results
+            if result["details"]:
                 details_file = output_dir / f"details_{dataset_name}_{n_shot}shot.jsonl"
                 with open(details_file, 'w') as f:
-                    for record in all_details:
+                    for record in result["details"]:
                         f.write(json.dumps(record, ensure_ascii=False) + '\n')
                 print(f"  Details saved to: {details_file}")
 
-            if is_main:
-                print(f"  Accuracy: {result['accuracy']:.4f}")
-                print(f"  Correct: {result['total_correct']}/{result['total_questions']}")
-                if combined_position:
-                    print(f"  Position accuracy:")
-                    for pos in sorted(combined_position.keys()):
-                        pm = combined_position[pos]
-                        print(f"    Position {pos}: {pm['accuracy']:.4f} ({pm['correct']}/{pm['total']})")
+            print(f"  Accuracy: {result['accuracy']:.4f}")
+            print(f"  Correct: {result['total_correct']}/{result['total_questions']}")
+            if result["position_metrics"]:
+                print(f"  Position accuracy:")
+                for pos in sorted(result["position_metrics"].keys()):
+                    pm = result["position_metrics"][pos]
+                    print(f"    Position {pos}: {pm['accuracy']:.4f} ({pm['correct']}/{pm['total']})")
 
-        # Compute N-shot benefits
+        # Compute benefits
         baseline_acc = dataset_results["0"]["accuracy"]
-        for n_shot_str, result in dataset_results.items():
-            result["benefit"] = result["accuracy"] - baseline_acc
+        for n_shot_str, res in dataset_results.items():
+            res["benefit"] = res["accuracy"] - baseline_acc
 
         all_results[dataset_name] = dataset_results
 
-        if is_main:
-            print(f"\n{'='*40}")
-            print(f"Summary for {dataset_name}:")
-            print(f"{'='*40}")
-            print(f"{'N-shot':<10} {'Accuracy':>10} {'Benefit':>10}")
-            print(f"{'-'*40}")
-            for n_shot in shots:
-                r = dataset_results[str(n_shot)]
-                print(f"{n_shot:<10} {r['accuracy']:>9.2%} {r['benefit']:>+9.2%}")
-            print(f"{'='*40}\n")
-
-    # Save results (only on rank 0)
-    if is_main:
-        output_file = output_dir / "exp3_nshot_results.json"
-        with open(output_file, 'w') as f:
-            json.dump({
-                "model": args.model,
-                "datasets": args.datasets,
-                "shots": shots,
-                "max_contexts": args.max_contexts,
-                "results": all_results,
-            }, f, indent=2)
-
-        print(f"\nResults saved to: {output_file}")
-
-        # Print final summary table
-        print(f"\n{'='*70}")
-        print("FINAL SUMMARY TABLE")
-        print(f"{'='*70}")
-
-        # Header
-        header = f"{'Dataset':<12}"
+        print(f"\n{'='*40}")
+        print(f"Summary for {dataset_name}:")
+        print(f"{'='*40}")
+        print(f"{'N-shot':<10} {'Accuracy':>10} {'Benefit':>10}")
+        print(f"{'-'*40}")
         for n_shot in shots:
-            header += f" {n_shot}-shot".rjust(10)
-        print(header)
-        print(f"{'-'*70}")
+            r = dataset_results[str(n_shot)]
+            print(f"{n_shot:<10} {r['accuracy']:>9.2%} {r['benefit']:>+9.2%}")
+        print(f"{'='*40}\n")
 
-        # Data rows
-        for dataset_name in args.datasets:
-            row = f"{dataset_name:<12}"
-            for n_shot in shots:
-                acc = all_results[dataset_name][str(n_shot)]["accuracy"]
-                row += f" {acc:>9.2%}"
-            print(row)
+    # Save results
+    output_file = output_dir / "exp3_nshot_results.json"
+    with open(output_file, 'w') as f:
+        json.dump({
+            "model": args.model,
+            "datasets": args.datasets,
+            "shots": shots,
+            "max_contexts": args.max_contexts,
+            "results": all_results,
+        }, f, indent=2)
 
-        print(f"{'='*70}")
+    print(f"\nResults saved to: {output_file}")
 
-        # Benefit summary
-        print(f"\nN-shot Benefit (vs 0-shot):")
-        print(f"{'-'*70}")
-        header = f"{'Dataset':<12}"
-        for n_shot in shots[1:]:  # Skip 0-shot
-            header += f" {n_shot}-shot".rjust(10)
-        print(header)
-        print(f"{'-'*70}")
+    # Print final summary
+    print(f"\n{'='*70}")
+    print("FINAL SUMMARY TABLE")
+    print(f"{'='*70}")
+    header = f"{'Dataset':<12}"
+    for n_shot in shots:
+        header += f" {n_shot}-shot".rjust(10)
+    print(header)
+    print(f"{'-'*70}")
+    for dataset_name in args.datasets:
+        row = f"{dataset_name:<12}"
+        for n_shot in shots:
+            acc = all_results[dataset_name][str(n_shot)]["accuracy"]
+            row += f" {acc:>9.2%}"
+        print(row)
+    print(f"{'='*70}")
 
-        for dataset_name in args.datasets:
-            row = f"{dataset_name:<12}"
-            for n_shot in shots[1:]:
-                benefit = all_results[dataset_name][str(n_shot)]["benefit"]
-                row += f" {benefit:>+9.2%}"
-            print(row)
-
-        print(f"{'='*70}\n")
-
-    # Cleanup distributed
-    cleanup_distributed()
+    print(f"\nN-shot Benefit (vs 0-shot):")
+    print(f"{'-'*70}")
+    header = f"{'Dataset':<12}"
+    for n_shot in shots[1:]:
+        header += f" {n_shot}-shot".rjust(10)
+    print(header)
+    print(f"{'-'*70}")
+    for dataset_name in args.datasets:
+        row = f"{dataset_name:<12}"
+        for n_shot in shots[1:]:
+            benefit = all_results[dataset_name][str(n_shot)]["benefit"]
+            row += f" {benefit:>+9.2%}"
+        print(row)
+    print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":
