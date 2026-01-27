@@ -262,25 +262,30 @@ Question: What color is the sky?
                 conversation.append({"role": "assistant", "content": response})
                 results["sequential"]["predictions"][q["qid"]] = (answer, valid)
 
-        # Strategy: batch (independent)
+        # Strategy: batch (independent) - batched generation like working script
         if "batch" in results:
+            prompts = []
             for q in group:
-                prompt = f"Passage:\n{context}\n\nQuestion: {q['question']}"
+                prompt = f"Passage:\n{q['context']}\n\nQuestion: {q['question']}"
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-                text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = tokenizer(text, return_tensors="pt").to(device)
+                full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                prompts.append(full_prompt)
 
-                start = time.perf_counter()
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=100,
-                        do_sample=False,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                results["batch"]["latency"] += time.perf_counter() - start
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
 
-                response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            start = time.perf_counter()
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=96,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            results["batch"]["latency"] += time.perf_counter() - start
+
+            for i, q in enumerate(group):
+                generated = outputs[i][inputs["input_ids"][i].shape[0]:]
+                response = tokenizer.decode(generated, skip_special_tokens=True)
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
@@ -357,6 +362,15 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
             if qid in preds:
                 pred_ans, valid = preds[qid]
                 predictions_for_eval[qid] = (pred_ans, valid)  # 2-tuple: (prediction, strict_valid)
+
+        # Debug: show first 3 predictions vs references
+        if strategy == strategies_to_run[0]:
+            debug_count = 0
+            for qid, (pred, valid) in list(predictions_for_eval.items())[:5]:
+                refs = lookup[qid].references
+                logger.info(f"[DEBUG] qid={qid}")
+                logger.info(f"  pred='{pred}' (valid={valid})")
+                logger.info(f"  refs={refs[:2] if refs else []}")
 
         metrics = evaluate_predictions(predictions_for_eval, lookup, dataset=dataset)
         summary[strategy] = {
