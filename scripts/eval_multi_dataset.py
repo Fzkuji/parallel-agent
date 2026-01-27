@@ -289,13 +289,6 @@ Question: What color is the sky?
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
-                # Debug: print first 2 examples from first group
-                if local_idx == 0 and i < 2:
-                    print(f"\n[DEBUG GPU {physical_gpu_id}] Question: {q['question'][:80]}...")
-                    print(f"[DEBUG] Raw response: {response[:200]}...")
-                    print(f"[DEBUG] Extracted answer: '{answer}' (valid={valid})")
-                    print(f"[DEBUG] References: {q.get('references', [])[:2]}")
-
     print(f"[GPU {physical_gpu_id}] Done processing {len(groups)} groups")
     result_queue.put((worker_id, results))
 
@@ -369,15 +362,6 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
             if qid in preds:
                 pred_ans, valid = preds[qid]
                 predictions_for_eval[qid] = (pred_ans, valid)  # 2-tuple: (prediction, strict_valid)
-
-        # Debug: show first 3 predictions vs references
-        if strategy == strategies_to_run[0]:
-            debug_count = 0
-            for qid, (pred, valid) in list(predictions_for_eval.items())[:5]:
-                refs = lookup[qid].references
-                logger.info(f"[DEBUG] qid={qid}")
-                logger.info(f"  pred='{pred}' (valid={valid})")
-                logger.info(f"  refs={refs[:2] if refs else []}")
 
         metrics = evaluate_predictions(predictions_for_eval, lookup, dataset=dataset)
         summary[strategy] = {
