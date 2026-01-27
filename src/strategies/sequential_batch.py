@@ -59,42 +59,31 @@ def run_sequential_strategy(
     else:
         unknown_instruction = ""
 
+    # Build system message (same as build_single_prompt)
     if use_mc_format:
         system_message = (
-            "You are a helpful assistant. Read the question and options and reply with the single correct option letter (A, B, C, D, ...)."
+            "You are a helpful assistant. Read the question and options, then reply with the single correct option letter (A, B, C, D, ...)."
         )
-        if background.strip():
-            system_message += "\n\nPassage:\n" + background.strip()
     elif use_direct_format:
         system_message = (
-            textwrap.dedent(
-                f"""You are a helpful medical assistant that answers questions given background passages.
-Provide the answer directly without any special formatting.
-
-Background:
-"""
-            ).strip()
-            + "\n"
-            + background.strip()
+            "You are a helpful medical assistant that answers questions given background passages.\n"
+            "Provide the answer directly without any special formatting."
         )
     else:
         system_message = (
-            textwrap.dedent(
-                f"""You are a helpful assistant. Answer the question based on the given passage.
-You MUST wrap your answer in <answer></answer> tags.{unknown_instruction}
-
-Background:
-"""
-            ).strip()
-            + "\n"
-            + background.strip()
+            "You are a helpful assistant. Answer the question based on the given passage.\n"
+            f"You MUST wrap your answer in <answer></answer> tags.{unknown_instruction}"
         )
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
     detail_records: List[Dict[str, Any]] = []
 
-    for question in questions:
-        user_message = f"Question ({question.qid}): {question.text.strip()}"
+    for i, question in enumerate(questions):
+        # First question includes the passage, subsequent questions don't
+        if i == 0:
+            user_message = f"Passage:\n{background.strip()}\n\nQuestion: {question.text.strip()}"
+        else:
+            user_message = f"Question: {question.text.strip()}"
         messages.append({"role": "user", "content": user_message})
 
         # Use API or local model for generation
