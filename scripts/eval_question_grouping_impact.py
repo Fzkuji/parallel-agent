@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Question grouping impact experiment.
+Question grouping impact experiment with multi-GPU support.
 
 Tests how grouping size affects strategy performance on the same set of questions.
 
@@ -14,6 +14,7 @@ For each grouping size:
 - batch: Processes N questions in parallel batch
 
 All configurations test the exact same questions.
+Multi-GPU: Each GPU loads one model and processes a subset of groups in parallel.
 """
 
 import argparse
@@ -22,7 +23,8 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+import multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -167,44 +169,57 @@ def group_questions(all_questions, group_size):
     return groups
 
 
-def run_evaluation(args, group_size, all_questions, output_dir, memory_bank=None, memory_embeddings=None, embedding_model=None):
-    """Run evaluation with specific group size."""
+def gpu_worker(
+    gpu_id: int,
+    groups: List[List[dict]],
+    group_indices: List[int],
+    args_dict: dict,
+    strategies_to_run: List[str],
+    memory_bank: Optional[List[dict]],
+    memory_embeddings_list: Optional[List],  # numpy array as list for pickling
+    result_queue: mp.Queue,
+):
+    """
+    Worker function that runs on a single GPU.
+    Loads the model and processes assigned groups.
+    """
     import time
     import re
     import torch
+    import numpy as np
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    from src.models import Question
-    from src.inference import extract_answer
-    from src.evaluation import evaluate_predictions
 
-    logger.info(f"\n{'='*80}")
-    logger.info(f"GROUP SIZE: {group_size} questions per group")
-    logger.info(f"Total questions: {len(all_questions)}, Groups: {len(all_questions)//group_size}")
-    logger.info(f"{'='*80}\n")
+    # Set GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = "cuda:0"
 
-    # Parse strategies to run
-    strategies_to_run = [s.strip() for s in args.strategies.split(',')]
+    # Reconstruct memory embeddings from list
+    memory_embeddings = np.array(memory_embeddings_list) if memory_embeddings_list is not None else None
 
-    # Group questions
-    groups = group_questions(all_questions, group_size)
+    # Load embedding model for memory strategy if needed
+    embedding_model = None
+    if "memory" in strategies_to_run and memory_bank:
+        try:
+            from sentence_transformers import SentenceTransformer
+            embedding_model = SentenceTransformer(args_dict["embedding_model"])
+        except ImportError:
+            pass
 
-    # Load model
-    logger.info("Loading model...")
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # Load LLM model
+    print(f"[GPU {gpu_id}] Loading model {args_dict['model']}...")
+    tokenizer = AutoTokenizer.from_pretrained(args_dict["model"], trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
+        args_dict["model"],
         torch_dtype=torch.float16,
-        device_map="cuda:0",
+        device_map=device,
         trust_remote_code=True,
     )
     model.eval()
-    logger.info("Model loaded\n")
+    print(f"[GPU {gpu_id}] Model loaded, processing {len(groups)} groups")
 
     SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
 You MUST wrap your answer in <answer></answer> tags. Be concise.
@@ -216,8 +231,7 @@ Question: What color is the sky?
     # Initialize results for strategies
     results = {}
     for strategy in strategies_to_run:
-        if strategy == "cross_batch" and not args.cross_batch_checkpoint:
-            logger.info("Skipping cross_batch strategy (no checkpoint provided)")
+        if strategy == "cross_batch" and not args_dict.get("cross_batch_checkpoint"):
             continue
         results[strategy] = {"predictions": {}, "latency": 0}
 
@@ -228,7 +242,7 @@ Question: What color is the sky?
             from src.strategies.cross_batch import run_cross_batch_strategy
             from src.cross_batch import CrossBatchGenerator, SimpleCrossBatchGate
             # Load checkpoint
-            checkpoint = torch.load(args.cross_batch_checkpoint, map_location="cuda:0")
+            checkpoint = torch.load(args_dict["cross_batch_checkpoint"], map_location=device)
             config = checkpoint.get("config", {})
             mix_method = config.get("module_type", "simple")
             hidden_size = model.config.hidden_size
@@ -240,7 +254,7 @@ Question: What color is the sky?
                 cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
 
             cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
-            cross_batch_module.to("cuda:0")
+            cross_batch_module.to(device)
 
             cross_batch_generator = CrossBatchGenerator(
                 model=model,
@@ -248,30 +262,33 @@ Question: What color is the sky?
                 cross_batch_module=cross_batch_module,
                 mix_method=mix_method,
                 mix_layer=config.get("mix_layer", -1),
-                device="cuda:0",
+                device=device,
             )
-            logger.info("Cross-Batch generator initialized")
+            print(f"[GPU {gpu_id}] Cross-Batch generator initialized")
         except Exception as e:
-            logger.warning(f"Failed to initialize Cross-Batch: {e}")
-            del results["cross_batch"]
+            print(f"[GPU {gpu_id}] Failed to initialize Cross-Batch: {e}")
+            if "cross_batch" in results:
+                del results["cross_batch"]
+
+    # Import extract_answer
+    from src.inference import extract_answer
 
     # Process each group
-    for group_idx, group in enumerate(groups):
-        if group_idx % 10 == 0:
-            logger.info(f"Processing group {group_idx+1}/{len(groups)}")
+    for local_idx, (group_idx, group) in enumerate(zip(group_indices, groups)):
+        if local_idx % 10 == 0:
+            print(f"[GPU {gpu_id}] Processing group {local_idx+1}/{len(groups)} (global idx: {group_idx})")
 
         context = group[0]["context"]
 
         # Strategy: all_in_one - all questions in one prompt
         if "all_in_one" in results:
             questions_text = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(group)])
-            # Improved prompt to encourage numbered answers with tags
             prompt = f"Passage:\n{context}\n\nQuestions:\n{questions_text}\n\nAnswer each question with numbered responses. Wrap each answer in <answer></answer> tags.\nExample format:\n1. <answer>answer1</answer>\n2. <answer>answer2</answer>"
 
             messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
             full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-            inputs = tokenizer([full_prompt], return_tensors="pt").to("cuda:0")
+            inputs = tokenizer([full_prompt], return_tensors="pt").to(device)
             start = time.perf_counter()
             with torch.no_grad():
                 outputs = model.generate(**inputs, max_new_tokens=96*len(group), do_sample=False, pad_token_id=tokenizer.pad_token_id)
@@ -282,7 +299,7 @@ Question: What color is the sky?
             # Try multiple parsing strategies
             answers = []
 
-            # Strategy 1: Look for numbered <answer> tags like "1. <answer>xxx</answer>"
+            # Strategy 1: Look for numbered <answer> tags
             numbered_answers = re.findall(r'\d+\.\s*<answer>(.*?)</answer>', raw_text, re.DOTALL | re.IGNORECASE)
             if len(numbered_answers) >= len(group):
                 answers = numbered_answers
@@ -291,9 +308,8 @@ Question: What color is the sky?
             if not answers:
                 answers = re.findall(r'<answer>(.*?)</answer>', raw_text, re.DOTALL | re.IGNORECASE)
 
-            # Strategy 3: Look for numbered answers without tags like "1. answer1\n2. answer2"
+            # Strategy 3: Look for numbered answers without tags
             if len(answers) < len(group):
-                # Try to extract by line numbers
                 lines = raw_text.strip().split('\n')
                 numbered_lines = []
                 for line in lines:
@@ -301,13 +317,11 @@ Question: What color is the sky?
                     if match:
                         numbered_lines.append((int(match.group(1)), match.group(2).strip()))
                 if len(numbered_lines) >= len(group):
-                    # Sort by number and extract answers
                     numbered_lines.sort(key=lambda x: x[0])
                     answers = [a[1] for a in numbered_lines[:len(group)]]
 
             for i, q in enumerate(group):
                 answer = answers[i].strip() if i < len(answers) else ""
-                # Clean up any remaining tags in the answer
                 answer = re.sub(r'</?answer>', '', answer).strip()
                 results["all_in_one"]["predictions"][q["qid"]] = (answer, len(answer) > 0)
 
@@ -319,7 +333,7 @@ Question: What color is the sky?
                 messages.append({"role": "user", "content": prompt})
 
                 full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = tokenizer([full_prompt], return_tensors="pt").to("cuda:0")
+                inputs = tokenizer([full_prompt], return_tensors="pt").to(device)
 
                 start = time.perf_counter()
                 with torch.no_grad():
@@ -327,7 +341,7 @@ Question: What color is the sky?
                 results["sequential"]["latency"] += time.perf_counter() - start
 
                 raw_text = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                answer, valid = extract_answer(raw_text, args.dataset)
+                answer, valid = extract_answer(raw_text, args_dict["dataset"])
                 results["sequential"]["predictions"][q["qid"]] = (answer, valid)
                 messages.append({"role": "assistant", "content": raw_text})
 
@@ -340,7 +354,7 @@ Question: What color is the sky?
                 full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 prompts.append(full_prompt)
 
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to("cuda:0")
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
 
             start = time.perf_counter()
             with torch.no_grad():
@@ -350,18 +364,16 @@ Question: What color is the sky?
             for i, q in enumerate(group):
                 generated = outputs[i][inputs["input_ids"][i].shape[0]:]
                 raw_text = tokenizer.decode(generated, skip_special_tokens=True)
-                answer, valid = extract_answer(raw_text, args.dataset)
+                answer, valid = extract_answer(raw_text, args_dict["dataset"])
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
 
         # Strategy: memory - 3-shot with embedding retrieval
         if "memory" in results and memory_bank and memory_embeddings is not None and embedding_model:
             prompts = []
             for q in group:
-                # Compute query embedding
                 query_emb = embedding_model.encode([q["question"]], convert_to_numpy=True)[0]
                 similar_examples = retrieve_similar_examples(query_emb, memory_embeddings, memory_bank, top_k=3)
 
-                # Build few-shot prompt
                 examples_text = ""
                 for idx, ex in enumerate(similar_examples, 1):
                     examples_text += f"Example {idx}:\nPassage: {ex['context'][:500]}...\nQuestion: {ex['question']}\n<answer>{ex['answer']}</answer>\n\n"
@@ -371,7 +383,7 @@ Question: What color is the sky?
                 full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 prompts.append(full_prompt)
 
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to("cuda:0")
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(device)
 
             start = time.perf_counter()
             with torch.no_grad():
@@ -381,7 +393,7 @@ Question: What color is the sky?
             for i, q in enumerate(group):
                 generated = outputs[i][inputs["input_ids"][i].shape[0]:]
                 raw_text = tokenizer.decode(generated, skip_special_tokens=True)
-                answer, valid = extract_answer(raw_text, args.dataset)
+                answer, valid = extract_answer(raw_text, args_dict["dataset"])
                 results["memory"]["predictions"][q["qid"]] = (answer, valid)
 
         # Strategy: cross_batch - Cross-Batch with trained checkpoint
@@ -402,7 +414,7 @@ Question: What color is the sky?
                     tokenizer=tokenizer,
                     model=model,
                     max_new_tokens=96,
-                    dataset=args.dataset,
+                    dataset=args_dict["dataset"],
                     cross_batch_generator=cross_batch_generator,
                     enable_cross_batch=True,
                 )
@@ -410,7 +422,6 @@ Question: What color is the sky?
 
                 for q in group:
                     answer = result.answers.get(q["qid"], "")
-                    # Find validity from details
                     valid = True
                     for detail in result.details.get("questions", []):
                         if detail["question_id"] == q["qid"]:
@@ -418,10 +429,101 @@ Question: What color is the sky?
                             break
                     results["cross_batch"]["predictions"][q["qid"]] = (answer, valid)
             except Exception as e:
-                logger.warning(f"Cross-Batch failed for group {group_idx}: {e}")
+                print(f"[GPU {gpu_id}] Cross-Batch failed for group {group_idx}: {e}")
                 results["cross_batch"]["latency"] += time.perf_counter() - start
                 for q in group:
                     results["cross_batch"]["predictions"][q["qid"]] = ("", False)
+
+    print(f"[GPU {gpu_id}] Done processing {len(groups)} groups")
+    result_queue.put((gpu_id, results))
+
+
+def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, memory_bank=None, memory_embeddings=None, embedding_model=None):
+    """Run evaluation with specific group size using multiple GPUs."""
+    import time
+    from src.models import Question
+    from src.evaluation import evaluate_predictions
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"GROUP SIZE: {group_size} questions per group")
+    logger.info(f"Total questions: {len(all_questions)}, Groups: {len(all_questions)//group_size}")
+    logger.info(f"Using {args.num_gpus} GPUs")
+    logger.info(f"{'='*80}\n")
+
+    # Parse strategies to run
+    strategies_to_run = [s.strip() for s in args.strategies.split(',')]
+
+    # Group questions
+    groups = group_questions(all_questions, group_size)
+    num_groups = len(groups)
+
+    # Distribute groups across GPUs
+    groups_per_gpu = (num_groups + args.num_gpus - 1) // args.num_gpus
+
+    # Convert args to dict for pickling
+    args_dict = {
+        "model": args.model,
+        "dataset": args.dataset,
+        "cross_batch_checkpoint": args.cross_batch_checkpoint,
+        "embedding_model": args.embedding_model,
+    }
+
+    # Convert memory embeddings to list for pickling
+    memory_embeddings_list = memory_embeddings.tolist() if memory_embeddings is not None else None
+
+    # Create result queue
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+
+    # Start workers
+    processes = []
+    start_time = time.perf_counter()
+
+    for gpu_id in range(args.num_gpus):
+        start_idx = gpu_id * groups_per_gpu
+        end_idx = min(start_idx + groups_per_gpu, num_groups)
+
+        if start_idx >= num_groups:
+            break
+
+        gpu_groups = groups[start_idx:end_idx]
+        gpu_indices = list(range(start_idx, end_idx))
+
+        p = ctx.Process(
+            target=gpu_worker,
+            args=(
+                gpu_id,
+                gpu_groups,
+                gpu_indices,
+                args_dict,
+                strategies_to_run,
+                memory_bank,
+                memory_embeddings_list,
+                result_queue,
+            ),
+        )
+        p.start()
+        processes.append(p)
+
+    logger.info(f"Started {len(processes)} GPU workers")
+
+    # Collect results from all workers
+    all_results = {}
+    for _ in range(len(processes)):
+        gpu_id, results = result_queue.get()
+        logger.info(f"Received results from GPU {gpu_id}")
+        for strategy, data in results.items():
+            if strategy not in all_results:
+                all_results[strategy] = {"predictions": {}, "latency": 0}
+            all_results[strategy]["predictions"].update(data["predictions"])
+            all_results[strategy]["latency"] += data["latency"]
+
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+
+    total_time = time.perf_counter() - start_time
+    logger.info(f"All GPUs finished in {total_time:.2f}s")
 
     # Evaluate all strategies
     logger.info("\nEvaluating predictions...")
@@ -439,13 +541,14 @@ Question: What color is the sky?
     }
 
     summary = {}
-    for strategy_name, result_data in results.items():
+    for strategy_name, result_data in all_results.items():
         metrics = evaluate_predictions(result_data["predictions"], question_lookup, dataset=args.dataset)
         summary[strategy_name] = {
             "metrics": metrics,
             "latency": result_data["latency"],
+            "wall_time": total_time,
         }
-        logger.info(f"{strategy_name}: EM={metrics['strict_acc']:.3f}, Latency={result_data['latency']:.2f}s")
+        logger.info(f"{strategy_name}: EM={metrics['strict_acc']:.3f}, Total GPU time={result_data['latency']:.2f}s, Wall time={total_time:.2f}s")
 
     return summary
 
@@ -468,6 +571,7 @@ def main():
     max_group_size = max(group_sizes)
     logger.info(f"Testing group sizes: {group_sizes}")
     logger.info(f"Dataset: {args.dataset}")
+    logger.info(f"Using {args.num_gpus} GPUs")
     logger.info(f"Will load contexts with at least {max_group_size} questions each\n")
 
     # Create output directory
@@ -519,7 +623,7 @@ def main():
             logger.warning(f"Skipping group size {group_size} - doesn't divide {total_questions} evenly")
             continue
 
-        summary = run_evaluation(
+        summary = run_evaluation_multi_gpu(
             args, group_size, all_questions, output_dir,
             memory_bank=memory_bank,
             memory_embeddings=memory_embeddings,
@@ -549,6 +653,7 @@ def main():
         f.write("# Question Grouping Impact Experiment\n")
         f.write(f"# Model: {args.model}\n")
         f.write(f"# Dataset: {args.dataset} - {total_questions} questions from {len(contexts)} contexts ({max_group_size} questions each)\n")
+        f.write(f"# GPUs: {args.num_gpus}\n")
         f.write(f"# All tests use the same {total_questions} questions, just grouped differently\n\n")
 
         f.write("## Results - EM (Exact Match)\n\n")
@@ -573,7 +678,7 @@ def main():
             line += f" | {num_groups:>10}"
             f.write(line + "\n")
 
-        f.write("\n## Latency (seconds)\n\n")
+        f.write("\n## Wall Time (seconds)\n\n")
         header = f"{'GroupSize':<10}"
         for strategy in actual_strategies:
             header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
@@ -585,8 +690,8 @@ def main():
             line = f"{gs:<10}"
             for strategy in actual_strategies:
                 if strategy in result:
-                    lat = result[strategy]['latency']
-                    line += f" | {lat:>12.2f}"
+                    wall_time = result[strategy].get('wall_time', result[strategy]['latency'])
+                    line += f" | {wall_time:>12.2f}"
                 else:
                     line += f" | {'--':>12}"
             f.write(line + "\n")
