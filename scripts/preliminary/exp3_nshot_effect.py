@@ -159,6 +159,9 @@ def run_batched_0shot(
 
     Collects all questions across contexts and processes them in batches.
     """
+    from src.evaluation.basic import compute_em, compute_f1, compute_choice_accuracy
+    from src.prompts import MULTIPLE_CHOICE_DATASETS
+
     # Collect all questions with their contexts
     all_items = []
     question_lookup = {}
@@ -189,6 +192,7 @@ def run_batched_0shot(
             "total_questions": 0,
             "total_correct": 0,
             "position_metrics": {},
+            "details": [],
         }
 
     # Build all prompts
@@ -208,6 +212,7 @@ def run_batched_0shot(
 
     # Batch inference
     answer_records = {}
+    detail_records = []
     total_batches = (len(all_prompts) + batch_size - 1) // batch_size
 
     pbar = tqdm(total=total_batches, desc="0-shot batch", disable=not is_main)
@@ -244,6 +249,24 @@ def run_batched_0shot(
             answer, valid = extract_answer(response, dataset)
             answer_records[item["qid"]] = (answer, valid)
 
+            # Compute correctness
+            refs = item["question"].references
+            if dataset in MULTIPLE_CHOICE_DATASETS:
+                correct = compute_choice_accuracy(answer, refs) > 0
+            else:
+                correct = compute_em(answer, refs) > 0
+
+            detail_records.append({
+                "qid": item["qid"],
+                "question": item["question"].text,
+                "references": refs,
+                "response": response,
+                "extracted_answer": answer,
+                "valid": valid,
+                "correct": correct,
+                "position": 1,
+            })
+
         pbar.update(1)
 
     pbar.close()
@@ -259,6 +282,7 @@ def run_batched_0shot(
         "total_questions": total_questions,
         "total_correct": total_correct,
         "position_metrics": {},
+        "details": detail_records,
     }
 
 
@@ -299,10 +323,11 @@ def run_nshot_condition(
     position_total = {}
     all_correct = 0
     all_total = 0
+    detail_records = []
 
     pbar = tqdm(data, desc=f"{n_shot}-shot", disable=not is_main)
 
-    for context_data in pbar:
+    for ctx_idx, context_data in enumerate(pbar):
         background = context_data["context"]
         questions = [
             Question(
@@ -331,7 +356,7 @@ def run_nshot_condition(
         all_correct += n_correct
         all_total += n_questions
 
-        # Track per-position metrics
+        # Track per-position metrics and collect details
         if "turns" in result.details:
             for i, turn in enumerate(result.details["turns"]):
                 pos = i + 1
@@ -339,8 +364,21 @@ def run_nshot_condition(
                     position_correct[pos] = 0
                     position_total[pos] = 0
                 position_total[pos] += 1
-                if turn.get("strict_valid", False):
+                is_correct = turn.get("strict_valid", False)
+                if is_correct:
                     position_correct[pos] += 1
+
+                # Collect detailed record (field names from run_sequential_strategy)
+                detail_records.append({
+                    "qid": turn.get("question_id", f"ctx{ctx_idx}_q{i}"),
+                    "question": turn.get("question", questions[i].text if i < len(questions) else ""),
+                    "references": turn.get("gold_answers", questions[i].references if i < len(questions) else []),
+                    "response": turn.get("raw_response", ""),
+                    "extracted_answer": turn.get("final_answer", ""),
+                    "valid": turn.get("strict_valid", False),
+                    "correct": is_correct,
+                    "position": pos,
+                })
 
     # Compute position-wise accuracy
     position_metrics = {}
@@ -360,6 +398,7 @@ def run_nshot_condition(
         "total_questions": all_total,
         "total_correct": all_correct,
         "position_metrics": position_metrics,
+        "details": detail_records,
     }
 
 
@@ -478,6 +517,7 @@ def main():
                 "total_correct": local_result["total_correct"],
                 "total_questions": local_result["total_questions"],
                 "position_metrics": local_result["position_metrics"],
+                "details": local_result.get("details", []),
             }
             all_metrics = gather_results([local_metrics], world_size)
 
@@ -501,6 +541,11 @@ def main():
                     if combined_position[pos]["total"] > 0 else 0.0
                 )
 
+            # Collect all details from all ranks
+            all_details = []
+            for m in all_metrics:
+                all_details.extend(m.get("details", []))
+
             result = {
                 "n_shot": n_shot,
                 "accuracy": accuracy,
@@ -510,6 +555,14 @@ def main():
             }
 
             dataset_results[str(n_shot)] = result
+
+            # Save detailed results for this dataset/shot combination
+            if is_main and all_details:
+                details_file = output_dir / f"details_{dataset_name}_{n_shot}shot.jsonl"
+                with open(details_file, 'w') as f:
+                    for record in all_details:
+                        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                print(f"  Details saved to: {details_file}")
 
             if is_main:
                 print(f"  Accuracy: {result['accuracy']:.4f}")
