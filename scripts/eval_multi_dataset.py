@@ -573,6 +573,42 @@ def main():
                         row += f" | {'--':>12}"
                 f.write(row + "\n")
 
+            # F1 table
+            f.write("\n### F1 Score\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        f1 = all_results[dataset][gs][s]["metrics"].get("f1", 0)
+                        row += f" | {f1*100:>11.1f}%"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            # Lenient accuracy table
+            f.write("\n### Lenient Accuracy\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        lenient = all_results[dataset][gs][s]["metrics"].get("lenient_acc", 0)
+                        row += f" | {lenient*100:>11.1f}%"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
             # Latency table
             f.write("\n### Latency (GPU seconds)\n\n")
             header = f"{'GroupSize':<10}"
@@ -622,6 +658,24 @@ def main():
                 for s in strategies:
                     if s in all_results[dataset][gs]:
                         tokens = all_results[dataset][gs][s].get("total_prompt_tokens_api", 0)
+                        row += f" | {tokens:>12,}"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            # Generated tokens table
+            f.write("\n### Generated Tokens\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        tokens = all_results[dataset][gs][s].get("total_generated_tokens", 0)
                         row += f" | {tokens:>12,}"
                     else:
                         row += f" | {'--':>12}"
