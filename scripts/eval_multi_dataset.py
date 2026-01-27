@@ -199,7 +199,7 @@ Question: What color is the sky?
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=50 * len(group),
+                    max_new_tokens=1024,
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                 )
@@ -239,11 +239,14 @@ Question: What color is the sky?
         # Strategy: sequential
         if "sequential" in results:
             conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
-            conversation.append({"role": "user", "content": f"Passage:\n{context}\n\nI will ask you questions about this passage."})
-            conversation.append({"role": "assistant", "content": "I've read the passage. Please ask your questions."})
 
-            for q in group:
-                conversation.append({"role": "user", "content": f"Question: {q['question']}"})
+            for i, q in enumerate(group):
+                # First question includes the passage
+                if i == 0:
+                    conversation.append({"role": "user", "content": f"Passage:\n{context}\n\nQuestion: {q['question']}"})
+                else:
+                    conversation.append({"role": "user", "content": f"Question: {q['question']}"})
+
                 text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
                 inputs = tokenizer(text, return_tensors="pt").to(device)
 
@@ -251,7 +254,7 @@ Question: What color is the sky?
                 with torch.no_grad():
                     outputs = model.generate(
                         **inputs,
-                        max_new_tokens=100,
+                        max_new_tokens=1024,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id,
                     )
@@ -277,7 +280,7 @@ Question: What color is the sky?
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=96,
+                    max_new_tokens=1024,
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                 )
