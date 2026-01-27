@@ -46,6 +46,12 @@ DATASET_METRICS: Dict[str, Dict[str, MetricFunc]] = {
         "f1": compute_f1,
         "lenient_acc": compute_contains,
     },
+    # CoQA: Conversational QA
+    "coqa": {
+        "strict_acc": compute_em,
+        "f1": compute_f1,
+        "lenient_acc": compute_contains,
+    },
     # CMB: Long-form medical QA
     "cmb": {
         "bleu4": compute_bleu4,
