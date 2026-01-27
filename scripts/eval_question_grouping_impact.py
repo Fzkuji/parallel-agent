@@ -32,13 +32,28 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
+def get_available_gpus():
+    """Get list of available GPU IDs from CUDA_VISIBLE_DEVICES or detect all GPUs."""
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible:
+        # Parse GPU IDs from environment variable
+        gpu_ids = [int(x.strip()) for x in cuda_visible.split(",") if x.strip()]
+        return gpu_ids
+    else:
+        # Try to detect available GPUs
+        try:
+            import torch
+            return list(range(torch.cuda.device_count()))
+        except:
+            return [0]  # Default to single GPU
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Question grouping impact experiment")
 
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--dataset", type=str, default="squad", choices=["squad", "cmb"],
                        help="Dataset to use (squad or cmb)")
-    parser.add_argument("--num-gpus", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--group-sizes", type=str, default="1,4,8,12,16",
                        help="Group sizes to test (questions per group)")
@@ -170,7 +185,8 @@ def group_questions(all_questions, group_size):
 
 
 def gpu_worker(
-    gpu_id: int,
+    worker_id: int,
+    physical_gpu_id: int,
     groups: List[List[dict]],
     group_indices: List[int],
     args_dict: dict,
@@ -189,8 +205,8 @@ def gpu_worker(
     import numpy as np
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    # Set GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Set GPU - use the physical GPU ID
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
     device = "cuda:0"
 
     # Reconstruct memory embeddings from list
@@ -206,7 +222,7 @@ def gpu_worker(
             pass
 
     # Load LLM model
-    print(f"[GPU {gpu_id}] Loading model {args_dict['model']}...")
+    print(f"[GPU {physical_gpu_id}] Loading model {args_dict['model']}...")
     tokenizer = AutoTokenizer.from_pretrained(args_dict["model"], trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -219,7 +235,7 @@ def gpu_worker(
         trust_remote_code=True,
     )
     model.eval()
-    print(f"[GPU {gpu_id}] Model loaded, processing {len(groups)} groups")
+    print(f"[GPU {physical_gpu_id}] Model loaded, processing {len(groups)} groups")
 
     SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
 You MUST wrap your answer in <answer></answer> tags. Be concise.
@@ -264,9 +280,9 @@ Question: What color is the sky?
                 mix_layer=config.get("mix_layer", -1),
                 device=device,
             )
-            print(f"[GPU {gpu_id}] Cross-Batch generator initialized")
+            print(f"[GPU {physical_gpu_id}] Cross-Batch generator initialized")
         except Exception as e:
-            print(f"[GPU {gpu_id}] Failed to initialize Cross-Batch: {e}")
+            print(f"[GPU {physical_gpu_id}] Failed to initialize Cross-Batch: {e}")
             if "cross_batch" in results:
                 del results["cross_batch"]
 
@@ -276,7 +292,7 @@ Question: What color is the sky?
     # Process each group
     for local_idx, (group_idx, group) in enumerate(zip(group_indices, groups)):
         if local_idx % 10 == 0:
-            print(f"[GPU {gpu_id}] Processing group {local_idx+1}/{len(groups)} (global idx: {group_idx})")
+            print(f"[GPU {physical_gpu_id}] Processing group {local_idx+1}/{len(groups)} (global idx: {group_idx})")
 
         context = group[0]["context"]
 
@@ -429,25 +445,26 @@ Question: What color is the sky?
                             break
                     results["cross_batch"]["predictions"][q["qid"]] = (answer, valid)
             except Exception as e:
-                print(f"[GPU {gpu_id}] Cross-Batch failed for group {group_idx}: {e}")
+                print(f"[GPU {physical_gpu_id}] Cross-Batch failed for group {group_idx}: {e}")
                 results["cross_batch"]["latency"] += time.perf_counter() - start
                 for q in group:
                     results["cross_batch"]["predictions"][q["qid"]] = ("", False)
 
-    print(f"[GPU {gpu_id}] Done processing {len(groups)} groups")
-    result_queue.put((gpu_id, results))
+    print(f"[GPU {physical_gpu_id}] Done processing {len(groups)} groups")
+    result_queue.put((worker_id, results))
 
 
-def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, memory_bank=None, memory_embeddings=None, embedding_model=None):
+def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, gpu_ids, memory_bank=None, memory_embeddings=None, embedding_model=None):
     """Run evaluation with specific group size using multiple GPUs."""
     import time
     from src.models import Question
     from src.evaluation import evaluate_predictions
 
+    num_gpus = len(gpu_ids)
     logger.info(f"\n{'='*80}")
     logger.info(f"GROUP SIZE: {group_size} questions per group")
     logger.info(f"Total questions: {len(all_questions)}, Groups: {len(all_questions)//group_size}")
-    logger.info(f"Using {args.num_gpus} GPUs")
+    logger.info(f"Using {num_gpus} GPUs: {gpu_ids}")
     logger.info(f"{'='*80}\n")
 
     # Parse strategies to run
@@ -458,7 +475,7 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, memory
     num_groups = len(groups)
 
     # Distribute groups across GPUs
-    groups_per_gpu = (num_groups + args.num_gpus - 1) // args.num_gpus
+    groups_per_gpu = (num_groups + num_gpus - 1) // num_gpus
 
     # Convert args to dict for pickling
     args_dict = {
@@ -479,8 +496,8 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, memory
     processes = []
     start_time = time.perf_counter()
 
-    for gpu_id in range(args.num_gpus):
-        start_idx = gpu_id * groups_per_gpu
+    for worker_id, physical_gpu_id in enumerate(gpu_ids):
+        start_idx = worker_id * groups_per_gpu
         end_idx = min(start_idx + groups_per_gpu, num_groups)
 
         if start_idx >= num_groups:
@@ -492,7 +509,8 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, memory
         p = ctx.Process(
             target=gpu_worker,
             args=(
-                gpu_id,
+                worker_id,
+                physical_gpu_id,
                 gpu_groups,
                 gpu_indices,
                 args_dict,
@@ -566,12 +584,16 @@ STRATEGY_DISPLAY = {
 def main():
     args = parse_args()
 
+    # Get available GPUs from CUDA_VISIBLE_DEVICES
+    gpu_ids = get_available_gpus()
+    num_gpus = len(gpu_ids)
+
     # Parse group sizes
     group_sizes = [int(x.strip()) for x in args.group_sizes.split(',')]
     max_group_size = max(group_sizes)
     logger.info(f"Testing group sizes: {group_sizes}")
     logger.info(f"Dataset: {args.dataset}")
-    logger.info(f"Using {args.num_gpus} GPUs")
+    logger.info(f"Using {num_gpus} GPUs: {gpu_ids}")
     logger.info(f"Will load contexts with at least {max_group_size} questions each\n")
 
     # Create output directory
@@ -624,7 +646,7 @@ def main():
             continue
 
         summary = run_evaluation_multi_gpu(
-            args, group_size, all_questions, output_dir,
+            args, group_size, all_questions, output_dir, gpu_ids,
             memory_bank=memory_bank,
             memory_embeddings=memory_embeddings,
             embedding_model=embedding_model,
@@ -653,7 +675,7 @@ def main():
         f.write("# Question Grouping Impact Experiment\n")
         f.write(f"# Model: {args.model}\n")
         f.write(f"# Dataset: {args.dataset} - {total_questions} questions from {len(contexts)} contexts ({max_group_size} questions each)\n")
-        f.write(f"# GPUs: {args.num_gpus}\n")
+        f.write(f"# GPUs: {gpu_ids}\n")
         f.write(f"# All tests use the same {total_questions} questions, just grouped differently\n\n")
 
         f.write("## Results - EM (Exact Match)\n\n")
