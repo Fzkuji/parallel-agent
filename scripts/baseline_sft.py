@@ -159,8 +159,12 @@ def _context_to_items(context_payload: dict) -> List[dict]:
 
 
 def load_dataset(dataset: str, split: str, max_contexts: int, min_questions: int,
-                 max_questions: int, seed: int) -> List[Dict]:
-    """Load dataset based on name."""
+                 max_questions: int, seed: int, fixed_question_count: Optional[int] = None) -> List[Dict]:
+    """Load dataset based on name.
+
+    Args:
+        fixed_question_count: If set, take exactly this many questions from each context (for consistency with eval_question_grouping_impact.py)
+    """
     if dataset == "hotpot":
         from src.datasets.hotpot import load_hotpot_groups
         return load_hotpot_groups(
@@ -171,7 +175,8 @@ def load_dataset(dataset: str, split: str, max_contexts: int, min_questions: int
         from src.datasets.squad import load_squad_groups
         return load_squad_groups(
             split=split, max_contexts=max_contexts,
-            min_questions=min_questions, max_questions=max_questions, seed=seed
+            min_questions=min_questions, max_questions=max_questions, seed=seed,
+            fixed_question_count=fixed_question_count
         )
     elif dataset == "quac":
         from src.datasets.quac import load_quac_groups
@@ -198,8 +203,8 @@ def load_dataset(dataset: str, split: str, max_contexts: int, min_questions: int
             min_questions=min_questions, max_questions=max_questions, seed=seed
         )
     elif dataset == "cmb":
-        from src.datasets.cmb import load_cmb_groups
-        return load_cmb_groups(
+        from src.datasets.cmb import load_cmb_exam_context_groups
+        return load_cmb_exam_context_groups(
             split=split, max_contexts=max_contexts,
             min_questions=min_questions, max_questions=max_questions, seed=seed
         )
@@ -1424,6 +1429,7 @@ def main():
 
     # Load evaluation data
     # Use same seed as baseline_pretrained.py for consistent evaluation samples
+    # Use fixed_question_count to match eval_question_grouping_impact.py data loading
     logger.info(f"Loading evaluation data: {args.eval_samples} samples from {args.dataset}")
     eval_contexts = load_dataset(
         args.dataset,
@@ -1432,6 +1438,7 @@ def main():
         min_questions=args.min_questions,
         max_questions=args.max_questions,
         seed=args.seed,  # Use same seed as pretrained for consistency
+        fixed_question_count=args.max_questions if args.dataset in ["squad", "cmb"] else None,
     )
     logger.info(f"Loaded {len(eval_contexts)} evaluation contexts")
 

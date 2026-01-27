@@ -448,51 +448,63 @@ def gpu_worker(
             results["batch"]["prompt_tokens_api"] += batch_prompt_tokens_api
             results["batch"]["generated_tokens_api"] += batch_generated_tokens
 
-        # Strategy: memory - 3-shot with embedding retrieval
+        # Strategy: memory - 3-shot sequential (like sequential but with 3 examples in first turn)
         if "memory" in results and memory_bank and memory_embeddings is not None and embedding_model:
-            prompts = []
-            for q in group:
-                query_emb = embedding_model.encode([q["question"]], convert_to_numpy=True)[0]
-                similar_examples = retrieve_similar_examples(query_emb, memory_embeddings, memory_bank, top_k=3)
+            # Retrieve 3 examples based on first question in group
+            first_q = group[0]
+            query_emb = embedding_model.encode([first_q["question"]], convert_to_numpy=True)[0]
+            similar_examples = retrieve_similar_examples(query_emb, memory_embeddings, memory_bank, top_k=3)
 
-                examples_text = ""
-                for idx, ex in enumerate(similar_examples, 1):
-                    examples_text += f"Example {idx}:\nPassage: {ex['context'][:500]}...\nQuestion: {ex['question']}\n<answer>{ex['answer']}</answer>\n\n"
+            # Build examples text
+            examples_text = ""
+            for idx, ex in enumerate(similar_examples, 1):
+                ex_context = ex['context'][:300] if len(ex['context']) > 300 else ex['context']
+                examples_text += f"Example {idx}:\nPassage: {ex_context}\nQuestion: {ex['question']}\n<answer>{ex['answer']}</answer>\n\n"
 
-                prompt = f"{examples_text}Now answer:\nPassage:\n{q['context']}\n\nQuestion: {q['question']}"
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-                full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                prompts.append(full_prompt)
-
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(device)
-            context_tokens = len(tokenizer.encode(context))
-
-            start = time.perf_counter()
-            with torch.no_grad():
-                outputs = model.generate(**inputs, max_new_tokens=96, do_sample=False, pad_token_id=tokenizer.pad_token_id)
-            results["memory"]["latency"] += time.perf_counter() - start
-
+            # Sequential conversation with 3-shot examples in first turn
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             mem_prompt_tokens_api = 0
             mem_generated_tokens = 0
             mem_deduplicated_tokens = 0
+            prev_prompt_tokens = 0
+            prev_gen_tokens = 0
 
             for i, q in enumerate(group):
-                prompt_tokens = inputs["attention_mask"][i].sum().item()
-                mem_prompt_tokens_api += prompt_tokens
+                if i == 0:
+                    # First turn: include 3 examples + passage + question
+                    prompt = f"{examples_text}Now answer:\nPassage:\n{q['context']}\n\nQuestion: {q['question']}"
+                else:
+                    # Subsequent turns: just the question
+                    prompt = f"Question: {q['question']}"
 
-                generated = outputs[i][inputs["input_ids"][i].shape[0]:]
-                gen_tokens = generated.shape[0]
+                messages.append({"role": "user", "content": prompt})
+                full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = tokenizer([full_prompt], return_tensors="pt").to(device)
+                current_prompt_tokens = inputs["input_ids"].shape[1]
+
+                start = time.perf_counter()
+                with torch.no_grad():
+                    output = model.generate(**inputs, max_new_tokens=96, do_sample=False, pad_token_id=tokenizer.pad_token_id)
+                results["memory"]["latency"] += time.perf_counter() - start
+
+                gen_tokens = output[0].shape[0] - current_prompt_tokens
+                mem_prompt_tokens_api += current_prompt_tokens
                 mem_generated_tokens += gen_tokens
 
-                # Deduplicated: first question full, subsequent questions minus context
+                # Deduplicated: first turn full, subsequent turns incremental
                 if i == 0:
-                    mem_deduplicated_tokens += prompt_tokens
+                    mem_deduplicated_tokens += current_prompt_tokens
                 else:
-                    mem_deduplicated_tokens += prompt_tokens - context_tokens
+                    incremental = current_prompt_tokens - prev_prompt_tokens - prev_gen_tokens
+                    mem_deduplicated_tokens += incremental
 
-                raw_text = tokenizer.decode(generated, skip_special_tokens=True)
+                prev_prompt_tokens = current_prompt_tokens
+                prev_gen_tokens = gen_tokens
+
+                raw_text = tokenizer.decode(output[0][current_prompt_tokens:], skip_special_tokens=True)
                 answer, valid = extract_answer(raw_text, args_dict["dataset"])
                 results["memory"]["predictions"][q["qid"]] = (answer, valid)
+                messages.append({"role": "assistant", "content": raw_text})
 
             results["memory"]["prompt_tokens"] += mem_deduplicated_tokens
             results["memory"]["generated_tokens"] += mem_generated_tokens
