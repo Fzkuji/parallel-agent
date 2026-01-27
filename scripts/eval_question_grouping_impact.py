@@ -677,7 +677,10 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, gpu_id
             "num_groups": num_groups,
             "num_questions": len(all_questions),
         }
-        logger.info(f"{strategy_name}: EM={metrics['strict_acc']:.3f}, "
+        # Get primary metric for logging (varies by dataset)
+        primary_metric = next(iter(metrics.keys())) if metrics else "unknown"
+        primary_value = metrics.get(primary_metric, 0.0)
+        logger.info(f"{strategy_name}: {primary_metric}={primary_value:.3f}, "
                    f"PromptTok={result_data.get('prompt_tokens', 0):,}, "
                    f"GenTok={result_data.get('generated_tokens', 0):,}, "
                    f"GPU time={result_data['latency']:.2f}s")
@@ -792,63 +795,52 @@ def main():
         f.write(f"# GPUs: {gpu_ids}\n")
         f.write(f"# All tests use the same {total_questions} questions, just grouped differently\n\n")
 
-        f.write("## Results - EM (Exact Match)\n\n")
-        # Header
-        header = f"{'GroupSize':<10}"
-        for strategy in actual_strategies:
-            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
-        header += f" | {'NumGroups':>10}"
-        f.write(header + "\n")
-        f.write("-" * len(header) + "\n")
+        # Detect available metrics from first result
+        available_metrics = []
+        if results_by_group_size and actual_strategies:
+            first_gs = next(iter(results_by_group_size.keys()))
+            first_strategy = next(iter(actual_strategies))
+            if first_strategy in results_by_group_size[first_gs]:
+                available_metrics = list(results_by_group_size[first_gs][first_strategy]['metrics'].keys())
 
-        for gs in sorted(results_by_group_size.keys()):
-            result = results_by_group_size[gs]
-            num_groups = total_questions // gs
-            line = f"{gs:<10}"
+        # Define metric display names
+        metric_display = {
+            "strict_acc": "EM (Exact Match)",
+            "f1": "F1 Score",
+            "lenient_acc": "Lenient Accuracy",
+            "bleu4": "BLEU-4",
+            "rouge1": "ROUGE-1",
+            "rouge2": "ROUGE-2",
+            "rougeL": "ROUGE-L",
+            "acc": "Accuracy",
+        }
+
+        # Write a table for each available metric
+        for metric_name in available_metrics:
+            display_name = metric_display.get(metric_name, metric_name)
+            f.write(f"## Results - {display_name}\n\n")
+            header = f"{'GroupSize':<10}"
             for strategy in actual_strategies:
-                if strategy in result:
-                    acc = result[strategy]['metrics']['strict_acc']
-                    line += f" | {acc:>12.3f}"
-                else:
-                    line += f" | {'--':>12}"
-            line += f" | {num_groups:>10}"
-            f.write(line + "\n")
+                header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
+            if metric_name == available_metrics[0]:
+                header += f" | {'NumGroups':>10}"
+            f.write(header + "\n")
+            f.write("-" * len(header) + "\n")
 
-        f.write("\n## Results - F1 Score\n\n")
-        header = f"{'GroupSize':<10}"
-        for strategy in actual_strategies:
-            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
-        f.write(header + "\n")
-        f.write("-" * len(header) + "\n")
-
-        for gs in sorted(results_by_group_size.keys()):
-            result = results_by_group_size[gs]
-            line = f"{gs:<10}"
-            for strategy in actual_strategies:
-                if strategy in result:
-                    f1 = result[strategy]['metrics'].get('f1', 0)
-                    line += f" | {f1:>12.3f}"
-                else:
-                    line += f" | {'--':>12}"
-            f.write(line + "\n")
-
-        f.write("\n## Results - Lenient Accuracy\n\n")
-        header = f"{'GroupSize':<10}"
-        for strategy in actual_strategies:
-            header += f" | {STRATEGY_DISPLAY[strategy]:>12}"
-        f.write(header + "\n")
-        f.write("-" * len(header) + "\n")
-
-        for gs in sorted(results_by_group_size.keys()):
-            result = results_by_group_size[gs]
-            line = f"{gs:<10}"
-            for strategy in actual_strategies:
-                if strategy in result:
-                    lenient = result[strategy]['metrics'].get('lenient_acc', 0)
-                    line += f" | {lenient:>12.3f}"
-                else:
-                    line += f" | {'--':>12}"
-            f.write(line + "\n")
+            for gs in sorted(results_by_group_size.keys()):
+                result = results_by_group_size[gs]
+                num_groups = total_questions // gs
+                line = f"{gs:<10}"
+                for strategy in actual_strategies:
+                    if strategy in result:
+                        value = result[strategy]['metrics'].get(metric_name, 0)
+                        line += f" | {value:>12.3f}"
+                    else:
+                        line += f" | {'--':>12}"
+                if metric_name == available_metrics[0]:
+                    line += f" | {num_groups:>10}"
+                f.write(line + "\n")
+            f.write("\n")
 
         f.write("\n## Token Statistics (Total)\n\n")
         header = f"{'GroupSize':<10}"
