@@ -263,7 +263,8 @@ Question: What color is the sky?
         # Strategy: all_in_one - all questions in one prompt
         if "all_in_one" in results:
             questions_text = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(group)])
-            prompt = f"Passage:\n{context}\n\nQuestions:\n{questions_text}\n\nPlease answer each question."
+            # Improved prompt to encourage numbered answers with tags
+            prompt = f"Passage:\n{context}\n\nQuestions:\n{questions_text}\n\nAnswer each question with numbered responses. Wrap each answer in <answer></answer> tags.\nExample format:\n1. <answer>answer1</answer>\n2. <answer>answer2</answer>"
 
             messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
             full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -275,10 +276,38 @@ Question: What color is the sky?
             results["all_in_one"]["latency"] += time.perf_counter() - start
 
             raw_text = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-            answers = re.findall(r'<answer>(.*?)</answer>', raw_text, re.DOTALL)
+
+            # Try multiple parsing strategies
+            answers = []
+
+            # Strategy 1: Look for numbered <answer> tags like "1. <answer>xxx</answer>"
+            numbered_answers = re.findall(r'\d+\.\s*<answer>(.*?)</answer>', raw_text, re.DOTALL | re.IGNORECASE)
+            if len(numbered_answers) >= len(group):
+                answers = numbered_answers
+
+            # Strategy 2: Look for any <answer> tags
+            if not answers:
+                answers = re.findall(r'<answer>(.*?)</answer>', raw_text, re.DOTALL | re.IGNORECASE)
+
+            # Strategy 3: Look for numbered answers without tags like "1. answer1\n2. answer2"
+            if len(answers) < len(group):
+                # Try to extract by line numbers
+                lines = raw_text.strip().split('\n')
+                numbered_lines = []
+                for line in lines:
+                    match = re.match(r'^(\d+)[\.\)]\s*(.+)', line.strip())
+                    if match:
+                        numbered_lines.append((int(match.group(1)), match.group(2).strip()))
+                if len(numbered_lines) >= len(group):
+                    # Sort by number and extract answers
+                    numbered_lines.sort(key=lambda x: x[0])
+                    answers = [a[1] for a in numbered_lines[:len(group)]]
+
             for i, q in enumerate(group):
                 answer = answers[i].strip() if i < len(answers) else ""
-                results["all_in_one"]["predictions"][q["qid"]] = (answer, True)
+                # Clean up any remaining tags in the answer
+                answer = re.sub(r'</?answer>', '', answer).strip()
+                results["all_in_one"]["predictions"][q["qid"]] = (answer, len(answer) > 0)
 
         # Strategy: sequential - one by one in conversation
         if "sequential" in results:
