@@ -80,8 +80,8 @@ Background:
     else:
         system_message = (
             textwrap.dedent(
-                f"""You are a helpful assistant that answers questions given background passages.
-Provide the answer with format <answer>text</answer>.{unknown_instruction}
+                f"""You are a helpful assistant. Answer the question based on the given passage.
+You MUST wrap your answer in <answer></answer> tags.{unknown_instruction}
 
 Background:
 """
