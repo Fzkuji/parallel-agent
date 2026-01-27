@@ -41,6 +41,8 @@ def parse_args():
     parser.add_argument("--group-sizes", type=str, default="1,4,8,12,16",
                        help="Group sizes to test (questions per group)")
     parser.add_argument("--output-dir", type=str, default="outputs/grouping_study")
+    parser.add_argument("--max-contexts", type=int, default=100,
+                       help="Maximum number of contexts to use (default: 100)")
     parser.add_argument("--cross-batch-checkpoint", type=str, default=None,
                        help="Path to Cross-Batch checkpoint (if not provided, skip cross_batch strategy)")
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2",
@@ -51,13 +53,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_all_questions(dataset="squad", seed=42, min_questions=16):
+def load_all_questions(dataset="squad", seed=42, min_questions=16, max_contexts=100):
     """Load questions from contexts with at least min_questions questions each."""
     if dataset == "squad":
         from src.datasets.squad import load_squad_groups
         contexts = load_squad_groups(
             split="validation",
-            max_contexts=1000,
+            max_contexts=max_contexts,
             min_questions=min_questions,
             max_questions=1000,  # No upper limit
             seed=seed,
@@ -69,7 +71,7 @@ def load_all_questions(dataset="squad", seed=42, min_questions=16):
             split="test",
             min_questions=min_questions,
             max_questions=min_questions,  # fixed count
-            max_contexts=1000,
+            max_contexts=max_contexts,
             seed=seed,
         )
     else:
@@ -473,7 +475,12 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load questions - use max group size as minimum questions per context
-    all_questions, contexts = load_all_questions(args.dataset, args.seed, min_questions=max_group_size)
+    all_questions, contexts = load_all_questions(
+        dataset=args.dataset,
+        seed=args.seed,
+        min_questions=max_group_size,
+        max_contexts=args.max_contexts,
+    )
 
     # Load memory bank if memory strategy is enabled
     strategies_to_run = [s.strip() for s in args.strategies.split(',')]
