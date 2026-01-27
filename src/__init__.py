@@ -103,6 +103,21 @@ from .api_client import (
     create_api_inference,
 )
 
+# Evaluation utilities
+from .eval_utils import (
+    get_available_gpus,
+    context_to_items,
+    load_dataset_groups,
+    aggregate_context_results,
+    save_evaluation_results,
+    print_results_summary,
+    get_cache_key,
+    load_cached_results,
+    save_cached_results,
+    SYSTEM_PROMPT,
+    ALL_IN_ONE_SYSTEM_PROMPT,
+)
+
 __all__ = [
     # Models
     "Question",
@@ -177,4 +192,16 @@ __all__ = [
     "APITokenizerWrapper",
     "APIResponse",
     "create_api_inference",
+    # Evaluation utilities
+    "get_available_gpus",
+    "context_to_items",
+    "load_dataset_groups",
+    "aggregate_context_results",
+    "save_evaluation_results",
+    "print_results_summary",
+    "get_cache_key",
+    "load_cached_results",
+    "save_cached_results",
+    "SYSTEM_PROMPT",
+    "ALL_IN_ONE_SYSTEM_PROMPT",
 ]

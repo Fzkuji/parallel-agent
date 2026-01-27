@@ -27,27 +27,21 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 import multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.eval_utils import (
+    get_available_gpus,
+    context_to_items,
+    aggregate_context_results,
+    SYSTEM_PROMPT,
+    ALL_IN_ONE_SYSTEM_PROMPT,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
-
-
-def get_available_gpus():
-    """Get list of available GPU IDs from CUDA_VISIBLE_DEVICES or detect all GPUs."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible:
-        gpu_ids = [int(x.strip()) for x in cuda_visible.split(",") if x.strip()]
-        return gpu_ids
-    else:
-        try:
-            import torch
-            return list(range(torch.cuda.device_count()))
-        except:
-            return [0]
 
 
 def parse_args():
@@ -154,6 +148,8 @@ def gpu_worker(
     import re
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    # Re-import for multiprocessing (spawn method requires this)
+    from src.eval_utils import SYSTEM_PROMPT, ALL_IN_ONE_SYSTEM_PROMPT
 
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
@@ -175,18 +171,18 @@ def gpu_worker(
     model.eval()
     print(f"[GPU {physical_gpu_id}] Model loaded, processing {len(groups)} groups")
 
-    SYSTEM_PROMPT = """You are a helpful assistant. Answer the question based on the given passage.
-You MUST wrap your answer in <answer></answer> tags. Be concise.
-
-Example:
-Question: What color is the sky?
-<answer>blue</answer>"""
-
     # Import extract_answer
     from src.inference import extract_answer
 
-    # Initialize results with token tracking
-    results = {s: {"predictions": {}, "latency": 0.0, "input_tokens": 0, "output_tokens": 0} for s in strategies_to_run}
+    # Initialize results with detailed token tracking
+    results = {s: {
+        "predictions": {},
+        "latency": 0.0,
+        "prompt_tokens": 0,           # Deduplicated (context counted once per group)
+        "generated_tokens": 0,
+        "prompt_tokens_api": 0,       # Actual API tokens sent
+        "generated_tokens_api": 0,    # Actual tokens generated
+    } for s in strategies_to_run}
 
     # Process each group
     for local_idx, (group_idx, group) in enumerate(zip(group_indices, groups)):
@@ -200,9 +196,11 @@ Question: What color is the sky?
             questions_text = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(group)])
             prompt = f"Passage:\n{context}\n\nQuestions:\n{questions_text}\n\nAnswer each question with numbered responses. Wrap each answer in <answer></answer> tags.\nExample format:\n1. <answer>answer1</answer>\n2. <answer>answer2</answer>"
 
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+            messages = [{"role": "system", "content": ALL_IN_ONE_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = tokenizer(text, return_tensors="pt").to(device)
+
+            prompt_tokens = inputs["input_ids"].shape[1]
 
             start = time.perf_counter()
             with torch.no_grad():
@@ -215,12 +213,13 @@ Question: What color is the sky?
             results["all_in_one"]["latency"] += time.perf_counter() - start
 
             # Track tokens
-            input_len = inputs["input_ids"].shape[1]
-            output_len = outputs[0].shape[0] - input_len
-            results["all_in_one"]["input_tokens"] += input_len
-            results["all_in_one"]["output_tokens"] += output_len
+            generated_tokens = outputs[0].shape[0] - prompt_tokens
+            results["all_in_one"]["prompt_tokens"] += prompt_tokens
+            results["all_in_one"]["generated_tokens"] += generated_tokens
+            results["all_in_one"]["prompt_tokens_api"] += prompt_tokens
+            results["all_in_one"]["generated_tokens_api"] += generated_tokens
 
-            response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+            response = tokenizer.decode(outputs[0][prompt_tokens:], skip_special_tokens=True)
 
             # Try multiple parsing strategies
             answers = []
@@ -254,6 +253,11 @@ Question: What color is the sky?
         # Strategy: sequential
         if "sequential" in results:
             conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+            seq_prompt_tokens_api = 0
+            seq_generated_tokens = 0
+            seq_deduplicated_tokens = 0
+            prev_prompt_tokens = 0
+            prev_gen_tokens = 0
 
             for i, q in enumerate(group):
                 # First question includes the passage
@@ -264,6 +268,7 @@ Question: What color is the sky?
 
                 text = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
                 inputs = tokenizer(text, return_tensors="pt").to(device)
+                current_prompt_tokens = inputs["input_ids"].shape[1]
 
                 start = time.perf_counter()
                 with torch.no_grad():
@@ -276,24 +281,44 @@ Question: What color is the sky?
                 results["sequential"]["latency"] += time.perf_counter() - start
 
                 # Track tokens
-                input_len = inputs["input_ids"].shape[1]
-                output_len = outputs[0].shape[0] - input_len
-                results["sequential"]["input_tokens"] += input_len
-                results["sequential"]["output_tokens"] += output_len
+                gen_tokens = outputs[0].shape[0] - current_prompt_tokens
+                seq_prompt_tokens_api += current_prompt_tokens
+                seq_generated_tokens += gen_tokens
 
-                response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+                # Deduplicated: first turn full, subsequent turns incremental
+                if i == 0:
+                    seq_deduplicated_tokens += current_prompt_tokens
+                else:
+                    incremental = current_prompt_tokens - prev_prompt_tokens - prev_gen_tokens
+                    seq_deduplicated_tokens += incremental
+
+                prev_prompt_tokens = current_prompt_tokens
+                prev_gen_tokens = gen_tokens
+
+                response = tokenizer.decode(outputs[0][current_prompt_tokens:], skip_special_tokens=True)
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 conversation.append({"role": "assistant", "content": response})
                 results["sequential"]["predictions"][q["qid"]] = (answer, valid)
 
+            results["sequential"]["prompt_tokens"] += seq_deduplicated_tokens
+            results["sequential"]["generated_tokens"] += seq_generated_tokens
+            results["sequential"]["prompt_tokens_api"] += seq_prompt_tokens_api
+            results["sequential"]["generated_tokens_api"] += seq_generated_tokens
+
         # Strategy: batch (independent) - process one at a time for consistent results
         if "batch" in results:
-            for q in group:
+            context_tokens = len(tokenizer.encode(context))
+            batch_prompt_tokens_api = 0
+            batch_generated_tokens = 0
+            batch_deduplicated_tokens = 0
+
+            for i, q in enumerate(group):
                 prompt = f"Passage:\n{q['context']}\n\nQuestion: {q['question']}"
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
                 full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
                 inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+                prompt_tokens = inputs["input_ids"].shape[1]
 
                 start = time.perf_counter()
                 with torch.no_grad():
@@ -306,14 +331,24 @@ Question: What color is the sky?
                 results["batch"]["latency"] += time.perf_counter() - start
 
                 # Track tokens
-                input_len = inputs["input_ids"].shape[1]
-                output_len = outputs[0].shape[0] - input_len
-                results["batch"]["input_tokens"] += input_len
-                results["batch"]["output_tokens"] += output_len
+                gen_tokens = outputs[0].shape[0] - prompt_tokens
+                batch_prompt_tokens_api += prompt_tokens
+                batch_generated_tokens += gen_tokens
 
-                response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+                # Deduplicated: first question full, subsequent questions minus context
+                if i == 0:
+                    batch_deduplicated_tokens += prompt_tokens
+                else:
+                    batch_deduplicated_tokens += prompt_tokens - context_tokens
+
+                response = tokenizer.decode(outputs[0][prompt_tokens:], skip_special_tokens=True)
                 answer, valid = extract_answer(response, args_dict.get("dataset"))
                 results["batch"]["predictions"][q["qid"]] = (answer, valid)
+
+            results["batch"]["prompt_tokens"] += batch_deduplicated_tokens
+            results["batch"]["generated_tokens"] += batch_generated_tokens
+            results["batch"]["prompt_tokens_api"] += batch_prompt_tokens_api
+            results["batch"]["generated_tokens_api"] += batch_generated_tokens
 
     print(f"[GPU {physical_gpu_id}] Done processing {len(groups)} groups")
     result_queue.put((worker_id, results))
@@ -357,14 +392,24 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
         processes.append(p)
 
     # Collect results
-    all_results = {s: {"predictions": {}, "latency": 0.0, "input_tokens": 0, "output_tokens": 0} for s in strategies_to_run}
+    all_results = {s: {
+        "predictions": {},
+        "latency": 0.0,
+        "prompt_tokens": 0,
+        "generated_tokens": 0,
+        "prompt_tokens_api": 0,
+        "generated_tokens_api": 0,
+    } for s in strategies_to_run}
+
     for _ in range(len(processes)):
         worker_id, worker_results = result_queue.get()
         for strategy, data in worker_results.items():
             all_results[strategy]["predictions"].update(data["predictions"])
             all_results[strategy]["latency"] += data["latency"]
-            all_results[strategy]["input_tokens"] += data.get("input_tokens", 0)
-            all_results[strategy]["output_tokens"] += data.get("output_tokens", 0)
+            all_results[strategy]["prompt_tokens"] += data.get("prompt_tokens", 0)
+            all_results[strategy]["generated_tokens"] += data.get("generated_tokens", 0)
+            all_results[strategy]["prompt_tokens_api"] += data.get("prompt_tokens_api", 0)
+            all_results[strategy]["generated_tokens_api"] += data.get("generated_tokens_api", 0)
 
     for p in processes:
         p.join()
@@ -392,24 +437,35 @@ def run_evaluation(args, dataset: str, group_size: int, all_questions: List[dict
                 predictions_for_eval[qid] = (pred_ans, valid)  # 2-tuple: (prediction, strict_valid)
 
         metrics = evaluate_predictions(predictions_for_eval, lookup, dataset=dataset)
-        input_tokens = all_results[strategy]["input_tokens"]
-        output_tokens = all_results[strategy]["output_tokens"]
-        total_tokens = input_tokens + output_tokens
         latency = all_results[strategy]["latency"]
+        prompt_tokens = all_results[strategy]["prompt_tokens"]
+        generated_tokens = all_results[strategy]["generated_tokens"]
+        prompt_tokens_api = all_results[strategy]["prompt_tokens_api"]
+        generated_tokens_api = all_results[strategy]["generated_tokens_api"]
 
         summary[strategy] = {
             "metrics": {
                 "strict_acc": metrics["strict_acc"],
                 "f1": metrics["f1"],
+                "lenient_acc": metrics.get("lenient_acc", 0),
             },
             "latency": latency,
             "wall_time": wall_time,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
+            # Deduplicated tokens
+            "total_prompt_tokens": prompt_tokens,
+            "total_generated_tokens": generated_tokens,
+            "avg_prompt_tokens": prompt_tokens / num_groups if num_groups > 0 else 0,
+            "avg_generated_tokens": generated_tokens / num_groups if num_groups > 0 else 0,
+            # API tokens
+            "total_prompt_tokens_api": prompt_tokens_api,
+            "total_generated_tokens_api": generated_tokens_api,
+            "avg_prompt_tokens_api": prompt_tokens_api / num_groups if num_groups > 0 else 0,
+            "avg_generated_tokens_api": generated_tokens_api / num_groups if num_groups > 0 else 0,
             "num_questions": len(all_questions),
+            "num_groups": num_groups,
         }
-        logger.info(f"{strategy}: EM={metrics['strict_acc']:.3f}, F1={metrics['f1']:.3f}, Latency={latency:.2f}s, Tokens={total_tokens}")
+        logger.info(f"{strategy}: EM={metrics['strict_acc']:.3f}, F1={metrics['f1']:.3f}, "
+                   f"PromptTok={prompt_tokens:,}, GenTok={generated_tokens:,}, Latency={latency:.2f}s")
 
     return summary
 
@@ -535,8 +591,8 @@ def main():
                         row += f" | {'--':>12}"
                 f.write(row + "\n")
 
-            # Token count table
-            f.write("\n### Total Tokens\n\n")
+            # Token count table (Deduplicated)
+            f.write("\n### Prompt Tokens (Deduplicated)\n\n")
             header = f"{'GroupSize':<10}"
             for s in strategies:
                 header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
@@ -547,7 +603,25 @@ def main():
                 row = f"{gs:<10}"
                 for s in strategies:
                     if s in all_results[dataset][gs]:
-                        tokens = all_results[dataset][gs][s].get("total_tokens", 0)
+                        tokens = all_results[dataset][gs][s].get("total_prompt_tokens", 0)
+                        row += f" | {tokens:>12,}"
+                    else:
+                        row += f" | {'--':>12}"
+                f.write(row + "\n")
+
+            # Token count table (API)
+            f.write("\n### Prompt Tokens (API)\n\n")
+            header = f"{'GroupSize':<10}"
+            for s in strategies:
+                header += f" | {STRATEGY_DISPLAY.get(s, s):>12}"
+            f.write(header + "\n")
+            f.write("-" * (12 + 15 * len(strategies)) + "\n")
+
+            for gs in sorted(all_results[dataset].keys()):
+                row = f"{gs:<10}"
+                for s in strategies:
+                    if s in all_results[dataset][gs]:
+                        tokens = all_results[dataset][gs][s].get("total_prompt_tokens_api", 0)
                         row += f" | {tokens:>12,}"
                     else:
                         row += f" | {'--':>12}"
@@ -559,9 +633,20 @@ def main():
     with open(summary_file, 'r') as f:
         print(f.read())
 
-    # Save all results
+    # Save all results with config
+    all_results_data = {
+        "config": {
+            "model": args.model,
+            "datasets": datasets,
+            "seed": args.seed,
+            "group_sizes": group_sizes,
+            "max_contexts": args.max_contexts,
+            "strategies": [s.strip() for s in args.strategies.split(',')],
+        },
+        "results": all_results,
+    }
     with open(output_dir / "all_results.json", 'w') as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(all_results_data, f, indent=2)
 
     logger.info(f"\nResults saved to {output_dir}")
 
