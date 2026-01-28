@@ -504,6 +504,43 @@ def main():
 
     # 加载数据集 (按 context 分组)
     train_groups = load_train_data(args, rank=rank)
+
+    # 平衡采样：确保不同问题数的 context 数量均衡
+    if args.min_questions < args.max_questions:
+        import random
+        from collections import defaultdict
+
+        # 按问题数分组
+        groups_by_qcount = defaultdict(list)
+        for g in train_groups:
+            num_q = len(g.get("questions", g.get("items", [])))
+            groups_by_qcount[num_q].append(g)
+
+        # 统计每组数量
+        counts = {q: len(groups) for q, groups in groups_by_qcount.items()}
+        print_rank0(f'原始分布: {dict(sorted(counts.items()))}', rank)
+
+        # 找到最小的组（限制因素）
+        min_count = min(counts.values()) if counts else 0
+        target_per_group = min(min_count, args.max_samples // len(groups_by_qcount)) if args.max_samples else min_count
+
+        # 每组采样相同数量
+        rng = random.Random(seed)
+        balanced_groups = []
+        for q_count in sorted(groups_by_qcount.keys()):
+            group_contexts = groups_by_qcount[q_count]
+            sampled = rng.sample(group_contexts, min(target_per_group, len(group_contexts)))
+            balanced_groups.extend(sampled)
+
+        train_groups = balanced_groups
+        rng.shuffle(train_groups)  # 打乱顺序
+
+        new_counts = defaultdict(int)
+        for g in train_groups:
+            num_q = len(g.get("questions", g.get("items", [])))
+            new_counts[num_q] += 1
+        print_rank0(f'平衡后分布: {dict(sorted(new_counts.items()))}', rank)
+
     train_dataset = SQuADGroupedDataset(
         tokenizer=tokenizer,
         groups=train_groups,
