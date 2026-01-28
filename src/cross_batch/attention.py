@@ -88,19 +88,21 @@ class CrossBatchAttention(nn.Module):
             # Initialize gate to output small values initially
             self._init_gate_weights()
         else:
-            # Learnable scale for the additive term (start small)
-            self.scale = nn.Parameter(torch.tensor(-3.0))  # sigmoid(-3) ≈ 0.047
+            # Learnable scale for the additive term (start completely closed)
+            # Initialize to -100 so sigmoid(-100) ≈ 0 (gate completely off)
+            # This ensures untrained/poorly-trained model = baseline performance
+            self.scale = nn.Parameter(torch.tensor(-100.0))
 
         self._init_weights()
 
     def _init_gate_weights(self):
-        """Initialize gate network to output small values initially."""
-        # Initialize the final linear layer to output values near 0
-        # This ensures H_out ≈ H at the start of training
+        """Initialize gate network to output near-zero values (gate completely closed)."""
+        # Initialize the final linear layer to output very negative values
+        # This ensures H_out ≈ H at the start of training (no cross-batch mixing)
         final_layer = self.gate_net[-2]  # Linear before Sigmoid
         nn.init.zeros_(final_layer.weight)
-        # Bias initialized to -3 so sigmoid(-3) ≈ 0.047
-        nn.init.constant_(final_layer.bias, -3.0)
+        # Bias initialized to -100 so sigmoid(-100) ≈ 0 (gate completely off)
+        nn.init.constant_(final_layer.bias, -100.0)
 
     def _init_weights(self):
         """Initialize weights - start with near-zero output."""
