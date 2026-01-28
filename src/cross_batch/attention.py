@@ -105,11 +105,16 @@ class CrossBatchAttention(nn.Module):
         nn.init.constant_(final_layer.bias, -100.0)
 
     def _init_weights(self):
-        """Initialize weights - start with near-zero output."""
+        """Initialize weights to ensure untrained model = baseline.
+
+        Strategy: Set V_proj and out_proj to zero so cross_batch_output = 0.
+        Q/K can be non-zero (only affect attention pattern, not output magnitude).
+        """
         nn.init.normal_(self.q_proj.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.k_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.v_proj.weight, mean=0.0, std=0.02)
-        # Initialize out_proj to zero so initial output is just H
+        # Initialize V_proj to zero: cross_batch_output = out_proj(attn @ 0) = 0
+        nn.init.zeros_(self.v_proj.weight)
+        # Initialize out_proj to zero (redundant with V=0, but double-safe)
         nn.init.zeros_(self.out_proj.weight)
 
     def forward(
