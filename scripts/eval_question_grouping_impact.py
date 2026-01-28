@@ -64,6 +64,10 @@ def parse_args():
                        help="Embedding model for Memory strategy")
     parser.add_argument("--strategies", type=str, default="batch,all_in_one,sequential,memory,cross_batch",
                        help="Comma-separated strategies to evaluate")
+    parser.add_argument("--lora-checkpoint", type=str, default=None,
+                       help="Path to LoRA checkpoint for SFT evaluation (applies to batch/sequential strategies)")
+    parser.add_argument("--sft-format", type=str, default=None, choices=["batch", "sequential"],
+                       help="SFT training format (batch or sequential), used with --lora-checkpoint")
 
     return parser.parse_args()
 
@@ -256,6 +260,20 @@ def gpu_worker(
         device_map=device,
         trust_remote_code=True,
     )
+
+    # Load LoRA checkpoint if provided
+    if args_dict.get("lora_checkpoint"):
+        try:
+            from peft import PeftModel
+            print(f"[GPU {physical_gpu_id}] Loading LoRA checkpoint: {args_dict['lora_checkpoint']}")
+            model = PeftModel.from_pretrained(model, args_dict["lora_checkpoint"])
+            model = model.merge_and_unload()  # Merge LoRA weights into base model
+            print(f"[GPU {physical_gpu_id}] LoRA weights loaded and merged")
+        except ImportError:
+            print(f"[GPU {physical_gpu_id}] Warning: peft not installed, skipping LoRA loading")
+        except Exception as e:
+            print(f"[GPU {physical_gpu_id}] Error loading LoRA: {e}")
+
     model.eval()
     print(f"[GPU {physical_gpu_id}] Model loaded, processing {len(groups)} groups")
 
@@ -598,6 +616,8 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, gpu_id
         "dataset": args.dataset,
         "cross_batch_checkpoint": args.cross_batch_checkpoint,
         "embedding_model": args.embedding_model,
+        "lora_checkpoint": args.lora_checkpoint,
+        "sft_format": args.sft_format,
     }
 
     # Convert memory embeddings to list for pickling

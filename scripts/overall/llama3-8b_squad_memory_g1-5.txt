@@ -1,0 +1,135 @@
+# Question Grouping Impact Experiment - Memory Strategy (3-shot Sequential)
+# Model: meta-llama/Meta-Llama-3-8B-Instruct
+# Dataset: squad - 480 questions from 100 contexts (5 questions each)
+# Strategy: Memory (3-shot with embedding retrieval, sequential conversation)
+
+## Results - EM (Exact Match)
+
+GroupSize  |       Memory |  NumGroups
+--------------------------------------
+1          |        0.804 |        480
+2          |        0.729 |        240
+3          |        0.658 |        160
+4          |        0.575 |        120
+5          |        0.838 |         96
+
+## Results - F1 Score
+
+GroupSize  |       Memory
+-------------------------
+1          |        0.904
+2          |        0.835
+3          |        0.756
+4          |        0.665
+5          |        0.924
+
+## Results - Lenient Accuracy
+
+GroupSize  |       Memory
+-------------------------
+1          |        0.942
+2          |        0.871
+3          |        0.785
+4          |        0.692
+5          |        0.967
+
+
+## Token Statistics (Total)
+
+GroupSize  |       Memory (Prompt Tokens - Deduplicated)
+-------------------------
+1          |      255,312
+2          |      133,386
+3          |       92,236
+4          |       71,851
+5          |       59,983
+
+## Token Statistics (API)
+
+GroupSize  |       Memory (Prompt Tokens - API)
+-------------------------
+1          |      255,312
+2          |      263,996
+3          |      271,197
+4          |      280,016
+5          |      288,583
+
+## Generated Tokens (Total)
+
+GroupSize  |       Memory
+-------------------------
+1          |        5,642
+2          |        5,919
+3          |        6,519
+4          |        7,209
+5          |        5,626
+
+## GPU Latency (seconds)
+
+GroupSize  |       Memory
+-------------------------
+1          |       127.58
+2          |       131.91
+3          |       143.41
+4          |       154.17
+5          |       129.59
+
+## Wall Time (seconds)
+
+GroupSize  |       Memory
+-------------------------
+1          |        44.46
+2          |        47.00
+3          |        69.45
+4          |        59.96
+5          |        48.62
+
+## Avg Prompt Tokens per Question (Deduplicated)
+
+GroupSize  |       Memory
+-------------------------
+1          |        531.9
+2          |        277.9
+3          |        192.2
+4          |        149.7
+5          |        125.0
+
+## Avg Prompt Tokens per Question (API)
+
+GroupSize  |       Memory
+-------------------------
+1          |        531.9
+2          |        550.0
+3          |        565.0
+4          |        583.4
+5          |        601.2
+
+## Avg Generated Tokens per Question
+
+GroupSize  |       Memory
+-------------------------
+1          |         11.8
+2          |         12.3
+3          |         13.6
+4          |         15.0
+5          |         11.7
+
+## Avg Latency per Question (seconds)
+
+GroupSize  |       Memory
+-------------------------
+1          |       0.2658
+2          |       0.2748
+3          |       0.2988
+4          |       0.3212
+5          |       0.2700
+
+## API Cost (USD, $0.10/M input + $0.20/M output)
+
+GroupSize  |       Memory
+-------------------------
+1          |       26.659
+2          |       27.584
+3          |       28.424
+4          |       29.444
+5          |       29.983
