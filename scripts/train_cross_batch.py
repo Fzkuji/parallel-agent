@@ -144,9 +144,9 @@ def parse_args():
                         help='强制重新训练，即使 checkpoint 已存在')
 
     # Cross-batch 模块参数
-    parser.add_argument('--module-type', type=str, default='simple',
-                        choices=['attention', 'simple', 'multi_layer', 'multi_layer_attention'],
-                        help='Cross-batch 模块类型: attention (单层完整QKV), simple (单层只学gate), multi_layer (多层gate), multi_layer_attention (多层完整QKV)')
+    parser.add_argument('--module-type', type=str, default='attention',
+                        choices=['attention', 'multi_layer_attention'],
+                        help='Cross-batch 模块类型: attention (单层完整QKV), multi_layer_attention (多层完整QKV)')
     parser.add_argument('--mix-layer', type=int, default=-1,
                         help='单层模式使用的层 (-1=最后层, 正数=中间层, 如 16 表示第16层)')
     parser.add_argument('--mix-layers', type=str, default=None,
@@ -591,15 +591,8 @@ def main():
             top_k=args.top_k,
         )
         print_rank0(f'模块类型: MultiLayerCrossBatchAttention, 层数: {len(layer_indices)}, 层: {layer_indices}, gate={args.use_gate}', rank)
-    elif args.module_type == 'simple':
-        # 简单模式: 单层只学 gate
-        cross_batch_module = SimpleCrossBatchGate(
-            hidden_size=hidden_size,
-            top_k=args.top_k,
-        )
-        print_rank0(f'模块类型: SimpleCrossBatchGate, 使用层: {args.mix_layer}', rank)
-    else:  # 'attention'
-        # 完整 attention 模式 (单层)
+    else:  # 'attention' (default)
+        # Cross-attention with learnable Q/K/V projections
         cross_batch_module = CrossBatchAttention(
             hidden_size=hidden_size,
             self_only=args.self_only,

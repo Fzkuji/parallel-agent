@@ -297,18 +297,15 @@ def gpu_worker(
     if "cross_batch" in results:
         try:
             from src.strategies.cross_batch import run_cross_batch_strategy
-            from src.cross_batch import CrossBatchGenerator, SimpleCrossBatchGate
+            from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
             # Load checkpoint
             checkpoint = torch.load(args_dict["cross_batch_checkpoint"], map_location=device)
             config = checkpoint.get("config", {})
-            mix_method = config.get("module_type", "simple")
+            mix_method = config.get("module_type", "attention")
             hidden_size = model.config.hidden_size
 
-            if mix_method == "simple":
-                cross_batch_module = SimpleCrossBatchGate(hidden_size=hidden_size)
-            else:
-                from src.cross_batch import CrossBatchAttention
-                cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
+            # Always use CrossBatchAttention (with learnable Q/K/V projections)
+            cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
 
             cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
             cross_batch_module.to(device)
