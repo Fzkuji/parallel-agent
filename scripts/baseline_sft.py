@@ -433,11 +433,23 @@ class DataCollatorForCausalLMWithMasking:
     def __init__(
         self,
         tokenizer,
-        assistant_token_pattern: str = "<|im_start|>assistant",
-        end_token_pattern: str = "<|im_end|>",
+        assistant_token_pattern: str = None,
+        end_token_pattern: str = None,
     ):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
+
+        # Auto-detect chat template format if not specified
+        if assistant_token_pattern is None or end_token_pattern is None:
+            model_name = getattr(tokenizer, 'name_or_path', '').lower()
+            if 'llama-3' in model_name or 'llama3' in model_name:
+                # Llama3 format
+                assistant_token_pattern = "<|start_header_id|>assistant<|end_header_id|>"
+                end_token_pattern = "<|eot_id|>"
+            else:
+                # Qwen/default format
+                assistant_token_pattern = "<|im_start|>assistant"
+                end_token_pattern = "<|im_end|>"
 
         # Pre-compute token ID patterns so we can scan input_ids directly
         self.assistant_start_ids = tokenizer.encode(
@@ -448,7 +460,8 @@ class DataCollatorForCausalLMWithMasking:
         self.newline_id = newline_ids[0] if len(newline_ids) == 1 else None
 
         if not self.assistant_start_ids or not self.end_ids:
-            raise ValueError("Failed to build assistant/end token patterns for masking")
+            raise ValueError(f"Failed to build assistant/end token patterns for masking. "
+                           f"Assistant pattern: {assistant_token_pattern}, End pattern: {end_token_pattern}")
 
     def _find_assistant_spans(self, token_ids: List[int]) -> List[tuple]:
         """Return (start, end) token indices for each assistant response."""

@@ -1,0 +1,142 @@
+# Question Grouping Impact Experiment - SFT-LoRA Batch
+# Model: Qwen/Qwen2.5-7B-Instruct + LoRA (1000 samples, 1 epoch, batch format)
+# Dataset: squad - 480 questions from 96 contexts (5 questions each)
+# Strategy: Independent (batch) with SFT-LoRA
+
+## Results - EM (Exact Match)
+
+GroupSize  |  Independent |  NumGroups
+--------------------------------------
+1          |        0.812 |        480
+2          |        0.810 |        240
+3          |        0.810 |        160
+4          |        0.810 |        120
+5          |        0.810 |         96
+
+## Results - F1 Score
+
+GroupSize  |  Independent
+-------------------------
+1          |        0.901
+2          |        0.899
+3          |        0.899
+4          |        0.899
+5          |        0.899
+
+## Results - Lenient Accuracy
+
+GroupSize  |  Independent
+-------------------------
+1          |        0.954
+2          |        0.952
+3          |        0.954
+4          |        0.952
+5          |        0.952
+
+
+## Token Statistics (Total)
+
+GroupSize  |  Independent (Prompt Tokens - Deduplicated)
+-------------------------
+1          |      119,112
+2          |       78,318
+3          |       65,214
+4          |       58,488
+5          |       53,956
+
+## Token Statistics (API)
+
+GroupSize  |  Independent (Prompt Tokens - API)
+-------------------------
+1          |      119,112
+2          |      119,112
+3          |      119,112
+4          |      119,112
+5          |      119,112
+
+## Generated Tokens (Total)
+
+GroupSize  |  Independent
+-------------------------
+1          |        5,564
+2          |        6,314
+3          |        6,909
+4          |        7,392
+5          |        7,550
+
+## GPU Latency (seconds)
+
+GroupSize  |  Independent
+-------------------------
+1          |       100.98
+2          |        76.23
+3          |        62.37
+4          |        52.74
+5          |        44.63
+
+## Wall Time (seconds)
+
+GroupSize  |  Independent
+-------------------------
+1          |        34.81
+2          |        32.86
+3          |        31.55
+4          |        26.95
+5          |        30.43
+
+## Avg Prompt Tokens per Question (Deduplicated)
+
+GroupSize  |  Independent
+-------------------------
+1          |        248.2
+2          |        163.2
+3          |        135.9
+4          |        121.8
+5          |        112.4
+
+## Avg Prompt Tokens per Question (API)
+
+GroupSize  |  Independent
+-------------------------
+1          |        248.2
+2          |        248.2
+3          |        248.2
+4          |        248.2
+5          |        248.2
+
+## Avg Generated Tokens per Question
+
+GroupSize  |  Independent
+-------------------------
+1          |         11.6
+2          |         13.2
+3          |         14.4
+4          |         15.4
+5          |         15.7
+
+## Avg Latency per Question (seconds)
+
+GroupSize  |  Independent
+-------------------------
+1          |       0.2104
+2          |       0.1588
+3          |       0.1299
+4          |       0.1099
+5          |       0.0930
+
+## API Cost (USD, $0.10/M input + $0.20/M output)
+
+GroupSize  |  Independent
+-------------------------
+1          |       13.024
+2          |       13.176
+3          |       13.293
+4          |       13.390
+5          |       13.422
+
+## Performance Comparison with 0-shot
+
+Strategy           | EM (G=5) | Improvement
+-------------------|----------|------------
+0-shot Independent |   80.4%  |    --
+SFT-LoRA Batch     |   81.0%  |   +0.6%
