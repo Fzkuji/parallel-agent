@@ -91,9 +91,13 @@ def build_single_prompt(
         )
         user_prompt = f"Passage:\n{effective_background.strip()}\n\nQuestion: {question.text.strip()}\n\nRespond with the option letter only."
     else:
+        # Use same system prompt as other strategies (must match eval_utils.SYSTEM_PROMPT)
         system_prompt = (
             "You are a helpful assistant. Answer the question based on the given passage.\n"
-            "You MUST wrap your answer in <answer></answer> tags."
+            "You MUST wrap your answer in <answer></answer> tags. Be concise.\n\n"
+            "Example:\n"
+            "Question: What color is the sky?\n"
+            "<answer>blue</answer>"
         )
         user_prompt = f"Passage:\n{effective_background.strip()}\n\nQuestion: {question.text.strip()}"
 
