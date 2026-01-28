@@ -525,7 +525,7 @@ def main():
         target_per_group = min(min_count, args.max_samples // len(groups_by_qcount)) if args.max_samples else min_count
 
         # 每组采样相同数量
-        rng = random.Random(seed)
+        rng = random.Random(args.seed)
         balanced_groups = []
         for q_count in sorted(groups_by_qcount.keys()):
             group_contexts = groups_by_qcount[q_count]
