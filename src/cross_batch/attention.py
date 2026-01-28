@@ -105,17 +105,17 @@ class CrossBatchAttention(nn.Module):
         nn.init.constant_(final_layer.bias, -100.0)
 
     def _init_weights(self):
-        """Initialize weights to ensure untrained model = baseline.
+        """Initialize weights to ensure untrained model ≈ baseline while allowing gradients.
 
-        Strategy: Set V_proj and out_proj to zero so cross_batch_output = 0.
-        Q/K can be non-zero (only affect attention pattern, not output magnitude).
+        Strategy: Use very small std for V/out_proj so output ≈ 0 initially,
+        but gradients can still flow (zeros would block backprop entirely).
         """
         nn.init.normal_(self.q_proj.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.k_proj.weight, mean=0.0, std=0.02)
-        # Initialize V_proj to zero: cross_batch_output = out_proj(attn @ 0) = 0
-        nn.init.zeros_(self.v_proj.weight)
-        # Initialize out_proj to zero (redundant with V=0, but double-safe)
-        nn.init.zeros_(self.out_proj.weight)
+        # Initialize V_proj and out_proj with very small std (not zero, to allow gradient flow)
+        # std=1e-5 → output ≈ 0 initially, but training can update weights
+        nn.init.normal_(self.v_proj.weight, mean=0.0, std=1e-5)
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-5)
 
     def forward(
         self,
