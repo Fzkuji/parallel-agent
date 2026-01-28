@@ -130,8 +130,8 @@ def parse_args():
                         help='训练样本数 (default: None, 使用全部数据)')
     parser.add_argument('--epochs', type=int, default=1,
                         help='训练轮数 (default: 1)')
-    parser.add_argument('--batch-size', type=int, default=8,
-                        help='每卡 batch size (default: 8)')
+    parser.add_argument('--batch-size', type=int, default=16,
+                        help='每卡 batch size (default: 16)')
     parser.add_argument('--eval-samples', type=int, default=None,
                         help='评估 context 数 (default: None, 使用全部验证集)')
     parser.add_argument('--lr', type=float, default=1e-4,
