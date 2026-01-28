@@ -569,14 +569,41 @@ def gpu_worker(
                 )
                 results["cross_batch"]["latency"] += time.perf_counter() - start
 
-                for q in group:
+                # Extract token statistics and predictions
+                context_tokens = len(tokenizer.encode(context))
+                cb_prompt_tokens_api = 0
+                cb_generated_tokens = 0
+                cb_deduplicated_tokens = 0
+
+                for i, q in enumerate(group):
                     answer = result.answers.get(q["qid"], "")
                     valid = True
+                    prompt_tokens = 0
+                    gen_tokens = 0
+
                     for detail in result.details.get("questions", []):
                         if detail["question_id"] == q["qid"]:
                             valid = detail.get("strict_valid", True)
+                            prompt_tokens = detail.get("prompt_tokens", 0)
+                            gen_tokens = detail.get("generated_tokens", 0)
                             break
+
                     results["cross_batch"]["predictions"][q["qid"]] = (answer, valid)
+
+                    # Track tokens
+                    cb_prompt_tokens_api += prompt_tokens
+                    cb_generated_tokens += gen_tokens
+
+                    # Deduplicated: first question full, subsequent questions minus context
+                    if i == 0:
+                        cb_deduplicated_tokens += prompt_tokens
+                    else:
+                        cb_deduplicated_tokens += prompt_tokens - context_tokens
+
+                results["cross_batch"]["prompt_tokens"] += cb_deduplicated_tokens
+                results["cross_batch"]["generated_tokens"] += cb_generated_tokens
+                results["cross_batch"]["prompt_tokens_api"] += cb_prompt_tokens_api
+                results["cross_batch"]["generated_tokens_api"] += cb_generated_tokens
             except Exception as e:
                 print(f"[GPU {physical_gpu_id}] Cross-Batch failed for group {group_idx}: {e}")
                 results["cross_batch"]["latency"] += time.perf_counter() - start
