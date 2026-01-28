@@ -1,0 +1,142 @@
+# Question Grouping Impact Experiment - SFT-LoRA Sequential
+# Model: meta-llama/Meta-Llama-3-8B-Instruct + LoRA (1000 samples, 1 epoch, sequential format)
+# Dataset: squad - 480 questions from 96 contexts (5 questions each)
+# Strategy: Sequential (multi-turn) with SFT-LoRA
+
+## Results - EM (Exact Match)
+
+GroupSize  |   Sequential |  NumGroups
+--------------------------------------
+1          |        0.856 |        480
+2          |        0.783 |        240
+3          |        0.694 |        160
+4          |        0.615 |        120
+5          |        0.885 |         96
+
+## Results - F1 Score
+
+GroupSize  |   Sequential
+-------------------------
+1          |        0.920
+2          |        0.843
+3          |        0.757
+4          |        0.664
+5          |        0.941
+
+## Results - Lenient Accuracy
+
+GroupSize  |   Sequential
+-------------------------
+1          |        0.944
+2          |        0.860
+3          |        0.775
+4          |        0.671
+5          |        0.965
+
+
+## Token Statistics (Total)
+
+GroupSize  |   Sequential (Prompt Tokens - Deduplicated)
+-------------------------
+1          |      117,692
+2          |       64,542
+3          |       46,471
+4          |       37,642
+5          |       32,475
+
+## Token Statistics (API)
+
+GroupSize  |   Sequential (Prompt Tokens - API)
+-------------------------
+1          |      117,692
+2          |      126,058
+3          |      133,628
+4          |      142,496
+5          |      150,379
+
+## Generated Tokens (Total)
+
+GroupSize  |   Sequential
+-------------------------
+1          |        5,152
+2          |        5,547
+3          |        6,107
+4          |        6,540
+5          |        5,305
+
+## GPU Latency (seconds)
+
+GroupSize  |   Sequential
+-------------------------
+1          |       105.50
+2          |       111.42
+3          |       121.26
+4          |       131.03
+5          |       112.24
+
+## Wall Time (seconds)
+
+GroupSize  |   Sequential
+-------------------------
+1          |        37.30
+2          |        39.16
+3          |        41.24
+4          |        42.20
+5          |        38.19
+
+## Avg Prompt Tokens per Question (Deduplicated)
+
+GroupSize  |   Sequential
+-------------------------
+1          |        245.2
+2          |        134.5
+3          |         96.8
+4          |         78.4
+5          |         67.7
+
+## Avg Prompt Tokens per Question (API)
+
+GroupSize  |   Sequential
+-------------------------
+1          |        245.2
+2          |        262.6
+3          |        278.4
+4          |        296.9
+5          |        313.3
+
+## Avg Generated Tokens per Question
+
+GroupSize  |   Sequential
+-------------------------
+1          |         10.7
+2          |         11.6
+3          |         12.7
+4          |         13.6
+5          |         11.1
+
+## Avg Latency per Question (seconds)
+
+GroupSize  |   Sequential
+-------------------------
+1          |       0.2198
+2          |       0.2321
+3          |       0.2526
+4          |       0.2730
+5          |       0.2338
+
+## API Cost (USD, $0.10/M input + $0.20/M output)
+
+GroupSize  |   Sequential
+-------------------------
+1          |       12.800
+2          |       13.717
+3          |       14.584
+4          |       15.558
+5          |       16.099
+
+## Performance Comparison with 0-shot Sequential
+
+Strategy                     | EM (G=1) | EM (G=5) | Improvement
+-----------------------------|----------|----------|------------
+0-shot Sequential            |   78.3%  |   81.0%  |    --
+SFT-LoRA Sequential (1K×1ep) |   85.6%  |   88.5%  |  +7.3% / +7.5%

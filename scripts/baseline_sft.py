@@ -1444,9 +1444,22 @@ def main():
     # Use same seed as baseline_pretrained.py for consistent evaluation samples
     # Use fixed_question_count to match eval_question_grouping_impact.py data loading
     logger.info(f"Loading evaluation data: {args.eval_samples} samples from {args.dataset}")
+
+    # Determine correct eval split for dataset
+    eval_split_map = {
+        "squad": "validation",
+        "hotpot": "validation",
+        "quac": "validation",
+        "drop": "validation",
+        "triviaqa": "validation",
+        "quality": "dev",
+        "cmb": "val",  # CMB uses "val" not "validation"
+    }
+    eval_split = eval_split_map.get(args.dataset, "validation")
+
     eval_contexts = load_dataset(
         args.dataset,
-        split="validation",
+        split=eval_split,
         max_contexts=args.eval_samples,
         min_questions=args.min_questions,
         max_questions=args.max_questions,
