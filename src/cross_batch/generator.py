@@ -232,8 +232,8 @@ class CrossBatchGenerator:
 
             # Apply cross-batch interaction
             if enable_cross_batch and batch_size > 1:
-                valid_mask = (~finished).to(self.device)
-
+                # Don't pass attention_mask to match training behavior
+                # Training doesn't use attention_mask, so inference shouldn't either for consistency
                 if self.is_multi_layer and isinstance(self.cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)):
                     # Multi-layer mode: apply cross-batch module at each selected layer
                     # Aggregate contributions from all layers
@@ -244,8 +244,8 @@ class CrossBatchGenerator:
                         actual_idx = layer_idx if layer_idx >= 0 else len(outputs.hidden_states) + layer_idx
                         layer_hidden = outputs.hidden_states[actual_idx][:, -1, :].to(self.device)
 
-                        # Apply the layer-specific module (gate or attention)
-                        mixed = self.cross_batch_module(layer_idx, layer_hidden, valid_mask)
+                        # Apply the layer-specific module (no attention_mask)
+                        mixed = self.cross_batch_module(layer_idx, layer_hidden)
                         delta = mixed - layer_hidden
 
                         if accumulated_delta is None:
@@ -258,10 +258,10 @@ class CrossBatchGenerator:
                     final_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = final_hidden + accumulated_delta / num_layers
                 else:
-                    # Single layer mode (backward compatible)
+                    # Single layer mode: no attention_mask to match training
                     hidden_states = outputs.hidden_states[self.mix_layer]
                     last_hidden = hidden_states[:, -1, :].to(self.device)
-                    mixed_hidden = self.cross_batch_module(last_hidden, attention_mask=valid_mask)
+                    mixed_hidden = self.cross_batch_module(last_hidden)
 
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
