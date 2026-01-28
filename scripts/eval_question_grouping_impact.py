@@ -311,32 +311,41 @@ def gpu_worker(
             cross_batch_module.to(device)
 
             # Load LoRA weights if present in Cross-Batch checkpoint
-            if "lora" in checkpoint:
+            if "lora" in checkpoint and config.get("use_lora"):
                 try:
                     from peft import PeftModel, LoraConfig, get_peft_model
-                    print(f"[GPU {physical_gpu_id}] Loading LoRA from Cross-Batch checkpoint")
+                    print(f"[GPU {physical_gpu_id}] Loading LoRA from Cross-Batch checkpoint ({len(checkpoint['lora'])} tensors)")
+
                     # Get LoRA config from checkpoint
-                    lora_config_dict = config.get("lora_config", {
-                        "r": config.get("lora_r", 16),
-                        "lora_alpha": config.get("lora_alpha", 32),
-                        "target_modules": config.get("lora_target_modules", "q_proj,k_proj,v_proj,o_proj").split(","),
-                    })
-                    # Apply LoRA structure to model
+                    target_modules = config.get("lora_target_modules", "q_proj,k_proj,v_proj,o_proj")
+                    if isinstance(target_modules, str):
+                        target_modules = target_modules.split(",")
+
                     lora_config = LoraConfig(
-                        r=lora_config_dict["r"],
-                        lora_alpha=lora_config_dict["lora_alpha"],
-                        target_modules=lora_config_dict["target_modules"],
+                        r=config.get("lora_r", 16),
+                        lora_alpha=config.get("lora_alpha", 32),
+                        target_modules=target_modules,
                         lora_dropout=0.05,
                         bias="none",
                         task_type="CAUSAL_LM",
                     )
+
+                    # Apply LoRA structure to model
                     model = get_peft_model(model, lora_config)
-                    # Load LoRA weights
-                    model.load_state_dict(checkpoint["lora"], strict=False)
+
+                    # Load LoRA weights from checkpoint
+                    # The checkpoint contains full state_dict with 'base_model.model...' prefixes
+                    incompatible = model.load_state_dict(checkpoint["lora"], strict=False)
+                    print(f"[GPU {physical_gpu_id}] Loaded LoRA, missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)}")
+
+                    # Merge LoRA into base model for inference
                     model = model.merge_and_unload()
-                    print(f"[GPU {physical_gpu_id}] LoRA weights loaded and merged")
+                    model.eval()
+                    print(f"[GPU {physical_gpu_id}] LoRA merged into base model")
                 except Exception as e:
-                    print(f"[GPU {physical_gpu_id}] Warning: Failed to load LoRA: {e}")
+                    print(f"[GPU {physical_gpu_id}] ERROR loading LoRA: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             cross_batch_generator = CrossBatchGenerator(
                 model=model,
