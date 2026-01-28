@@ -310,6 +310,34 @@ def gpu_worker(
             cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
             cross_batch_module.to(device)
 
+            # Load LoRA weights if present in Cross-Batch checkpoint
+            if "lora" in checkpoint:
+                try:
+                    from peft import PeftModel, LoraConfig, get_peft_model
+                    print(f"[GPU {physical_gpu_id}] Loading LoRA from Cross-Batch checkpoint")
+                    # Get LoRA config from checkpoint
+                    lora_config_dict = config.get("lora_config", {
+                        "r": config.get("lora_r", 16),
+                        "lora_alpha": config.get("lora_alpha", 32),
+                        "target_modules": config.get("lora_target_modules", "q_proj,k_proj,v_proj,o_proj").split(","),
+                    })
+                    # Apply LoRA structure to model
+                    lora_config = LoraConfig(
+                        r=lora_config_dict["r"],
+                        lora_alpha=lora_config_dict["lora_alpha"],
+                        target_modules=lora_config_dict["target_modules"],
+                        lora_dropout=0.05,
+                        bias="none",
+                        task_type="CAUSAL_LM",
+                    )
+                    model = get_peft_model(model, lora_config)
+                    # Load LoRA weights
+                    model.load_state_dict(checkpoint["lora"], strict=False)
+                    model = model.merge_and_unload()
+                    print(f"[GPU {physical_gpu_id}] LoRA weights loaded and merged")
+                except Exception as e:
+                    print(f"[GPU {physical_gpu_id}] Warning: Failed to load LoRA: {e}")
+
             cross_batch_generator = CrossBatchGenerator(
                 model=model,
                 tokenizer=tokenizer,
