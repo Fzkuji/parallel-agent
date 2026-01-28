@@ -169,15 +169,31 @@ def build_memory_embeddings(memory_bank, embedding_model="sentence-transformers/
     return embeddings, model
 
 
-def retrieve_similar_examples(query_embedding, memory_embeddings, memory_bank, top_k=3):
-    """Retrieve top-k most similar examples from memory bank."""
+def retrieve_similar_examples(query_embedding, memory_embeddings, memory_bank, top_k=3, exclude_context=None):
+    """Retrieve top-k most similar examples from memory bank, excluding examples from the same context.
+
+    Args:
+        exclude_context: Context text to exclude (prevent data leakage)
+    """
     import numpy as np
     # Normalize for cosine similarity
     query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-9)
     memory_norms = memory_embeddings / (np.linalg.norm(memory_embeddings, axis=1, keepdims=True) + 1e-9)
     similarities = np.dot(memory_norms, query_norm)
-    top_indices = np.argsort(similarities)[-top_k:][::-1]
-    return [memory_bank[i] for i in top_indices]
+
+    # Sort all indices by similarity (descending)
+    sorted_indices = np.argsort(similarities)[::-1]
+
+    # Filter out examples with same context
+    selected = []
+    for idx in sorted_indices:
+        if exclude_context and memory_bank[idx]["context"] == exclude_context:
+            continue  # Skip examples from same context
+        selected.append(memory_bank[idx])
+        if len(selected) >= top_k:
+            break
+
+    return selected
 
 
 def group_questions(all_questions, group_size):
@@ -450,10 +466,10 @@ def gpu_worker(
 
         # Strategy: memory - 3-shot sequential (like sequential but with 3 examples in first turn)
         if "memory" in results and memory_bank and memory_embeddings is not None and embedding_model:
-            # Retrieve 3 examples based on first question in group
+            # Retrieve 3 examples based on first question in group (exclude same context to prevent data leakage)
             first_q = group[0]
             query_emb = embedding_model.encode([first_q["question"]], convert_to_numpy=True)[0]
-            similar_examples = retrieve_similar_examples(query_emb, memory_embeddings, memory_bank, top_k=3)
+            similar_examples = retrieve_similar_examples(query_emb, memory_embeddings, memory_bank, top_k=3, exclude_context=context)
 
             # Build examples text
             examples_text = ""
