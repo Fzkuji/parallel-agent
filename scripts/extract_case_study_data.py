@@ -219,13 +219,16 @@ def generate_and_capture_attention(
 
         # Decode answers
         answers = []
-        for i, (in_ids, out_ids) in enumerate(zip(input_ids, output_ids)):
+        for i in range(len(input_ids)):
+            in_len = input_ids[i].shape[0]
+            out_ids = output_ids[i]
             # Get generated part only
-            generated_ids = out_ids[len(in_ids):]
-            # Ensure it's a list for tokenizer.decode
-            if hasattr(generated_ids, 'tolist'):
-                generated_ids = generated_ids.tolist()
-            answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_ids = out_ids[in_len:].tolist()
+            if not generated_ids:
+                # No tokens generated, use empty string
+                answer = ""
+            else:
+                answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
             answers.append(answer.strip())
 
     finally:
