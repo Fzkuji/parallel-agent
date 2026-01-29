@@ -443,7 +443,7 @@ class CSAVisualizer:
         answers: List[str],
         attention_matrix: np.ndarray,
         output_path: Optional[str] = None,
-        figsize: Tuple[float, float] = (12, 4),
+        figsize: Tuple[float, float] = (14, 4),
     ):
         """Plot case study with Q&A text and attention heatmap side by side.
 
@@ -459,9 +459,9 @@ class CSAVisualizer:
         """
         n = len(questions)
 
-        # Create figure
+        # Create figure with more space between subplots
         fig, (ax_qa, ax_attn) = plt.subplots(1, 2, figsize=figsize, facecolor='white',
-                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.05})
+                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.15})
 
         # ===== (a) Left: Q&A Text =====
         ax_qa.axis('off')
@@ -488,9 +488,9 @@ class CSAVisualizer:
                   fontsize=9, verticalalignment='center', fontfamily='monospace',
                   linespacing=1.5)
 
-        # Subplot label (a) at bottom
-        ax_qa.text(0.5, -0.05, '(a)', transform=ax_qa.transAxes,
-                  fontsize=12, fontweight='bold', va='top', ha='center')
+        # Subplot label (a) at bottom with title
+        ax_qa.text(0.5, -0.08, '(a) Questions and Answers', transform=ax_qa.transAxes,
+                  fontsize=11, fontweight='bold', va='top', ha='center')
 
         # ===== (b) Right: Attention Heatmap =====
         # Labels
@@ -540,9 +540,9 @@ class CSAVisualizer:
         ax_attn.set_xlabel('Source (Key)', fontsize=12)
         ax_attn.set_ylabel('Target (Query)', fontsize=12)
 
-        # Subplot label (b) at bottom
-        ax_attn.text(0.5, -0.12, '(b)', transform=ax_attn.transAxes,
-                    fontsize=12, fontweight='bold', va='top', ha='center')
+        # Subplot label (b) at bottom with title
+        ax_attn.text(0.5, -0.18, '(b) CSA Attention Matrix', transform=ax_attn.transAxes,
+                    fontsize=11, fontweight='bold', va='top', ha='center')
 
         # Minor grid for heatmap
         ax_attn.set_xticks(np.arange(-0.5, n, 1), minor=True)
