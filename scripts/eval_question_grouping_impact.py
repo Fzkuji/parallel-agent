@@ -822,6 +822,20 @@ def run_evaluation_multi_gpu(args, group_size, all_questions, output_dir, gpu_id
     num_groups = len(groups)
     # Use mapped dataset name for evaluation (e.g., "cmb" -> "cmb_exam_context" for accuracy metrics)
     eval_dataset = EVAL_DATASET_MAP.get(args.dataset, args.dataset)
+
+    # Print a few examples before full evaluation
+    logger.info("\n" + "="*80)
+    logger.info("SAMPLE PREDICTIONS (first 3 questions)")
+    logger.info("="*80)
+    sample_questions = list(question_lookup.values())[:3]
+    for q in sample_questions:
+        logger.info(f"\nQuestion: {q.text}")
+        logger.info(f"References: {q.references}")
+        for strategy_name, result_data in all_results.items():
+            pred, valid = result_data["predictions"].get(q.qid, ("", False))
+            logger.info(f"  {strategy_name}: {pred} {'✓' if valid else '✗'}")
+    logger.info("="*80 + "\n")
+
     for strategy_name, result_data in all_results.items():
         metrics = evaluate_predictions(result_data["predictions"], question_lookup, dataset=eval_dataset)
         summary[strategy_name] = {
