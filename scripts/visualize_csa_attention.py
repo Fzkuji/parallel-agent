@@ -443,59 +443,56 @@ class CSAVisualizer:
         answers: List[str],
         attention_matrix: np.ndarray,
         output_path: Optional[str] = None,
-        figsize: Tuple[float, float] = (18, 6),
+        figsize: Tuple[float, float] = (14, 5),
     ):
         """Plot case study with Q&A text and attention heatmap side by side.
 
-        Layout: [Q&A Text] | [Attention Heatmap]
-        Aspect ratio approximately 3:1 (width:height)
+        Layout: [(a) Q&A Text] | [(b) Attention Heatmap]
+        Both vertically centered.
 
         Args:
             questions: List of question dicts
             answers: Generated answers
             attention_matrix: Attention weights
             output_path: Path to save figure
-            figsize: Figure size (default 18x6 for ~3:1 ratio)
+            figsize: Figure size
         """
         n = len(questions)
 
-        # Create figure with custom layout
-        fig = plt.figure(figsize=figsize, facecolor='white')
+        # Create figure
+        fig, (ax_qa, ax_attn) = plt.subplots(1, 2, figsize=figsize, facecolor='white',
+                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.05})
 
-        # Grid: Q&A section (wider) | Attention heatmap
-        gs = fig.add_gridspec(1, 2, width_ratios=[2.0, 1], wspace=0.02)
-
-        # ===== Left: Q&A Text =====
-        ax_qa = fig.add_subplot(gs[0])
+        # ===== (a) Left: Q&A Text =====
         ax_qa.axis('off')
 
         # Build text content
         text_lines = []
-
         for i, (q, a) in enumerate(zip(questions, answers)):
             ref = q['references'][0] if q['references'] else "N/A"
 
             # Truncate if needed
-            q_text = q['question'][:80] + "..." if len(q['question']) > 80 else q['question']
-            a_text = a.strip()[:60] + "..." if len(a.strip()) > 60 else a.strip()
-            ref_text = ref[:60] + "..." if len(ref) > 60 else ref
+            q_text = q['question'][:70] + "..." if len(q['question']) > 70 else q['question']
+            a_text = a.strip()[:50] + "..." if len(a.strip()) > 50 else a.strip()
+            ref_text = ref[:50] + "..." if len(ref) > 50 else ref
 
             text_lines.append(f"$q_{{{i+1}}}$: {q_text}")
             text_lines.append(f"      Gen: {a_text}")
             text_lines.append(f"      Ref: {ref_text}")
-            text_lines.append("")
+            if i < n - 1:
+                text_lines.append("")
 
-        # Join and display
+        # Join and display - vertically centered
         text_content = "\n".join(text_lines)
-        ax_qa.text(0.02, 0.95, text_content, transform=ax_qa.transAxes,
-                  fontsize=10, verticalalignment='top', fontfamily='monospace',
-                  linespacing=1.4)
-        ax_qa.set_title('Questions & Answers', fontsize=13, fontweight='bold',
-                       loc='left', pad=10)
+        ax_qa.text(0.0, 0.5, text_content, transform=ax_qa.transAxes,
+                  fontsize=9, verticalalignment='center', fontfamily='monospace',
+                  linespacing=1.5)
 
-        # ===== Right: Attention Heatmap =====
-        ax_attn = fig.add_subplot(gs[1])
+        # Subplot label (a)
+        ax_qa.text(-0.02, 1.02, '(a)', transform=ax_qa.transAxes,
+                  fontsize=12, fontweight='bold', va='bottom', ha='right')
 
+        # ===== (b) Right: Attention Heatmap =====
         # Labels
         labels = [f"$q_{{{i+1}}}$" for i in range(n)]
 
@@ -518,8 +515,8 @@ class CSAVisualizer:
         # Ticks
         ax_attn.set_xticks(range(n))
         ax_attn.set_yticks(range(n))
-        ax_attn.set_xticklabels(labels, fontsize=11)
-        ax_attn.set_yticklabels(labels, fontsize=11)
+        ax_attn.set_xticklabels(labels, fontsize=10)
+        ax_attn.set_yticklabels(labels, fontsize=10)
 
         # Value annotations
         for i in range(n):
@@ -528,7 +525,7 @@ class CSAVisualizer:
                     value = attention_matrix[i, j]
                     color = 'white' if value > 0.35 else '#333333'
                     ax_attn.text(j, i, f'{value:.2f}', ha='center', va='center',
-                               fontsize=9, fontweight='bold', color=color)
+                               fontsize=8, fontweight='bold', color=color)
 
         # Diagonal markers
         for i in range(n):
@@ -538,11 +535,14 @@ class CSAVisualizer:
                 edgecolor='#BDBDBD', linewidth=0.5
             ))
             ax_attn.text(i, i, '—', ha='center', va='center',
-                        fontsize=10, color='#9E9E9E')
+                        fontsize=9, color='#9E9E9E')
 
-        ax_attn.set_xlabel('Source (Key)', fontsize=11)
-        ax_attn.set_ylabel('Target (Query)', fontsize=11)
-        ax_attn.set_title('Cross-Sequence Attention', fontsize=13, fontweight='bold', pad=10)
+        ax_attn.set_xlabel('Source (Key)', fontsize=10)
+        ax_attn.set_ylabel('Target (Query)', fontsize=10)
+
+        # Subplot label (b)
+        ax_attn.text(-0.15, 1.02, '(b)', transform=ax_attn.transAxes,
+                    fontsize=12, fontweight='bold', va='bottom', ha='right')
 
         # Minor grid for heatmap
         ax_attn.set_xticks(np.arange(-0.5, n, 1), minor=True)
