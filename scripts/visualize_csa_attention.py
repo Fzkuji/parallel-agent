@@ -463,7 +463,7 @@ class CSAVisualizer:
         fig = plt.figure(figsize=figsize, facecolor='white')
 
         # Grid: Q&A section (wider) | Attention heatmap
-        gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1], wspace=0.15)
+        gs = fig.add_gridspec(1, 2, width_ratios=[2.0, 1], wspace=0.02)
 
         # ===== Left: Q&A Text =====
         ax_qa = fig.add_subplot(gs[0])
