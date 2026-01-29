@@ -126,16 +126,16 @@ def parse_args():
                         help='相似度分组使用的 embedding 模型')
 
     # 训练参数
-    parser.add_argument('--max-samples', type=int, default=None,
-                        help='训练样本数 (default: None, 使用全部数据)')
+    parser.add_argument('--max-samples', type=int, default=1000,
+                        help='训练样本数 (default: 1000, 保守设置避免overfitting)')
     parser.add_argument('--epochs', type=int, default=1,
                         help='训练轮数 (default: 1)')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='每卡 batch size (default: 16)')
     parser.add_argument('--eval-samples', type=int, default=None,
                         help='评估 context 数 (default: None, 使用全部验证集)')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='学习率 (default: 1e-4)')
+    parser.add_argument('--lr', type=float, default=1e-5,
+                        help='学习率 (default: 1e-5, 保守设置)')
     parser.add_argument('--save-dir', type=str, default='outputs/checkpoints',
                         help='保存 checkpoint 的基础目录 (default: outputs/checkpoints)')
     parser.add_argument('--seed', type=int, default=42,

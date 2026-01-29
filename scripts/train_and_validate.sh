@@ -19,15 +19,16 @@ echo "=========================================="
 echo "Training CSA: $MODEL on $DATASET"
 echo "=========================================="
 
-# Train
+# Train with conservative settings
 torchrun --nproc_per_node=8 scripts/train_cross_batch.py \
     --model "$MODEL" \
     --dataset "$DATASET" \
-    --max-samples 10000 \
+    --max-samples 1000 \
     --min-questions 1 \
     --max-questions 5 \
     --epochs 1 \
     --batch-size 4 \
+    --lr 1e-5 \
     --seed 42 \
     --force
 
