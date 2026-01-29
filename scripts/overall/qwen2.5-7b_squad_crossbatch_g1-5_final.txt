@@ -1,0 +1,162 @@
+# Question Grouping Impact Experiment - Cross-Batch (CSA + Gate + LM Head)
+# Model: Qwen/Qwen2.5-7B-Instruct + CSA (10K samples, gate, lm_head)
+# Dataset: squad - 480 questions from 100 contexts (5 questions each)
+# Strategy: Cross-Batch with CrossBatchAttention + Question-Aware Gate + Trained LM Head
+
+## Results - EM (Exact Match)
+
+GroupSize  |  Cross-Batch |  NumGroups
+--------------------------------------
+1          |        0.810 |        480
+2          |        0.810 |        240
+3          |        0.808 |        160
+4          |        0.806 |        120
+5          |        0.806 |         96
+
+## Results - F1 Score
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |        0.910
+2          |        0.909
+3          |        0.909
+4          |        0.907
+5          |        0.905
+
+## Results - Lenient Accuracy
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |        0.958
+2          |        0.960
+3          |        0.960
+4          |        0.960
+5          |        0.960
+
+
+## Token Statistics (Total)
+
+GroupSize  |  Cross-Batch (Prompt Tokens - Deduplicated)
+-------------------------
+1          |      119,112
+2          |       78,318
+3          |       65,214
+4          |       58,488
+5          |       53,956
+
+## Token Statistics (API)
+
+GroupSize  |  Cross-Batch (Prompt Tokens - API)
+-------------------------
+1          |      119,112
+2          |      119,112
+3          |      119,112
+4          |      119,112
+5          |      119,112
+
+## Generated Tokens (Total)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |        5,474
+2          |        5,476
+3          |        5,473
+4          |        5,466
+5          |        5,466
+
+## GPU Latency (seconds)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |       106.32
+2          |        83.26
+3          |        67.28
+4          |        58.35
+5          |        50.08
+
+## Wall Time (seconds)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |        30.92
+2          |        27.54
+3          |        26.83
+4          |        24.48
+5          |        23.32
+
+## Avg Prompt Tokens per Question (Deduplicated)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |        248.2
+2          |        163.2
+3          |        135.9
+4          |        121.8
+5          |        112.4
+
+## Avg Prompt Tokens per Question (API)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |        248.2
+2          |        248.2
+3          |        248.2
+4          |        248.2
+5          |        248.2
+
+## Avg Generated Tokens per Question
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |         11.4
+2          |         11.4
+3          |         11.4
+4          |         11.4
+5          |         11.4
+
+## Avg Latency per Question (seconds)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |       0.2215
+2          |       0.1735
+3          |       0.1402
+4          |       0.1216
+5          |       0.1043
+
+## API Cost (USD, $0.10/M input + $0.20/M output)
+
+GroupSize  |  Cross-Batch
+-------------------------
+1          |       13.006
+2          |       13.007
+3          |       13.006
+4          |       13.005
+5          |       13.005
+
+## Performance Comparison
+
+Strategy           | EM (G=1) | EM (G=5) | Improvement
+-------------------|----------|----------|------------
+0-shot Independent |   80.4%  |   80.4%  |    --
+0-shot Sequential  |   80.4%  |   81.7%  |  +1.3%
+Cross-Batch (CSA)  |   81.0%  |   80.6%  |  +0.2%
+
+## Training Details
+- Training samples: 10,000 (SQuAD train)
+- Training method: CSA + Gate + LM Head
+- Learning rate: 1e-5
+- Batch size: 16 per GPU × 8 GPUs = 128
+- Epochs: 1
+- Parameters trained: CSA (51M) + Gate (varies) + LM Head (29M) ≈ 80M
+
+## Key Features
+- Question-aware gating controls mixing ratio
+- Trained lm_head adapts to CSA-modified hidden states
+- Left padding aligns prompt endings (matches inference)
+- Answer format: <answer>...</answer>
+- Maintains baseline accuracy while enabling parallel execution
+
+## Token Efficiency
+G=5 saves 54% prompt tokens (112.4 vs 248.2 per question)
+while maintaining 80.6% EM (vs Independent 80.4%)
