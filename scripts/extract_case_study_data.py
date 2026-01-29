@@ -164,7 +164,9 @@ def generate_and_capture_attention(
     device: str,
 ):
     """Generate answers and capture attention weights."""
-    from src.strategies.batch import build_batch_prompt
+    from src.prompts import build_single_prompt
+    from src.templates import build_chat_prompt
+    from src.models import Question
 
     # Storage for attention weights
     captured_attention = []
@@ -181,11 +183,19 @@ def generate_and_capture_attention(
     hook_handle = csa_module.register_forward_hook(attention_hook)
 
     try:
-        # Build prompts
+        # Build prompts using the same format as training
         prompts = []
-        for q in questions:
-            prompt = build_batch_prompt(context, q["text"])
-            prompts.append(prompt)
+        for i, q in enumerate(questions):
+            # Create Question object
+            question_obj = Question(
+                qid=f"Q{i+1}",
+                text=q["text"],
+                references=q.get("references", []),
+            )
+            # Build prompt
+            system_prompt, user_prompt = build_single_prompt(context, question_obj, dataset="squad")
+            full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+            prompts.append(full_prompt)
 
         # Tokenize
         inputs = tokenizer(
