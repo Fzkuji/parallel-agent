@@ -459,9 +459,9 @@ class CSAVisualizer:
         """
         n = len(questions)
 
-        # Create figure with moderate space between subplots
+        # Create figure with minimal space between subplots
         fig, (ax_qa, ax_attn) = plt.subplots(1, 2, figsize=figsize, facecolor='white',
-                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.08})
+                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.02})
 
         # ===== (a) Left: Q&A Text =====
         ax_qa.axis('off')
