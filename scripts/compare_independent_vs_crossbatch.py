@@ -119,9 +119,8 @@ def run_comparison(model_name="Qwen/Qwen2.5-7B-Instruct", num_contexts=20):
             full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
             prompts_cb.append(full_prompt)
 
-        tokenizer.padding_side = "left"
+        # Keep left padding (same as Independent)
         encoded = tokenizer(prompts_cb, return_tensors="pt", padding=True)
-        tokenizer.padding_side = "right"
 
         # CSA off
         outputs_cb_off = generator.generate(
