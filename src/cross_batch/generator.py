@@ -258,44 +258,16 @@ class CrossBatchGenerator:
                     final_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = final_hidden + accumulated_delta / num_layers
                 else:
-                    # Single layer mode: no attention_mask to match training
-                    hidden_states = outputs.hidden_states[self.mix_layer]
-                    last_hidden = hidden_states[:, -1, :].to(self.device)
+                    # Single layer mode: use last_hidden_state (already normalized!)
+                    # outputs.last_hidden_state is AFTER final norm
+                    # outputs.hidden_states[-1] is BEFORE final norm
+                    # Using last_hidden_state avoids norm mismatch issues
+                    last_hidden = outputs.last_hidden_state[:, -1, :].to(self.device)
                     mixed_hidden = self.cross_batch_module(last_hidden)
-
-                # Apply final layer norm before lm_head (critical fix!)
-                # Models like Qwen/Llama: layers → final_norm → lm_head
-                if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
-                    # Qwen, Llama, Mistral style
-                    norm_layer = self.model.model.norm
-                    # Ensure correct device
-                    norm_device = next(norm_layer.parameters()).device
-                    mixed_hidden = norm_layer(mixed_hidden.to(norm_device))
-                    mixed_hidden = mixed_hidden.to(self.device)
-                elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
-                    # GPT-2 style
-                    norm_layer = self.model.transformer.ln_f
-                    norm_device = next(norm_layer.parameters()).device
-                    mixed_hidden = norm_layer(mixed_hidden.to(norm_device))
-                    mixed_hidden = mixed_hidden.to(self.device)
+                    # No need to apply norm - already normalized!
 
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
-
-                # DEBUG: Compare with model's logits (should be identical when CSA adds 0)
-                if not hasattr(self, '_logits_debug_count'):
-                    self._logits_debug_count = 0
-                self._logits_debug_count += 1
-                if self._logits_debug_count <= 2:
-                    model_logits = outputs.logits[:, -1, :]
-                    diff = (next_token_logits - model_logits).abs()
-                    print(f"[LOGITS DEBUG #{self._logits_debug_count}] max_diff={diff.max().item():.6f}, mean_diff={diff.mean().item():.6f}")
-                    if diff.max().item() > 0.1:
-                        print(f"[LOGITS DEBUG] WARNING: Logits differ significantly!")
-                        # Check intermediate values
-                        print(f"[LOGITS DEBUG] mixed_hidden norm: {mixed_hidden.norm().item():.4f}")
-                        print(f"[LOGITS DEBUG] my_logits range: [{next_token_logits.min().item():.2f}, {next_token_logits.max().item():.2f}]")
-                        print(f"[LOGITS DEBUG] model_logits range: [{model_logits.min().item():.2f}, {model_logits.max().item():.2f}]")
             else:
                 next_token_logits = outputs.logits[:, -1, :]
 
