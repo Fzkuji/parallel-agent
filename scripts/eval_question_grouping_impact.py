@@ -296,7 +296,6 @@ def gpu_worker(
     cross_batch_generator = None
     if "cross_batch" in results:
         try:
-            from src.strategies.cross_batch import run_cross_batch_strategy
             from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
 
             hidden_size = model.config.hidden_size
@@ -630,23 +629,16 @@ def gpu_worker(
 
         # Strategy: cross_batch - Cross-Batch with trained checkpoint
         if "cross_batch" in results and cross_batch_generator:
-            from src.models import Question as Q
-            questions_obj = [
-                Q(qid=q["qid"], text=q["question"], priority=1.0,
-                  answer_tokens=q["answer_tokens"], type_hint=None, references=q["references"])
-                for q in group
-            ]
-
             # DEBUG: Print batch size for first few groups
             if local_idx < 3:
-                print(f"[GPU {physical_gpu_id}] Cross-Batch group {local_idx}: batch_size={len(questions_obj)}")
+                print(f"[GPU {physical_gpu_id}] Cross-Batch group {local_idx}: batch_size={len(group)}")
 
             start = time.perf_counter()
             try:
-                from src.strategies.cross_batch import run_cross_batch_strategy
-                result = run_cross_batch_strategy(
-                    background=context,
-                    questions=questions_obj,
+                # Use multi-context strategy since each question has its own context
+                from src.strategies.cross_batch import run_cross_batch_multi_strategy
+                result = run_cross_batch_multi_strategy(
+                    items=group,  # Each item has qid, question, context, references
                     tokenizer=tokenizer,
                     model=model,
                     max_new_tokens=96,
