@@ -237,9 +237,9 @@ class CrossBatchGenerator:
             active_mask = ~finished  # [batch_size] - True for active sequences
             num_active = active_mask.sum().item()
 
-            # CRITICAL: Always use same path (CSA or native) throughout generation
-            # Don't switch paths mid-generation when num_active drops to 1
-            if enable_cross_batch and batch_size > 1 and num_active >= 1:
+            # When num_active == 1, CSA's self-exclusion mask makes all attention weights 0
+            # This causes numerical issues, so we skip CSA and use hidden_states directly
+            if enable_cross_batch and batch_size > 1 and num_active > 1:
                 # Get model's native logits for all sequences first
                 model_logits = outputs.logits[:, -1, :].to(self.device)  # [batch, vocab]
 
@@ -285,9 +285,23 @@ class CrossBatchGenerator:
                 next_token_logits = model_logits.clone()
                 next_token_logits[active_indices] = active_logits
             else:
-                # batch_size == 1, CSA disabled, or only 1 active sequence
-                # Use model's native logits directly
-                next_token_logits = outputs.logits[:, -1, :]
+                # batch_size == 1, CSA disabled, or num_active <= 1
+                # When num_active == 1: use lm_head(hidden_states) to maintain consistency
+                # (don't use outputs.logits to avoid path switching)
+                if enable_cross_batch and batch_size > 1 and num_active == 1:
+                    # Only 1 active sequence remains, compute logits from hidden states
+                    model_logits = outputs.logits[:, -1, :].to(self.device)
+                    active_indices = active_mask.nonzero(as_tuple=True)[0]
+
+                    last_hidden_all = outputs.hidden_states[-1][:, -1, :].to(self.device)
+                    last_hidden = last_hidden_all[active_indices]  # [1, hidden]
+                    active_logits = self._hidden_to_logits(last_hidden)  # Skip CSA, direct lm_head
+
+                    next_token_logits = model_logits.clone()
+                    next_token_logits[active_indices] = active_logits
+                else:
+                    # batch_size == 1 or CSA disabled
+                    next_token_logits = outputs.logits[:, -1, :]
 
             # Apply temperature, top-k, top-p only when sampling
             if do_sample:
