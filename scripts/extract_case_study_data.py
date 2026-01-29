@@ -5,7 +5,7 @@ Run this on the server with GPU, then download the JSON for local plotting.
 
 Usage:
     python scripts/extract_case_study_data.py \
-        --checkpoint outputs/checkpoints/squad/Qwen_Qwen2.5-7B-Instruct_attention_frozen_lora.pt \
+        --checkpoint outputs/checkpoints/squad/Qwen_Qwen2.5-7B-Instruct_attention_gate.pt \
         --output case_study_data.json \
         --num-questions 5 \
         --context-index 0
