@@ -462,7 +462,7 @@ class CSAVisualizer:
 
         # Create 2x2 grid: top row for content, bottom row for titles
         fig = plt.figure(figsize=figsize, facecolor='white')
-        gs = fig.add_gridspec(2, 2, height_ratios=[10, 1], width_ratios=[1.5, 1],
+        gs = fig.add_gridspec(2, 2, height_ratios=[10, 1], width_ratios=[2, 1],
                               hspace=0.05, wspace=0.15)
 
         ax_qa = fig.add_subplot(gs[0, 0])      # Top-left: Q&A text
