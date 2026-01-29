@@ -299,10 +299,8 @@ def gpu_worker(
             from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
 
             hidden_size = model.config.hidden_size
-            # Always use CrossBatchAttention (with learnable Q/K/V projections)
-            cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
 
-            # Load checkpoint if provided and exists
+            # Load checkpoint first to get config (if available)
             checkpoint = None
             config = {}
             checkpoint_path = args_dict.get("cross_batch_checkpoint")
@@ -311,6 +309,14 @@ def gpu_worker(
                 print(f"[GPU {physical_gpu_id}] Loading Cross-Batch checkpoint: {checkpoint_path}")
                 checkpoint = torch.load(checkpoint_path, map_location=device)
                 config = checkpoint.get("config", {})
+                print(f"[GPU {physical_gpu_id}] Checkpoint config: use_gate={config.get('use_gate', False)}")
+
+            # Create CSA module with correct config
+            use_gate = config.get("use_gate", False)
+            cross_batch_module = CrossBatchAttention(hidden_size=hidden_size, use_gate=use_gate)
+
+            # Load checkpoint weights
+            if checkpoint is not None:
                 cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
                 print(f"[GPU {physical_gpu_id}] Loaded trained CSA weights")
             else:
