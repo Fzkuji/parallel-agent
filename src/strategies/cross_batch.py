@@ -210,9 +210,11 @@ def run_cross_batch_strategy(
     boxes = []
     generated_token_counts = []
 
-    for seq in sequences:
+    for idx, seq in enumerate(sequences):
+        # Use each sequence's actual input length, not the max (prompt_window)
+        actual_prompt_len = int(input_lengths[idx])
         tokens = []
-        for token in seq[int(prompt_window):].tolist():
+        for token in seq[actual_prompt_len:].tolist():
             if token in (eos_id, pad_id):
                 break
             tokens.append(token)
@@ -465,9 +467,11 @@ def run_cross_batch_multi_strategy(
     boxes = []
     generated_token_counts = []
 
-    for seq in sequences:
+    for idx, seq in enumerate(sequences):
+        # Use each sequence's actual input length, not the max (prompt_window)
+        actual_prompt_len = int(input_lengths[idx])
         tokens = []
-        for token in seq[int(prompt_window):].tolist():
+        for token in seq[actual_prompt_len:].tolist():
             if token in (eos_id, pad_id):
                 break
             tokens.append(token)
