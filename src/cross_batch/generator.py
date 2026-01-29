@@ -230,78 +230,33 @@ class CrossBatchGenerator:
                 output_hidden_states=True,
             )
 
-            # Apply cross-batch interaction
-            # Key insight: Only apply CSA to ACTIVE (unfinished) sequences
-            # - Finished sequences should use model's native logits (will be masked to pad anyway)
-            # - Mixing finished sequences' hidden states into CSA would pollute cross-batch info
-            active_mask = ~finished  # [batch_size] - True for active sequences
-            num_active = active_mask.sum().item()
-
-            # When num_active == 1, CSA's self-exclusion mask makes all attention weights 0
-            # This causes numerical issues, so we skip CSA and use hidden_states directly
-            if enable_cross_batch and batch_size > 1 and num_active > 1:
-                # Get model's native logits for all sequences first
-                model_logits = outputs.logits[:, -1, :].to(self.device)  # [batch, vocab]
-
-                # Extract hidden states only for active sequences
-                active_indices = active_mask.nonzero(as_tuple=True)[0]
-
+            # Apply cross-batch interaction (match training: apply to ALL sequences)
+            if enable_cross_batch and batch_size > 1:
                 if self.is_multi_layer and isinstance(self.cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)):
-                    # Multi-layer mode: apply cross-batch module at each selected layer
-                    # Only use active sequences for cross-batch
+                    # Multi-layer mode
                     accumulated_delta = None
-
                     for layer_idx in self.cross_batch_module.layer_indices:
-                        # Handle negative indices
                         actual_idx = layer_idx if layer_idx >= 0 else len(outputs.hidden_states) + layer_idx
-                        # Only take active sequences' hidden states
-                        layer_hidden_all = outputs.hidden_states[actual_idx][:, -1, :].to(self.device)
-                        layer_hidden = layer_hidden_all[active_indices]  # [num_active, hidden]
-
-                        # Apply the layer-specific module (only to active sequences)
+                        layer_hidden = outputs.hidden_states[actual_idx][:, -1, :].to(self.device)
                         mixed = self.cross_batch_module(layer_idx, layer_hidden)
                         delta = mixed - layer_hidden
-
                         if accumulated_delta is None:
                             accumulated_delta = delta
                         else:
                             accumulated_delta = accumulated_delta + delta
-
-                    # Average the deltas and add to final hidden state
                     num_layers = len(self.cross_batch_module.layer_indices)
-                    final_hidden_all = outputs.hidden_states[-1][:, -1, :].to(self.device)
-                    final_hidden = final_hidden_all[active_indices]
+                    final_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = final_hidden + accumulated_delta / num_layers
                 else:
-                    # Single layer mode: use hidden_states[-1] which is ALREADY normalized
-                    last_hidden_all = outputs.hidden_states[-1][:, -1, :].to(self.device)
-                    last_hidden = last_hidden_all[active_indices]  # [num_active, hidden]
+                    # Single layer mode
+                    last_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = self.cross_batch_module(last_hidden)
 
-                # Project active sequences' hidden states to logits
-                active_logits = self._hidden_to_logits(mixed_hidden)  # [num_active, vocab]
-
-                # Combine: use CSA logits for active, model logits for finished
-                next_token_logits = model_logits.clone()
-                next_token_logits[active_indices] = active_logits
+                # Project to logits
+                next_token_logits = self._hidden_to_logits(mixed_hidden)
             else:
-                # batch_size == 1, CSA disabled, or num_active <= 1
-                # When num_active == 1: use lm_head(hidden_states) to maintain consistency
-                # (don't use outputs.logits to avoid path switching)
-                if enable_cross_batch and batch_size > 1 and num_active == 1:
-                    # Only 1 active sequence remains, compute logits from hidden states
-                    model_logits = outputs.logits[:, -1, :].to(self.device)
-                    active_indices = active_mask.nonzero(as_tuple=True)[0]
-
-                    last_hidden_all = outputs.hidden_states[-1][:, -1, :].to(self.device)
-                    last_hidden = last_hidden_all[active_indices]  # [1, hidden]
-                    active_logits = self._hidden_to_logits(last_hidden)  # Skip CSA, direct lm_head
-
-                    next_token_logits = model_logits.clone()
-                    next_token_logits[active_indices] = active_logits
-                else:
-                    # batch_size == 1 or CSA disabled
-                    next_token_logits = outputs.logits[:, -1, :]
+                # batch_size == 1 or CSA disabled
+                next_token_logits = outputs.logits[:, -1, :]
 
             # Apply temperature, top-k, top-p only when sampling
             if do_sample:
