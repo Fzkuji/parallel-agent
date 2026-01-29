@@ -443,7 +443,7 @@ class CSAVisualizer:
         answers: List[str],
         attention_matrix: np.ndarray,
         output_path: Optional[str] = None,
-        figsize: Tuple[float, float] = (14, 5),
+        figsize: Tuple[float, float] = (12, 4),
     ):
         """Plot case study with Q&A text and attention heatmap side by side.
 
