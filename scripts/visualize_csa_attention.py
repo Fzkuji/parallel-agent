@@ -443,70 +443,142 @@ class CSAVisualizer:
         answers: List[str],
         attention_matrix: np.ndarray,
         output_path: Optional[str] = None,
-        figsize: Tuple[int, int] = (16, 10),
+        figsize: Tuple[float, float] = (18, 6),
     ):
-        """Plot detailed case study with questions, answers, and attention.
+        """Plot case study with Q&A cards and attention heatmap side by side.
+
+        Layout: [Q&A Cards (horizontal)] | [Attention Heatmap]
+        Aspect ratio approximately 3:1 (width:height)
 
         Args:
             questions: List of question dicts
             answers: Generated answers
             attention_matrix: Attention weights
             output_path: Path to save figure
-            figsize: Figure size
+            figsize: Figure size (default 18x6 for ~3:1 ratio)
         """
         n = len(questions)
 
-        fig = plt.figure(figsize=figsize)
+        # Create figure with custom layout
+        fig = plt.figure(figsize=figsize, facecolor='white')
 
-        # Create grid: left side for Q&A, right side for attention heatmap
-        gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1], wspace=0.3)
+        # Grid: Q&A section (wider) | Attention heatmap
+        gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1], wspace=0.08)
 
-        # Left: Questions and Answers
+        # ===== Left: Q&A Cards =====
         ax_qa = fig.add_subplot(gs[0])
+        ax_qa.set_xlim(0, n)
+        ax_qa.set_ylim(0, 1)
         ax_qa.axis('off')
 
-        # Build text content
-        context_preview = questions[0]['context'][:200] + "..." if len(questions[0]['context']) > 200 else questions[0]['context']
+        # Card dimensions
+        card_width = 0.95
+        card_spacing = (n - n * card_width) / (n + 1)
+        card_height = 0.85
+        card_y = 0.08
 
-        text_content = f"Context (truncated):\n{context_preview}\n\n"
-        text_content += "=" * 50 + "\n\n"
+        # Color scheme
+        card_colors = ['#E3F2FD', '#E8F5E9', '#FFF3E0', '#F3E5F5', '#E0F7FA']
+        border_colors = ['#1976D2', '#388E3C', '#F57C00', '#7B1FA2', '#00838F']
 
         for i, (q, a) in enumerate(zip(questions, answers)):
             ref = q['references'][0] if q['references'] else "N/A"
+            card_x = card_spacing + i * (card_width + card_spacing)
 
-            # Truncate long answers
-            a_display = a[:100] + "..." if len(a) > 100 else a
-            ref_display = ref[:100] + "..." if len(ref) > 100 else ref
+            # Card background
+            card = mpatches.FancyBboxPatch(
+                (card_x, card_y), card_width, card_height,
+                boxstyle=mpatches.BoxStyle("Round", pad=0.02, rounding_size=0.03),
+                facecolor=card_colors[i % len(card_colors)],
+                edgecolor=border_colors[i % len(border_colors)],
+                linewidth=2,
+                transform=ax_qa.transData,
+            )
+            ax_qa.add_patch(card)
 
-            text_content += f"Q{i+1}: {q['question']}\n"
-            text_content += f"    Generated: {a_display}\n"
-            text_content += f"    Reference: {ref_display}\n\n"
+            # Question label (header)
+            ax_qa.text(
+                card_x + card_width / 2, card_y + card_height - 0.08,
+                f"$q_{{{i+1}}}$",
+                fontsize=14, fontweight='bold',
+                ha='center', va='top',
+                color=border_colors[i % len(border_colors)],
+            )
 
-        ax_qa.text(0.02, 0.98, text_content, transform=ax_qa.transAxes,
-                  fontsize=9, verticalalignment='top', fontfamily='monospace',
-                  wrap=True)
-        ax_qa.set_title('Questions & Answers', fontsize=14, fontweight='bold', loc='left')
+            # Question text
+            q_text = q['question']
+            if len(q_text) > 60:
+                q_text = q_text[:57] + "..."
+            ax_qa.text(
+                card_x + 0.03, card_y + card_height - 0.18,
+                q_text,
+                fontsize=9, ha='left', va='top',
+                wrap=True,
+                style='italic',
+                color='#333333',
+            )
 
-        # Right: Attention heatmap
+            # Generated answer
+            a_text = a.strip()
+            if len(a_text) > 50:
+                a_text = a_text[:47] + "..."
+            ax_qa.text(
+                card_x + 0.03, card_y + card_height - 0.45,
+                f"Gen: {a_text}",
+                fontsize=9, ha='left', va='top',
+                fontweight='bold',
+                color='#1565C0',
+            )
+
+            # Reference answer
+            ref_text = ref
+            if len(ref_text) > 50:
+                ref_text = ref_text[:47] + "..."
+            ax_qa.text(
+                card_x + 0.03, card_y + card_height - 0.62,
+                f"Ref: {ref_text}",
+                fontsize=9, ha='left', va='top',
+                color='#2E7D32',
+            )
+
+            # Match indicator
+            is_match = a.strip().lower() == ref.strip().lower()
+            match_symbol = "✓" if is_match else "~"
+            match_color = '#2E7D32' if is_match else '#F57C00'
+            ax_qa.text(
+                card_x + card_width - 0.05, card_y + 0.08,
+                match_symbol,
+                fontsize=16, ha='right', va='bottom',
+                fontweight='bold',
+                color=match_color,
+            )
+
+        ax_qa.set_title('Questions & Answers', fontsize=13, fontweight='bold',
+                       loc='left', pad=10)
+
+        # ===== Right: Attention Heatmap =====
         ax_attn = fig.add_subplot(gs[1])
 
-        # Create labels
-        labels = [f"Q{i+1}" for i in range(n)]
+        # Labels
+        labels = [f"$q_{{{i+1}}}$" for i in range(n)]
 
-        # Plot heatmap
+        # Mask diagonal
         mask = np.eye(n, dtype=bool)
         masked_attn = np.ma.array(attention_matrix, mask=mask)
 
-        colors = ["#ffffff", "#e6f3ff", "#99d6ff", "#4db8ff", "#0099ff", "#0066cc"]
+        # Custom colormap
+        colors = ["#FFFFFF", "#E3F2FD", "#90CAF9", "#42A5F5", "#1976D2", "#0D47A1"]
         cmap = LinearSegmentedColormap.from_list("csa_blue", colors, N=256)
 
-        im = ax_attn.imshow(masked_attn, cmap=cmap, aspect='auto', vmin=0, vmax=1)
+        im = ax_attn.imshow(masked_attn, cmap=cmap, aspect='equal',
+                           vmin=0, vmax=max(0.5, attention_matrix.max()))
 
         # Colorbar
-        cbar = plt.colorbar(im, ax=ax_attn, shrink=0.8)
-        cbar.set_label('Attention Weight', fontsize=10)
+        cbar = plt.colorbar(im, ax=ax_attn, shrink=0.8, pad=0.02)
+        cbar.set_label('Attention', fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
 
-        # Ticks and labels
+        # Ticks
         ax_attn.set_xticks(range(n))
         ax_attn.set_yticks(range(n))
         ax_attn.set_xticklabels(labels, fontsize=11)
@@ -517,24 +589,35 @@ class CSAVisualizer:
             for j in range(n):
                 if i != j:
                     value = attention_matrix[i, j]
-                    color = 'white' if value > 0.5 else 'black'
+                    color = 'white' if value > 0.35 else '#333333'
                     ax_attn.text(j, i, f'{value:.2f}', ha='center', va='center',
-                               fontsize=10, fontweight='bold', color=color)
+                               fontsize=9, fontweight='bold', color=color)
 
-        # Mark diagonal
+        # Diagonal markers
         for i in range(n):
-            ax_attn.add_patch(plt.Rectangle((i-0.5, i-0.5), 1, 1,
-                            fill=True, facecolor='lightgray',
-                            edgecolor='gray', linewidth=1))
+            ax_attn.add_patch(plt.Rectangle(
+                (i - 0.5, i - 0.5), 1, 1,
+                fill=True, facecolor='#F5F5F5',
+                edgecolor='#BDBDBD', linewidth=0.5
+            ))
+            ax_attn.text(i, i, '—', ha='center', va='center',
+                        fontsize=10, color='#9E9E9E')
 
-        ax_attn.set_xlabel('Source Question', fontsize=12)
-        ax_attn.set_ylabel('Target Question', fontsize=12)
-        ax_attn.set_title('Cross-Sequence Attention', fontsize=14, fontweight='bold')
+        ax_attn.set_xlabel('Source (Key)', fontsize=11)
+        ax_attn.set_ylabel('Target (Query)', fontsize=11)
+        ax_attn.set_title('Cross-Sequence Attention', fontsize=13, fontweight='bold', pad=10)
 
-        plt.suptitle('Case Study: CSA Information Flow', fontsize=16, fontweight='bold', y=1.02)
+        # Minor grid for heatmap
+        ax_attn.set_xticks(np.arange(-0.5, n, 1), minor=True)
+        ax_attn.set_yticks(np.arange(-0.5, n, 1), minor=True)
+        ax_attn.grid(which='minor', color='white', linewidth=1)
+        ax_attn.tick_params(which='minor', size=0)
+
+        plt.tight_layout()
 
         if output_path:
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.savefig(output_path, dpi=300, bbox_inches='tight',
+                       facecolor='white', edgecolor='none')
             print(f"Saved case study to {output_path}")
 
         return fig
