@@ -222,6 +222,9 @@ def generate_and_capture_attention(
         for i, (in_ids, out_ids) in enumerate(zip(input_ids, output_ids)):
             # Get generated part only
             generated_ids = out_ids[len(in_ids):]
+            # Ensure it's a list for tokenizer.decode
+            if hasattr(generated_ids, 'tolist'):
+                generated_ids = generated_ids.tolist()
             answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
             answers.append(answer.strip())
 
