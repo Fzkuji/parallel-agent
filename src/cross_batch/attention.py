@@ -87,11 +87,6 @@ class CrossBatchAttention(nn.Module):
             )
             # Initialize gate to output small values initially
             self._init_gate_weights()
-        else:
-            # Learnable scale for the additive term
-            # Initialize to -10 so sigmoid(-10) ≈ 0.00005 (very small, safe)
-            # But trainable - can grow during training
-            self.scale = nn.Parameter(torch.tensor(-10.0))
 
         self._init_weights()
 
@@ -146,9 +141,6 @@ class CrossBatchAttention(nn.Module):
                 ln_a = self.ln_a(hidden_states)
                 gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
                 dummy = dummy + self.gate_net(gate_input).sum() * 0.0
-            else:
-                # Include scale parameter
-                dummy = dummy + self.scale * 0.0
             return hidden_states + dummy
 
         # Compute Q, K, V
@@ -199,6 +191,20 @@ class CrossBatchAttention(nn.Module):
         cross_batch_output = cross_batch_output.reshape(batch_size, self.hidden_size)
         cross_batch_output = self.out_proj(cross_batch_output)
 
+        # DEBUG: Log cross_batch_output norm (should be ~0 if out_proj=0)
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        self._debug_count += 1
+        if self._debug_count <= 3:
+            cb_norm = cross_batch_output.norm().item()
+            cb_max = cross_batch_output.abs().max().item()
+            h_norm = hidden_states.norm().item()
+            print(f"[CSA #{self._debug_count}] batch={batch_size}, cross_batch_output: norm={cb_norm:.6f}, max={cb_max:.6f}, hidden_norm={h_norm:.4f}")
+            if cb_norm < 0.001:
+                print(f"[CSA #{self._debug_count}] ✓ cross_batch_output ≈ 0 (as expected)")
+            else:
+                print(f"[CSA #{self._debug_count}] ✗ cross_batch_output ≠ 0! This will change output!")
+
         if self.use_gate:
             # Question-aware gating following paper design:
             # g_i = σ(MLP([LN(h_i); LN(a_i); LN(h_i) ⊙ LN(a_i)]))
@@ -206,11 +212,19 @@ class CrossBatchAttention(nn.Module):
             ln_a = self.ln_a(cross_batch_output)
             gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
             gate = self.gate_net(gate_input)  # [batch, hidden_size]
+
+            # DEBUG: Log gate values
+            if self._debug_count <= 3:
+                gate_mean = gate.mean().item()
+                gate_max = gate.max().item()
+                contribution = (gate * cross_batch_output).norm().item()
+                print(f"[CSA #{self._debug_count}] gate: mean={gate_mean:.6f}, max={gate_max:.6f}, contribution_norm={contribution:.6f}")
+
             output = hidden_states + gate * cross_batch_output
         else:
-            # ADDITIVE: H_out = H + scale * cross_batch_info
-            scale = torch.sigmoid(self.scale)
-            output = hidden_states + scale * cross_batch_output
+            # ADDITIVE: H_out = H + cross_batch_info
+            # out_proj initialized to 0, so initially cross_batch_output = 0
+            output = hidden_states + cross_batch_output
 
         return output
 

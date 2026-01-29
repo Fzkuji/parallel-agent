@@ -319,6 +319,41 @@ def gpu_worker(
 
             cross_batch_module.to(device)
 
+            # ============ DEBUG: Print CSA module weights ============
+            print(f"\n[GPU {physical_gpu_id}] ===== CSA Module Debug Info =====")
+            print(f"[GPU {physical_gpu_id}] use_gate: {cross_batch_module.use_gate}")
+
+            # Check out_proj weights (should be 0 for LoRA-style init)
+            out_proj_norm = cross_batch_module.out_proj.weight.norm().item()
+            out_proj_max = cross_batch_module.out_proj.weight.abs().max().item()
+            print(f"[GPU {physical_gpu_id}] out_proj.weight: norm={out_proj_norm:.6f}, max={out_proj_max:.6f}")
+
+            # Check Q/K/V weights
+            q_norm = cross_batch_module.q_proj.weight.norm().item()
+            k_norm = cross_batch_module.k_proj.weight.norm().item()
+            v_norm = cross_batch_module.v_proj.weight.norm().item()
+            print(f"[GPU {physical_gpu_id}] Q/K/V norms: Q={q_norm:.4f}, K={k_norm:.4f}, V={v_norm:.4f}")
+
+            # Check gate weights if use_gate=True
+            if cross_batch_module.use_gate:
+                gate_final = cross_batch_module.gate_net[-2]  # Linear before Sigmoid
+                gate_bias = gate_final.bias.item() if gate_final.bias.numel() == 1 else gate_final.bias[0].item()
+                gate_weight_norm = gate_final.weight.norm().item()
+                print(f"[GPU {physical_gpu_id}] gate: bias[0]={gate_bias:.4f}, weight_norm={gate_weight_norm:.6f}")
+
+            # Expected values for LoRA-style init:
+            # - out_proj should be ~0 (norm=0, max=0)
+            # - Q/K/V should be ~normal (norm around hidden_size * 0.02)
+            expected_qkv_norm = (hidden_size ** 0.5) * 0.02
+            print(f"[GPU {physical_gpu_id}] Expected Q/K/V norm (if init properly): ~{expected_qkv_norm:.4f}")
+
+            if out_proj_norm < 0.001:
+                print(f"[GPU {physical_gpu_id}] ✓ out_proj is ~0 (LoRA-style init correct)")
+            else:
+                print(f"[GPU {physical_gpu_id}] ✗ out_proj is NOT 0! CSA will affect output!")
+            print(f"[GPU {physical_gpu_id}] =====================================\n")
+            # ============ END DEBUG ============
+
             # Load LoRA weights if present in Cross-Batch checkpoint
             if checkpoint and "lora" in checkpoint and config.get("use_lora"):
                 try:
@@ -601,6 +636,10 @@ def gpu_worker(
                   answer_tokens=q["answer_tokens"], type_hint=None, references=q["references"])
                 for q in group
             ]
+
+            # DEBUG: Print batch size for first few groups
+            if local_idx < 3:
+                print(f"[GPU {physical_gpu_id}] Cross-Batch group {local_idx}: batch_size={len(questions_obj)}")
 
             start = time.perf_counter()
             try:
