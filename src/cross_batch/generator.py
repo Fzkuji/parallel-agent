@@ -237,7 +237,9 @@ class CrossBatchGenerator:
             active_mask = ~finished  # [batch_size] - True for active sequences
             num_active = active_mask.sum().item()
 
-            if enable_cross_batch and batch_size > 1 and num_active > 1:
+            # CRITICAL: Always use same path (CSA or native) throughout generation
+            # Don't switch paths mid-generation when num_active drops to 1
+            if enable_cross_batch and batch_size > 1 and num_active >= 1:
                 # Get model's native logits for all sequences first
                 model_logits = outputs.logits[:, -1, :].to(self.device)  # [batch, vocab]
 
