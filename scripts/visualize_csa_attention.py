@@ -459,9 +459,9 @@ class CSAVisualizer:
         """
         n = len(questions)
 
-        # Create figure with more space between subplots
+        # Create figure with moderate space between subplots
         fig, (ax_qa, ax_attn) = plt.subplots(1, 2, figsize=figsize, facecolor='white',
-                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.15})
+                                              gridspec_kw={'width_ratios': [1.6, 1], 'wspace': 0.08})
 
         # ===== (a) Left: Q&A Text =====
         ax_qa.axis('off')
@@ -488,8 +488,8 @@ class CSAVisualizer:
                   fontsize=9, verticalalignment='center', fontfamily='monospace',
                   linespacing=1.5)
 
-        # Subplot label (a) at bottom with title
-        ax_qa.text(0.5, -0.08, '(a) Questions and Answers', transform=ax_qa.transAxes,
+        # Subplot label (a) at bottom with title - aligned with (b)
+        ax_qa.text(0.5, -0.15, '(a) Questions and Answers', transform=ax_qa.transAxes,
                   fontsize=11, fontweight='bold', va='top', ha='center')
 
         # ===== (b) Right: Attention Heatmap =====
@@ -540,8 +540,8 @@ class CSAVisualizer:
         ax_attn.set_xlabel('Source (Key)', fontsize=12)
         ax_attn.set_ylabel('Target (Query)', fontsize=12)
 
-        # Subplot label (b) at bottom with title
-        ax_attn.text(0.5, -0.18, '(b) CSA Attention Matrix', transform=ax_attn.transAxes,
+        # Subplot label (b) at bottom with title - aligned with (a)
+        ax_attn.text(0.5, -0.15, '(b) CSA Attention Matrix', transform=ax_attn.transAxes,
                     fontsize=11, fontweight='bold', va='top', ha='center')
 
         # Minor grid for heatmap
