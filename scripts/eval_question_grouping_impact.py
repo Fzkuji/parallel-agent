@@ -281,8 +281,7 @@ def gpu_worker(
     # Initialize results for strategies with detailed token tracking
     results = {}
     for strategy in strategies_to_run:
-        if strategy == "cross_batch" and not args_dict.get("cross_batch_checkpoint"):
-            continue
+        # Cross-Batch now supports random init (no checkpoint required)
         results[strategy] = {
             "predictions": {},
             "latency": 0,
@@ -371,6 +370,8 @@ def gpu_worker(
             print(f"[GPU {physical_gpu_id}] Cross-Batch generator initialized")
         except Exception as e:
             print(f"[GPU {physical_gpu_id}] Failed to initialize Cross-Batch: {e}")
+            import traceback
+            traceback.print_exc()
             if "cross_batch" in results:
                 del results["cross_batch"]
 
