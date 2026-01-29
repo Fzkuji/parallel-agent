@@ -445,9 +445,9 @@ class CSAVisualizer:
         output_path: Optional[str] = None,
         figsize: Tuple[float, float] = (18, 6),
     ):
-        """Plot case study with Q&A cards and attention heatmap side by side.
+        """Plot case study with Q&A text and attention heatmap side by side.
 
-        Layout: [Q&A Cards (horizontal)] | [Attention Heatmap]
+        Layout: [Q&A Text] | [Attention Heatmap]
         Aspect ratio approximately 3:1 (width:height)
 
         Args:
@@ -463,96 +463,33 @@ class CSAVisualizer:
         fig = plt.figure(figsize=figsize, facecolor='white')
 
         # Grid: Q&A section (wider) | Attention heatmap
-        gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1], wspace=0.08)
+        gs = fig.add_gridspec(1, 2, width_ratios=[2.2, 1], wspace=0.15)
 
-        # ===== Left: Q&A Cards =====
+        # ===== Left: Q&A Text =====
         ax_qa = fig.add_subplot(gs[0])
-        ax_qa.set_xlim(0, n)
-        ax_qa.set_ylim(0, 1)
         ax_qa.axis('off')
 
-        # Card dimensions
-        card_width = 0.95
-        card_spacing = (n - n * card_width) / (n + 1)
-        card_height = 0.85
-        card_y = 0.08
-
-        # Color scheme
-        card_colors = ['#E3F2FD', '#E8F5E9', '#FFF3E0', '#F3E5F5', '#E0F7FA']
-        border_colors = ['#1976D2', '#388E3C', '#F57C00', '#7B1FA2', '#00838F']
+        # Build text content
+        text_lines = []
 
         for i, (q, a) in enumerate(zip(questions, answers)):
             ref = q['references'][0] if q['references'] else "N/A"
-            card_x = card_spacing + i * (card_width + card_spacing)
 
-            # Card background
-            card = mpatches.FancyBboxPatch(
-                (card_x, card_y), card_width, card_height,
-                boxstyle=mpatches.BoxStyle("Round", pad=0.02, rounding_size=0.03),
-                facecolor=card_colors[i % len(card_colors)],
-                edgecolor=border_colors[i % len(border_colors)],
-                linewidth=2,
-                transform=ax_qa.transData,
-            )
-            ax_qa.add_patch(card)
+            # Truncate if needed
+            q_text = q['question'][:80] + "..." if len(q['question']) > 80 else q['question']
+            a_text = a.strip()[:60] + "..." if len(a.strip()) > 60 else a.strip()
+            ref_text = ref[:60] + "..." if len(ref) > 60 else ref
 
-            # Question label (header)
-            ax_qa.text(
-                card_x + card_width / 2, card_y + card_height - 0.08,
-                f"$q_{{{i+1}}}$",
-                fontsize=14, fontweight='bold',
-                ha='center', va='top',
-                color=border_colors[i % len(border_colors)],
-            )
+            text_lines.append(f"$q_{{{i+1}}}$: {q_text}")
+            text_lines.append(f"      Gen: {a_text}")
+            text_lines.append(f"      Ref: {ref_text}")
+            text_lines.append("")
 
-            # Question text
-            q_text = q['question']
-            if len(q_text) > 60:
-                q_text = q_text[:57] + "..."
-            ax_qa.text(
-                card_x + 0.03, card_y + card_height - 0.18,
-                q_text,
-                fontsize=9, ha='left', va='top',
-                wrap=True,
-                style='italic',
-                color='#333333',
-            )
-
-            # Generated answer
-            a_text = a.strip()
-            if len(a_text) > 50:
-                a_text = a_text[:47] + "..."
-            ax_qa.text(
-                card_x + 0.03, card_y + card_height - 0.45,
-                f"Gen: {a_text}",
-                fontsize=9, ha='left', va='top',
-                fontweight='bold',
-                color='#1565C0',
-            )
-
-            # Reference answer
-            ref_text = ref
-            if len(ref_text) > 50:
-                ref_text = ref_text[:47] + "..."
-            ax_qa.text(
-                card_x + 0.03, card_y + card_height - 0.62,
-                f"Ref: {ref_text}",
-                fontsize=9, ha='left', va='top',
-                color='#2E7D32',
-            )
-
-            # Match indicator
-            is_match = a.strip().lower() == ref.strip().lower()
-            match_symbol = "✓" if is_match else "~"
-            match_color = '#2E7D32' if is_match else '#F57C00'
-            ax_qa.text(
-                card_x + card_width - 0.05, card_y + 0.08,
-                match_symbol,
-                fontsize=16, ha='right', va='bottom',
-                fontweight='bold',
-                color=match_color,
-            )
-
+        # Join and display
+        text_content = "\n".join(text_lines)
+        ax_qa.text(0.02, 0.95, text_content, transform=ax_qa.transAxes,
+                  fontsize=10, verticalalignment='top', fontfamily='monospace',
+                  linespacing=1.4)
         ax_qa.set_title('Questions & Answers', fontsize=13, fontweight='bold',
                        loc='left', pad=10)
 
