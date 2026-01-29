@@ -490,7 +490,7 @@ class CSAVisualizer:
                 text_lines.append("")
 
         text_content = "\n".join(text_lines)
-        ax_qa.text(0.02, 0.5, text_content, transform=ax_qa.transAxes,
+        ax_qa.text(0.02, 0.4, text_content, transform=ax_qa.transAxes,
                   fontsize=9, verticalalignment='center', fontfamily='monospace',
                   linespacing=1.4)
 
