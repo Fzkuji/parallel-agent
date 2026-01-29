@@ -482,14 +482,14 @@ class CSAVisualizer:
             if i < n - 1:
                 text_lines.append("")
 
-        # Join and display - vertically centered
+        # Join and display - slightly below center
         text_content = "\n".join(text_lines)
-        ax_qa.text(0.0, 0.5, text_content, transform=ax_qa.transAxes,
+        ax_qa.text(0.0, 0.45, text_content, transform=ax_qa.transAxes,
                   fontsize=9, verticalalignment='center', fontfamily='monospace',
                   linespacing=1.5)
 
         # Subplot label (a) at bottom with title - aligned with (b)
-        ax_qa.text(0.5, -0.15, '(a) Questions and Answers', transform=ax_qa.transAxes,
+        ax_qa.text(0.5, -0.02, '(a) Questions and Answers', transform=ax_qa.transAxes,
                   fontsize=11, fontweight='bold', va='top', ha='center')
 
         # ===== (b) Right: Attention Heatmap =====
@@ -541,7 +541,7 @@ class CSAVisualizer:
         ax_attn.set_ylabel('Target (Query)', fontsize=12)
 
         # Subplot label (b) at bottom with title - aligned with (a)
-        ax_attn.text(0.5, -0.15, '(b) CSA Attention Matrix', transform=ax_attn.transAxes,
+        ax_attn.text(0.5, -0.22, '(b) CSA Attention Matrix', transform=ax_attn.transAxes,
                     fontsize=11, fontweight='bold', va='top', ha='center')
 
         # Minor grid for heatmap
