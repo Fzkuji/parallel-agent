@@ -173,7 +173,7 @@ def run_cross_batch_strategy(
         full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
         batch_prompts.append(full_prompt)
 
-    # Tokenize all prompts with left padding
+    # Tokenize all prompts with left padding (match Independent strategy)
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     encoded = tokenizer(
@@ -181,6 +181,7 @@ def run_cross_batch_strategy(
         return_tensors="pt",
         padding=True,
         truncation=True,
+        max_length=2048,  # Same as Independent strategy
     )
     tokenizer.padding_side = original_padding_side
 
@@ -427,7 +428,7 @@ def run_cross_batch_multi_strategy(
         full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
         batch_prompts.append(full_prompt)
 
-    # Tokenize all prompts with left padding
+    # Tokenize all prompts with left padding (match Independent strategy)
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     encoded = tokenizer(
@@ -435,6 +436,7 @@ def run_cross_batch_multi_strategy(
         return_tensors="pt",
         padding=True,
         truncation=True,
+        max_length=2048,  # Same as Independent strategy
     )
     tokenizer.padding_side = original_padding_side
 
