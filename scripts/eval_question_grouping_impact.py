@@ -298,20 +298,30 @@ def gpu_worker(
         try:
             from src.strategies.cross_batch import run_cross_batch_strategy
             from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
-            # Load checkpoint
-            checkpoint = torch.load(args_dict["cross_batch_checkpoint"], map_location=device)
-            config = checkpoint.get("config", {})
-            mix_method = config.get("module_type", "attention")
-            hidden_size = model.config.hidden_size
+            import os
 
+            hidden_size = model.config.hidden_size
             # Always use CrossBatchAttention (with learnable Q/K/V projections)
             cross_batch_module = CrossBatchAttention(hidden_size=hidden_size)
 
-            cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
+            # Load checkpoint if provided and exists
+            checkpoint = None
+            config = {}
+            checkpoint_path = args_dict.get("cross_batch_checkpoint")
+
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                print(f"[GPU {physical_gpu_id}] Loading Cross-Batch checkpoint: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                config = checkpoint.get("config", {})
+                cross_batch_module.load_state_dict(checkpoint["cross_batch_module"])
+                print(f"[GPU {physical_gpu_id}] Loaded trained CSA weights")
+            else:
+                print(f"[GPU {physical_gpu_id}] Using random init CSA (no checkpoint)")
+
             cross_batch_module.to(device)
 
             # Load LoRA weights if present in Cross-Batch checkpoint
-            if "lora" in checkpoint and config.get("use_lora"):
+            if checkpoint and "lora" in checkpoint and config.get("use_lora"):
                 try:
                     from peft import PeftModel, LoraConfig, get_peft_model
                     print(f"[GPU {physical_gpu_id}] Loading LoRA from Cross-Batch checkpoint ({len(checkpoint['lora'])} tensors)")
@@ -347,12 +357,15 @@ def gpu_worker(
                     import traceback
                     traceback.print_exc()
 
+            mix_method = config.get("module_type", "attention")
+            mix_layer = config.get("mix_layer", -1)
+
             cross_batch_generator = CrossBatchGenerator(
                 model=model,
                 tokenizer=tokenizer,
                 cross_batch_module=cross_batch_module,
                 mix_method=mix_method,
-                mix_layer=config.get("mix_layer", -1),
+                mix_layer=mix_layer,
                 device=device,
             )
             print(f"[GPU {physical_gpu_id}] Cross-Batch generator initialized")
