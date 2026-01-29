@@ -267,13 +267,35 @@ class CrossBatchGenerator:
                 # Models like Qwen/Llama: layers → final_norm → lm_head
                 if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
                     # Qwen, Llama, Mistral style
-                    mixed_hidden = self.model.model.norm(mixed_hidden)
+                    norm_layer = self.model.model.norm
+                    # Ensure correct device
+                    norm_device = next(norm_layer.parameters()).device
+                    mixed_hidden = norm_layer(mixed_hidden.to(norm_device))
+                    mixed_hidden = mixed_hidden.to(self.device)
                 elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
                     # GPT-2 style
-                    mixed_hidden = self.model.transformer.ln_f(mixed_hidden)
+                    norm_layer = self.model.transformer.ln_f
+                    norm_device = next(norm_layer.parameters()).device
+                    mixed_hidden = norm_layer(mixed_hidden.to(norm_device))
+                    mixed_hidden = mixed_hidden.to(self.device)
 
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
+
+                # DEBUG: Compare with model's logits (should be identical when CSA adds 0)
+                if not hasattr(self, '_logits_debug_count'):
+                    self._logits_debug_count = 0
+                self._logits_debug_count += 1
+                if self._logits_debug_count <= 2:
+                    model_logits = outputs.logits[:, -1, :]
+                    diff = (next_token_logits - model_logits).abs()
+                    print(f"[LOGITS DEBUG #{self._logits_debug_count}] max_diff={diff.max().item():.6f}, mean_diff={diff.mean().item():.6f}")
+                    if diff.max().item() > 0.1:
+                        print(f"[LOGITS DEBUG] WARNING: Logits differ significantly!")
+                        # Check intermediate values
+                        print(f"[LOGITS DEBUG] mixed_hidden norm: {mixed_hidden.norm().item():.4f}")
+                        print(f"[LOGITS DEBUG] my_logits range: [{next_token_logits.min().item():.2f}, {next_token_logits.max().item():.2f}]")
+                        print(f"[LOGITS DEBUG] model_logits range: [{model_logits.min().item():.2f}, {model_logits.max().item():.2f}]")
             else:
                 next_token_logits = outputs.logits[:, -1, :]
 
