@@ -214,41 +214,56 @@ def multi_context_collate_fn(batch: List[List[Dict]], tokenizer: PreTrainedToken
 
 
 def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: int = 512):
-    """Collate function for DataLoader with left padding to match inference."""
+    """Collate function with custom padding to align prompt endings.
+
+    Strategy:
+    - Left pad prompts to align endings (like inference)
+    - Right pad answers (different lengths, masked)
+    - Result: [PAD_prompt][prompt][answer][PAD_answer]
+    """
     prompts = [item["prompt"] for item in batch]
     answers = [item["answer"] for item in batch]
-    full_texts = [item["full_text"] for item in batch]
 
-    # Use left padding for prompts to match inference behavior
-    # This ensures prompt endings are aligned at the same position in batch
-    original_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
+    # Tokenize separately
+    prompt_tokens = [tokenizer.encode(p, add_special_tokens=False) for p in prompts]
+    answer_tokens = [tokenizer.encode(a, add_special_tokens=False) for a in answers]
 
-    # Tokenize prompts (for input)
-    prompt_encodings = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
+    max_prompt_len = max(len(p) for p in prompt_tokens)
+    max_answer_len = max(len(a) for a in answer_tokens)
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-    # Tokenize full texts (for labels) - also use left padding
-    full_encodings = tokenizer(
-        full_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
+    input_ids_list = []
+    attention_mask_list = []
+    labels_list = []
+    labels_mask_list = []
 
-    tokenizer.padding_side = original_padding_side
+    for p_toks, a_toks in zip(prompt_tokens, answer_tokens):
+        # Left pad prompt
+        prompt_pad = max_prompt_len - len(p_toks)
+        padded_prompt = [pad_id] * prompt_pad + p_toks
+
+        # Right pad answer
+        answer_pad = max_answer_len - len(a_toks)
+        padded_answer = a_toks + [pad_id] * answer_pad
+
+        # Input: only prompt
+        input_ids = padded_prompt
+        input_mask = [0] * prompt_pad + [1] * len(p_toks)
+
+        # Labels: prompt + answer
+        labels = padded_prompt + padded_answer
+        labels_mask = input_mask + [1] * len(a_toks) + [0] * answer_pad
+
+        input_ids_list.append(input_ids)
+        attention_mask_list.append(input_mask)
+        labels_list.append(labels)
+        labels_mask_list.append(labels_mask)
 
     return {
-        "input_ids": prompt_encodings["input_ids"],
-        "attention_mask": prompt_encodings["attention_mask"],
-        "labels": full_encodings["input_ids"],
-        "labels_attention_mask": full_encodings["attention_mask"],
+        "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long),
+        "labels": torch.tensor(labels_list, dtype=torch.long),
+        "labels_attention_mask": torch.tensor(labels_mask_list, dtype=torch.long),
         "answers": answers,
     }
 
