@@ -214,10 +214,15 @@ def multi_context_collate_fn(batch: List[List[Dict]], tokenizer: PreTrainedToken
 
 
 def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: int = 512):
-    """Collate function for DataLoader."""
+    """Collate function for DataLoader with left padding to match inference."""
     prompts = [item["prompt"] for item in batch]
     answers = [item["answer"] for item in batch]
     full_texts = [item["full_text"] for item in batch]
+
+    # Use left padding for prompts to match inference behavior
+    # This ensures prompt endings are aligned at the same position in batch
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
 
     # Tokenize prompts (for input)
     prompt_encodings = tokenizer(
@@ -228,7 +233,7 @@ def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: in
         max_length=max_length,
     )
 
-    # Tokenize full texts (for labels)
+    # Tokenize full texts (for labels) - also use left padding
     full_encodings = tokenizer(
         full_texts,
         return_tensors="pt",
@@ -236,6 +241,8 @@ def collate_fn(batch: List[Dict], tokenizer: PreTrainedTokenizer, max_length: in
         truncation=True,
         max_length=max_length,
     )
+
+    tokenizer.padding_side = original_padding_side
 
     return {
         "input_ids": prompt_encodings["input_ids"],
