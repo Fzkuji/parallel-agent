@@ -66,8 +66,8 @@ class SQuADDataset(Dataset):
         for idx, item in enumerate(dataset):
             prompt = self._format_prompt(item["context"], item["question"], idx)
             raw_answer = item["answers"]["text"][0] if item["answers"]["text"] else ""
-            # Simple answer format: just the answer text + EOS token (no <answer> tags)
-            answer = f"{raw_answer}{eos_token}"
+            # Use <answer> tags to match inference format
+            answer = f"<answer>{raw_answer}</answer>{eos_token}"
             self.examples.append({
                 "prompt": prompt,
                 "answer": answer,
