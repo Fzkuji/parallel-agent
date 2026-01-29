@@ -263,6 +263,15 @@ class CrossBatchGenerator:
                     last_hidden = hidden_states[:, -1, :].to(self.device)
                     mixed_hidden = self.cross_batch_module(last_hidden)
 
+                # Apply final layer norm before lm_head (critical fix!)
+                # Models like Qwen/Llama: layers → final_norm → lm_head
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'norm'):
+                    # Qwen, Llama, Mistral style
+                    mixed_hidden = self.model.model.norm(mixed_hidden)
+                elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
+                    # GPT-2 style
+                    mixed_hidden = self.model.transformer.ln_f(mixed_hidden)
+
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
             else:
