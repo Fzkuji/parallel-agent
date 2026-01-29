@@ -269,6 +269,25 @@ class CrossBatchGenerator:
 
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
+
+                # DEBUG: Compare with model's built-in logits for first few steps
+                if not hasattr(self, '_logits_debug_count'):
+                    self._logits_debug_count = 0
+                self._logits_debug_count += 1
+                if self._logits_debug_count <= 5:
+                    model_logits = outputs.logits[:, -1, :]
+                    logits_diff = (next_token_logits - model_logits).abs()
+                    max_diff = logits_diff.max().item()
+                    mean_diff = logits_diff.mean().item()
+                    # Check if argmax matches
+                    my_argmax = next_token_logits.argmax(dim=-1)
+                    model_argmax = model_logits.argmax(dim=-1)
+                    argmax_match = (my_argmax == model_argmax).all().item()
+                    print(f"[LOGITS DEBUG #{self._logits_debug_count}] batch={batch_size}, max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, argmax_match={argmax_match}")
+                    if max_diff > 0.01:
+                        print(f"[LOGITS DEBUG #{self._logits_debug_count}] ⚠️ Logits differ significantly!")
+                        print(f"  my_argmax: {my_argmax.tolist()}")
+                        print(f"  model_argmax: {model_argmax.tolist()}")
             else:
                 next_token_logits = outputs.logits[:, -1, :]
 
