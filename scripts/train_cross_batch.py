@@ -153,8 +153,10 @@ def parse_args():
                         help='多层模式使用的层列表 (逗号分隔, 如 "8,12,16,20,24,28")')
     parser.add_argument('--self-only', action='store_true',
                         help='Ablation: CrossBatch 模块只关注自己（对角线 attention），禁用跨样本交互')
-    parser.add_argument('--use-gate', action='store_true',
-                        help='使用 Question-Aware Gating 而非固定 scale (仅 attention 模式)')
+    parser.add_argument('--use-gate', action='store_true', default=True,
+                        help='使用 Question-Aware Gating (默认启用, 用 --no-use-gate 禁用)')
+    parser.add_argument('--no-use-gate', action='store_false', dest='use_gate',
+                        help='禁用 Question-Aware Gating')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Top-k sparsification: 每个 query 只保留 top-k 个最相关的连接 (default: None, 不限制)')
     parser.add_argument('--train-lm-head', action='store_true', default=False,
