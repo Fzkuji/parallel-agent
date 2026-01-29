@@ -721,13 +721,101 @@ class CrossBatchTrainer:
             "num_tokens": num_tokens,
         }
 
+    def _run_quick_validation(self, val_contexts: List, step: int, epoch: int):
+        """Run quick validation on a few contexts during training."""
+        from src.cross_batch import CrossBatchGenerator
+        from src.models import Question
+        from src.inference import extract_answer
+        from src.evaluation import evaluate_predictions
+
+        self.cross_batch_module.eval()
+        logger.info(f"\n{'='*80}")
+        logger.info(f"VALIDATION @ Epoch {epoch}, Step {step}")
+        logger.info(f"{'='*80}")
+
+        # Test on 5 contexts with different group sizes
+        generator = CrossBatchGenerator(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            cross_batch_module=self.cross_batch_module,
+            mix_method="attention",
+            mix_layer=-1,
+            device=self.device,
+        )
+
+        # Sample 5 contexts
+        test_contexts = val_contexts[:5]
+        group_sizes = [1, 2, 3, 5]
+
+        for group_size in group_sizes:
+            all_preds = {}
+            question_lookup = {}
+
+            for ctx_idx, ctx in enumerate(test_contexts):
+                questions = ctx["questions"][:group_size]
+                questions_obj = [
+                    Question(qid=f"val_ctx{ctx_idx}_q{i}", text=q["text"],
+                             priority=1.0, answer_tokens=12, type_hint=None,
+                             references=q["references"])
+                    for i, q in enumerate(questions)
+                ]
+                for q in questions_obj:
+                    question_lookup[q.qid] = q
+
+                # Build prompts
+                from src.prompts import build_single_prompt
+                from src.templates import build_chat_prompt
+                prompts = []
+                for q in questions_obj:
+                    sys_prompt, user_prompt = build_single_prompt(ctx["context"], q, dataset="squad")
+                    full_prompt = build_chat_prompt(self.tokenizer, user_prompt, system_prompt=sys_prompt)
+                    prompts.append(full_prompt)
+
+                # Generate
+                encoded = self.tokenizer(prompts, return_tensors="pt", padding=True)
+                with torch.no_grad():
+                    outputs = generator.generate(
+                        input_ids=encoded["input_ids"],
+                        attention_mask=encoded["attention_mask"],
+                        max_new_tokens=96,
+                        do_sample=False,
+                        enable_cross_batch=True,
+                    )
+
+                # Decode
+                prompt_len = encoded["input_ids"].shape[1]
+                for i, q in enumerate(questions_obj):
+                    tokens = []
+                    for token in outputs["sequences"][i][prompt_len:].tolist():
+                        if token in (self.tokenizer.eos_token_id, self.tokenizer.pad_token_id):
+                            break
+                        tokens.append(token)
+                    raw_text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
+                    answer, valid = extract_answer(raw_text, "squad")
+                    all_preds[q.qid] = (answer, valid)
+
+            # Evaluate
+            metrics = evaluate_predictions(all_preds, question_lookup, dataset="squad")
+            em = metrics.get("strict_acc", 0.0)
+            logger.info(f"  G={group_size}: EM={em:.1%} ({len(test_contexts)*group_size} questions)")
+
+        logger.info(f"{'='*80}\n")
+        self.cross_batch_module.train()
+
     def train_epoch(
         self,
         dataloader: DataLoader,
         epoch: int,
         rank: int = 0,
+        val_contexts: Optional[List] = None,
+        val_freq: int = 500,
     ) -> Dict[str, float]:
-        """Train for one epoch."""
+        """Train for one epoch with periodic validation.
+
+        Args:
+            val_contexts: Optional list of validation contexts for periodic eval
+            val_freq: Run validation every N batches (default 500)
+        """
         self.cross_batch_module.train()
 
         total_loss = 0.0
@@ -785,6 +873,10 @@ class CrossBatchTrainer:
                 "baseline": f"{loss_dict['baseline_loss'].item():.4f}",
                 "improve": f"{loss_dict['improvement'].item():.4f}",
             })
+
+            # Periodic validation
+            if val_contexts is not None and rank == 0 and (num_batches + 1) % val_freq == 0:
+                self._run_quick_validation(val_contexts, num_batches + 1, epoch)
 
         return {
             "loss": total_loss / max(num_batches, 1),
