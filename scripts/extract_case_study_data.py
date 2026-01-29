@@ -10,8 +10,8 @@ import torch
 import numpy as np
 from pathlib import Path
 
-# Add parallel-agent to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "parallel-agent"))
+# Add parent directory (parallel-agent root) to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from src.cross_batch.attention import CrossBatchAttention
