@@ -488,9 +488,9 @@ class CSAVisualizer:
                   fontsize=9, verticalalignment='center', fontfamily='monospace',
                   linespacing=1.5)
 
-        # Subplot label (a)
-        ax_qa.text(-0.02, 1.02, '(a)', transform=ax_qa.transAxes,
-                  fontsize=12, fontweight='bold', va='bottom', ha='right')
+        # Subplot label (a) at bottom
+        ax_qa.text(0.5, -0.05, '(a)', transform=ax_qa.transAxes,
+                  fontsize=12, fontweight='bold', va='top', ha='center')
 
         # ===== (b) Right: Attention Heatmap =====
         # Labels
@@ -515,8 +515,8 @@ class CSAVisualizer:
         # Ticks
         ax_attn.set_xticks(range(n))
         ax_attn.set_yticks(range(n))
-        ax_attn.set_xticklabels(labels, fontsize=10)
-        ax_attn.set_yticklabels(labels, fontsize=10)
+        ax_attn.set_xticklabels(labels, fontsize=12)
+        ax_attn.set_yticklabels(labels, fontsize=12)
 
         # Value annotations
         for i in range(n):
@@ -525,7 +525,7 @@ class CSAVisualizer:
                     value = attention_matrix[i, j]
                     color = 'white' if value > 0.35 else '#333333'
                     ax_attn.text(j, i, f'{value:.2f}', ha='center', va='center',
-                               fontsize=8, fontweight='bold', color=color)
+                               fontsize=10, fontweight='bold', color=color)
 
         # Diagonal markers
         for i in range(n):
@@ -535,14 +535,14 @@ class CSAVisualizer:
                 edgecolor='#BDBDBD', linewidth=0.5
             ))
             ax_attn.text(i, i, '—', ha='center', va='center',
-                        fontsize=9, color='#9E9E9E')
+                        fontsize=11, color='#9E9E9E')
 
-        ax_attn.set_xlabel('Source (Key)', fontsize=10)
-        ax_attn.set_ylabel('Target (Query)', fontsize=10)
+        ax_attn.set_xlabel('Source (Key)', fontsize=12)
+        ax_attn.set_ylabel('Target (Query)', fontsize=12)
 
-        # Subplot label (b)
-        ax_attn.text(-0.15, 1.02, '(b)', transform=ax_attn.transAxes,
-                    fontsize=12, fontweight='bold', va='bottom', ha='right')
+        # Subplot label (b) at bottom
+        ax_attn.text(0.5, -0.12, '(b)', transform=ax_attn.transAxes,
+                    fontsize=12, fontweight='bold', va='top', ha='center')
 
         # Minor grid for heatmap
         ax_attn.set_xticks(np.arange(-0.5, n, 1), minor=True)
