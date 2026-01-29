@@ -258,13 +258,14 @@ class CrossBatchGenerator:
                     final_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = final_hidden + accumulated_delta / num_layers
                 else:
-                    # Single layer mode: use last_hidden_state (already normalized!)
-                    # outputs.last_hidden_state is AFTER final norm
-                    # outputs.hidden_states[-1] is BEFORE final norm
-                    # Using last_hidden_state avoids norm mismatch issues
-                    last_hidden = outputs.last_hidden_state[:, -1, :].to(self.device)
+                    # Single layer mode: use hidden_states[-1] which is ALREADY normalized
+                    # For Qwen2/LlamaModel, the model adds normalized hidden states to the tuple:
+                    #   hidden_states = self.norm(hidden_states)
+                    #   all_hidden_states += (hidden_states,)  # After norm
+                    # So outputs.hidden_states[-1] IS normalized, no extra processing needed
+                    last_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = self.cross_batch_module(last_hidden)
-                    # No need to apply norm - already normalized!
+                    # CSA adds cross-batch info (initially 0 due to out_proj=0)
 
                 # Project back to logits using the model's output projection
                 next_token_logits = self._hidden_to_logits(mixed_hidden)
