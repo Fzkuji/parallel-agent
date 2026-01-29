@@ -91,13 +91,16 @@ class CrossBatchAttention(nn.Module):
         self._init_weights()
 
     def _init_gate_weights(self):
-        """Initialize gate network to output very small values initially."""
-        # Initialize the final linear layer to output very small values
-        # Ensures H_out ≈ H initially (untrained model = baseline)
+        """Initialize gate network.
+
+        Since out_proj=0 initially (cross_batch_output≈0), gate value doesn't
+        matter for initial output (gate × 0 = 0). We can use moderate values
+        to help gradient flow during training.
+        """
         final_layer = self.gate_net[-2]  # Linear before Sigmoid
-        nn.init.zeros_(final_layer.weight)
-        # Bias initialized to -10 so sigmoid(-10) ≈ 0.00005 (very small, safe)
-        nn.init.constant_(final_layer.bias, -10.0)
+        nn.init.normal_(final_layer.weight, mean=0.0, std=0.02)
+        # Bias to -3: sigmoid(-3) ≈ 0.047 (small but not tiny, allows gradient flow)
+        nn.init.constant_(final_layer.bias, -3.0)
 
     def _init_weights(self):
         """LoRA-style initialization: out_proj=0, others normal.
