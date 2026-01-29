@@ -223,6 +223,7 @@ def gpu_worker(
     Worker function that runs on a single GPU.
     Loads the model and processes assigned groups.
     """
+    import os
     import time
     import re
     import torch
@@ -298,7 +299,6 @@ def gpu_worker(
         try:
             from src.strategies.cross_batch import run_cross_batch_strategy
             from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
-            import os
 
             hidden_size = model.config.hidden_size
             # Always use CrossBatchAttention (with learnable Q/K/V projections)

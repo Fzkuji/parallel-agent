@@ -651,6 +651,7 @@ class CrossBatchTrainer:
                     step_loss = F.cross_entropy(
                         valid_logits[non_pad_mask],
                         valid_targets[non_pad_mask],
+                        reduction='sum',  # Use sum instead of mean
                     )
                     total_loss = total_loss + step_loss
 
@@ -664,6 +665,7 @@ class CrossBatchTrainer:
                         baseline_step_loss = F.cross_entropy(
                             valid_baseline[non_pad_mask],
                             valid_targets[non_pad_mask],
+                            reduction='sum',  # Use sum instead of mean
                         )
                         total_baseline_loss = total_baseline_loss + baseline_step_loss.item()
 
