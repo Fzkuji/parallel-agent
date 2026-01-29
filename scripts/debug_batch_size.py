@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from src.cross_batch import CrossBatchGenerator, CrossBatchAttention
-from src.eval_utils import load_dataset_groups
-from src.prompts import build_single_prompt
+from src.eval_utils import load_dataset_groups, SYSTEM_PROMPT
+from src.models import Question
 from src.templates import build_chat_prompt
 
 def main():
@@ -69,8 +69,12 @@ def main():
     # Prepare prompts
     prompts = []
     for q in [q1, q2]:
-        system_prompt, user_prompt = build_single_prompt(ctx['context'], q, dataset="squad")
-        full_prompt = build_chat_prompt(tokenizer, user_prompt, system_prompt=system_prompt)
+        prompt = f"Passage:\n{ctx['context']}\n\nQuestion: {q['text']}"
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         prompts.append(full_prompt)
 
     print("\n" + "="*80)
