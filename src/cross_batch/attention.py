@@ -69,13 +69,6 @@ class CrossBatchAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        # Learnable scaling factors for V and out projections
-        # Start small (0.01) to ensure untrained model = baseline
-        # During training, these can grow to allow gradient flow
-        # After training, merge into weights for efficiency
-        self.v_scale = nn.Parameter(torch.tensor(0.01))
-        self.out_scale = nn.Parameter(torch.tensor(0.01))
-
         self.dropout = nn.Dropout(dropout)
 
         if use_gate:
@@ -96,32 +89,33 @@ class CrossBatchAttention(nn.Module):
             self._init_gate_weights()
         else:
             # Learnable scale for the additive term
-            # Initialize to -3 so sigmoid(-3) ≈ 0.047 (small but trainable)
-            # Combined with v_scale=0.01, effective mixing ≈ 0.047 × 0.01 × 0.01 ≈ 0.00005
-            self.scale = nn.Parameter(torch.tensor(-3.0))
+            # Initialize to -10 so sigmoid(-10) ≈ 0.00005 (very small, safe)
+            # But trainable - can grow during training
+            self.scale = nn.Parameter(torch.tensor(-10.0))
 
         self._init_weights()
 
     def _init_gate_weights(self):
-        """Initialize gate network to output small values initially."""
-        # Initialize the final linear layer to output small values
-        # Combined with v_scale/out_scale, ensures H_out ≈ H initially
+        """Initialize gate network to output very small values initially."""
+        # Initialize the final linear layer to output very small values
+        # Ensures H_out ≈ H initially (untrained model = baseline)
         final_layer = self.gate_net[-2]  # Linear before Sigmoid
         nn.init.zeros_(final_layer.weight)
-        # Bias initialized to -3 so sigmoid(-3) ≈ 0.047 (small but trainable)
-        nn.init.constant_(final_layer.bias, -3.0)
+        # Bias initialized to -10 so sigmoid(-10) ≈ 0.00005 (very small, safe)
+        nn.init.constant_(final_layer.bias, -10.0)
 
     def _init_weights(self):
-        """Initialize weights with normal std, protected by learnable scales.
+        """LoRA-style initialization: out_proj=0, others normal.
 
-        With v_scale=0.01 and out_scale=0.01, effective output ≈ 0 initially.
-        But weights use normal std (0.02) so gradients flow normally during training.
+        Q, K, V use normal init (std=0.02) for gradient flow.
+        out_proj uses zero init (like LoRA B matrix) to ensure initial output = 0.
+        This guarantees untrained model = baseline performance.
         """
         nn.init.normal_(self.q_proj.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.k_proj.weight, mean=0.0, std=0.02)
-        # Use normal initialization - scales handle the magnitude
         nn.init.normal_(self.v_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02)
+        # Zero init for out_proj (like LoRA B) - ensures cross_batch_output = 0 initially
+        nn.init.zeros_(self.out_proj.weight)
 
     def forward(
         self,
@@ -141,11 +135,11 @@ class CrossBatchAttention(nn.Module):
         if batch_size == 1:
             # Still pass through ALL parameters to maintain DDP gradient sync
             # The output equals input, but parameters participate in the computation graph
-            # Must include q_proj, k_proj, v_proj, out_proj, scales, and gate components
+            # Must include q_proj, k_proj, v_proj, out_proj and gate components
             dummy = (
                 self.q_proj(hidden_states).sum() * 0.0 +
                 self.k_proj(hidden_states).sum() * 0.0 +
-                self.out_proj(self.v_proj(hidden_states) * self.v_scale).sum() * self.out_scale * 0.0
+                self.out_proj(self.v_proj(hidden_states)).sum() * 0.0
             )
             if self.use_gate:
                 ln_h = self.ln_h(hidden_states)
@@ -157,10 +151,10 @@ class CrossBatchAttention(nn.Module):
                 dummy = dummy + self.scale * 0.0
             return hidden_states + dummy
 
-        # Compute Q, K, V (with learnable scale on V)
+        # Compute Q, K, V
         q = self.q_proj(hidden_states).view(batch_size, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(batch_size, self.num_heads, self.head_dim)
-        v = (self.v_proj(hidden_states) * self.v_scale).view(batch_size, self.num_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(batch_size, self.num_heads, self.head_dim)
 
         # [num_heads, batch, head_dim]
         q = q.permute(1, 0, 2)
@@ -203,8 +197,7 @@ class CrossBatchAttention(nn.Module):
         cross_batch_output = torch.bmm(attn_weights, v)  # [num_heads, batch, head_dim]
         cross_batch_output = cross_batch_output.permute(1, 0, 2)  # [batch, num_heads, head_dim]
         cross_batch_output = cross_batch_output.reshape(batch_size, self.hidden_size)
-        # Apply learnable scale to out_proj
-        cross_batch_output = self.out_proj(cross_batch_output) * self.out_scale
+        cross_batch_output = self.out_proj(cross_batch_output)
 
         if self.use_gate:
             # Question-aware gating following paper design:
@@ -220,21 +213,6 @@ class CrossBatchAttention(nn.Module):
             output = hidden_states + scale * cross_batch_output
 
         return output
-
-    def merge_scales(self):
-        """Merge learnable scales into projection weights (call after training).
-
-        This is a one-time operation that absorbs v_scale and out_scale into
-        the weights, making inference equivalent but without extra multiplications.
-        """
-        with torch.no_grad():
-            # Absorb scales into weights
-            self.v_proj.weight.data *= self.v_scale.item()
-            self.out_proj.weight.data *= self.out_scale.item()
-            # Reset scales to 1.0
-            self.v_scale.data.fill_(1.0)
-            self.out_scale.data.fill_(1.0)
-        print(f"Merged v_scale and out_scale into weights")
 
 
 class CrossBatchEmbeddingMixer(nn.Module):
