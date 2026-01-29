@@ -462,8 +462,8 @@ class CSAVisualizer:
 
         # Create 2x2 grid: top row for content, bottom row for titles
         fig = plt.figure(figsize=figsize, facecolor='white')
-        gs = fig.add_gridspec(2, 2, height_ratios=[10, 1], width_ratios=[2, 1],
-                              hspace=0.05, wspace=0.15)
+        gs = fig.add_gridspec(2, 2, height_ratios=[10, 1], width_ratios=[3, 1],
+                              hspace=0.05, wspace=0.1)
 
         ax_qa = fig.add_subplot(gs[0, 0])      # Top-left: Q&A text
         ax_attn = fig.add_subplot(gs[0, 1])    # Top-right: Heatmap
@@ -508,8 +508,8 @@ class CSAVisualizer:
         im = ax_attn.imshow(masked_attn, cmap=cmap, aspect='equal',
                            vmin=0, vmax=max(0.5, attention_matrix.max()))
 
-        # Colorbar
-        cbar = plt.colorbar(im, ax=ax_attn, shrink=0.8, pad=0.02)
+        # Colorbar - shrink to match heatmap height
+        cbar = plt.colorbar(im, ax=ax_attn, shrink=0.6, pad=0.02)
         cbar.set_label('Attention', fontsize=10)
         cbar.ax.tick_params(labelsize=9)
 
