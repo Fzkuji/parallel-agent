@@ -194,35 +194,11 @@ class CrossBatchAttention(nn.Module):
         cross_batch_output = cross_batch_output.reshape(batch_size, self.hidden_size)
         cross_batch_output = self.out_proj(cross_batch_output)
 
-        # DEBUG: Log cross_batch_output norm (should be ~0 if out_proj=0)
-        if not hasattr(self, '_debug_count'):
-            self._debug_count = 0
-        self._debug_count += 1
-        if self._debug_count <= 3:
-            cb_norm = cross_batch_output.norm().item()
-            cb_max = cross_batch_output.abs().max().item()
-            h_norm = hidden_states.norm().item()
-            print(f"[CSA #{self._debug_count}] batch={batch_size}, cross_batch_output: norm={cb_norm:.6f}, max={cb_max:.6f}, hidden_norm={h_norm:.4f}")
-            if cb_norm < 0.001:
-                print(f"[CSA #{self._debug_count}] ✓ cross_batch_output ≈ 0 (as expected)")
-            else:
-                print(f"[CSA #{self._debug_count}] ✗ cross_batch_output ≠ 0! This will change output!")
-
         if self.use_gate:
-            # Question-aware gating following paper design:
-            # g_i = σ(MLP([LN(h_i); LN(a_i); LN(h_i) ⊙ LN(a_i)]))
             ln_h = self.ln_h(hidden_states)
             ln_a = self.ln_a(cross_batch_output)
             gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
-            gate = self.gate_net(gate_input)  # [batch, hidden_size]
-
-            # DEBUG: Log gate values
-            if self._debug_count <= 3:
-                gate_mean = gate.mean().item()
-                gate_max = gate.max().item()
-                contribution = (gate * cross_batch_output).norm().item()
-                print(f"[CSA #{self._debug_count}] gate: mean={gate_mean:.6f}, max={gate_max:.6f}, contribution_norm={contribution:.6f}")
-
+            gate = self.gate_net(gate_input)
             output = hidden_states + gate * cross_batch_output
         else:
             # ADDITIVE: H_out = H + cross_batch_info
@@ -611,3 +587,156 @@ class MultiLayerCrossBatchAttention(nn.Module):
         if layer_idx in self.layer_indices:
             return self.attentions[str(layer_idx)]
         return None
+
+
+class CrossSequenceAttentionV2(nn.Module):
+    """CSA-v2: question-aware routing.
+
+    Differences from CrossBatchAttention:
+    - Routing (Q, K) is computed from a fixed question embedding (q_emb), not the
+      current decode-step hidden. q_emb is the mean-pooled hidden over the question
+      span of the prompt, computed once after the prompt forward pass and reused at
+      every decode step.
+    - Value uses the current decode-step hidden (the actual generation signal).
+    - Adaptive top-k: by default keeps max(1, ceil((B-1)/2)) cross-sequence
+      connections per query, suppressing dilution at large group size.
+    - Gate is initialized at sigmoid(0)=0.5 (not 0.05), since out_proj=0 already
+      guarantees zero initial contribution. This avoids training stalls.
+
+    Forward signature accepts question_emb separately. If None, falls back to using
+    hidden_states for routing (matches the v1 behavior).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        temperature: float = 1.0,
+        use_gate: bool = True,
+        gate_hidden_size: int = None,
+        top_k: Optional[int] = None,
+        adaptive_top_k: bool = True,
+    ):
+        super().__init__()
+        assert hidden_size % num_heads == 0
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.temperature = temperature
+        self.use_gate = use_gate
+        self.top_k = top_k
+        self.adaptive_top_k = adaptive_top_k
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        if use_gate:
+            self.ln_h = nn.LayerNorm(hidden_size)
+            self.ln_a = nn.LayerNorm(hidden_size)
+            gate_hidden = gate_hidden_size or hidden_size // 4
+            self.gate_net = nn.Sequential(
+                nn.Linear(hidden_size * 3, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, hidden_size),
+                nn.Sigmoid(),
+            )
+            self._init_gate_weights()
+
+        self._init_weights()
+
+    def _init_gate_weights(self):
+        final_layer = self.gate_net[-2]
+        nn.init.xavier_uniform_(final_layer.weight)
+        # bias=0 -> sigmoid(0)=0.5; out_proj=0 already keeps initial contribution at 0,
+        # so we don't need to clamp the gate as well.
+        nn.init.zeros_(final_layer.bias)
+
+    def _init_weights(self):
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.v_proj.weight, mean=0.0, std=0.02)
+        # LoRA-style: out_proj=0 -> initial cross_info = 0 -> initial output = baseline.
+        nn.init.zeros_(self.out_proj.weight)
+
+    def _resolve_top_k(self, batch_size: int) -> Optional[int]:
+        if self.top_k is not None:
+            return self.top_k
+        if self.adaptive_top_k and batch_size >= 3:
+            # max(1, ceil((B-1)/2)): G=3 -> 1, G=4 -> 2, G=5 -> 2, G=8 -> 4
+            return max(1, (batch_size - 1 + 1) // 2)
+        return None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        question_emb: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, d] current decode-step hidden states.
+            question_emb: [B, d] fixed question embeddings used for routing. If
+                None, falls back to hidden_states (v1 behavior).
+            attention_mask: [B] bool mask for valid samples.
+        """
+        B = hidden_states.size(0)
+
+        if B == 1:
+            # Keep all params in the graph for DDP gradient sync.
+            dummy = (
+                self.q_proj(hidden_states).sum() * 0.0
+                + self.k_proj(hidden_states).sum() * 0.0
+                + self.out_proj(self.v_proj(hidden_states)).sum() * 0.0
+            )
+            if self.use_gate:
+                ln_h = self.ln_h(hidden_states)
+                ln_a = self.ln_a(hidden_states)
+                gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
+                dummy = dummy + self.gate_net(gate_input).sum() * 0.0
+            return hidden_states + dummy
+
+        routing_states = question_emb if question_emb is not None else hidden_states
+        if routing_states.size(0) != B:
+            raise ValueError(
+                f"question_emb batch ({routing_states.size(0)}) must match hidden ({B})"
+            )
+
+        q = self.q_proj(routing_states).view(B, self.num_heads, self.head_dim).permute(1, 0, 2)
+        k = self.k_proj(routing_states).view(B, self.num_heads, self.head_dim).permute(1, 0, 2)
+        v = self.v_proj(hidden_states).view(B, self.num_heads, self.head_dim).permute(1, 0, 2)
+
+        scale = (self.head_dim ** 0.5) * self.temperature
+        attn_logits = torch.bmm(q, k.transpose(1, 2)) / scale  # [H, B, B]
+
+        eye_mask = torch.eye(B, device=hidden_states.device, dtype=torch.bool)
+        attn_logits = attn_logits.masked_fill(eye_mask.unsqueeze(0), float('-inf'))
+
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(0).unsqueeze(1)
+            attn_logits = attn_logits.masked_fill(~mask, float('-inf'))
+
+        top_k = self._resolve_top_k(B)
+        if top_k is not None and top_k < B - 1:
+            top_k_values, _ = torch.topk(attn_logits, k=top_k, dim=-1)
+            threshold = top_k_values[:, :, -1:].expand_as(attn_logits)
+            attn_logits = attn_logits.masked_fill(attn_logits < threshold, float('-inf'))
+
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.dropout(attn)
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+        cross_info = torch.bmm(attn, v).permute(1, 0, 2).reshape(B, self.hidden_size)
+        cross_info = self.out_proj(cross_info)
+
+        if self.use_gate:
+            ln_h = self.ln_h(hidden_states)
+            ln_a = self.ln_a(cross_info)
+            gate_input = torch.cat([ln_h, ln_a, ln_h * ln_a], dim=-1)
+            gate = self.gate_net(gate_input)
+            return hidden_states + gate * cross_info
+
+        return hidden_states + cross_info

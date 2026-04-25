@@ -21,12 +21,15 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
 
+import random
+
 from .attention import (
     CrossBatchAttention,
     CrossBatchEmbeddingMixer,
     SimpleCrossBatchGate,
     MultiLayerCrossBatch,
     MultiLayerCrossBatchAttention,
+    CrossSequenceAttentionV2,
 )
 from .utils import is_instruct_model, get_eos_token
 from src.prompts import build_single_prompt
@@ -107,6 +110,11 @@ class SQuADGroupedDataset(Dataset):
     Supported formats:
     - SQuAD: {"context": "...", "questions": [{"text": "...", "references": [...]}, ...]}
     - HotpotQA: {"items": [{"context": "...", "question": "...", "references": [...]}, ...], "title": "..."}
+
+    If `evidence_dropout_prob > 0`, with that probability each sample's context
+    is truncated to `1 - evidence_dropout_keep` of its tokens at __getitem__ time.
+    Same-context peers in the batch keep full context, forcing the model to share
+    information through CSA. Disable by passing 0.0.
     """
 
     def __init__(
@@ -115,48 +123,69 @@ class SQuADGroupedDataset(Dataset):
         groups: List[Dict],
         max_length: int = 512,
         dataset_name: str = "squad",
+        evidence_dropout_prob: float = 0.0,
+        evidence_dropout_keep: float = 0.5,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_name = dataset_name
-        self.context_groups = []
+        self.evidence_dropout_prob = evidence_dropout_prob
+        self.evidence_dropout_keep = evidence_dropout_keep
 
-        # Get EOS token for chat models (e.g., <|im_end|> for Qwen)
+        # Store raw fields so we can re-format prompts per-epoch when evidence
+        # dropout is enabled. context_groups also holds pre-formatted prompts so
+        # that the no-dropout fast path doesn't re-tokenize.
+        self.context_groups = []
+        self.raw_groups = []
+
         eos_token = get_eos_token(tokenizer)
 
         for group_idx, group in enumerate(groups):
             examples = []
+            raw_examples = []
 
-            # Detect format: HotpotQA uses "items", SQuAD uses "context" + "questions"
             if "items" in group:
-                # HotpotQA format: each item has its own context
                 for q_idx, item in enumerate(group["items"]):
                     context = item.get("context", "")
                     question_text = item.get("question", "")
                     references = item.get("references", [])
-                    prompt = self._format_prompt(context, question_text, group_idx, q_idx)
                     raw_answer = references[0] if references else ""
                     answer = f"{raw_answer}{eos_token}"
+                    prompt = self._format_prompt(context, question_text, group_idx, q_idx)
                     examples.append({
                         "prompt": prompt,
                         "answer": answer,
                         "full_text": prompt + answer,
                     })
+                    raw_examples.append({
+                        "context": context,
+                        "question": question_text,
+                        "answer": answer,
+                        "group_idx": group_idx,
+                        "q_idx": q_idx,
+                    })
             else:
-                # SQuAD format: shared context for all questions
                 context = group["context"]
                 questions = group["questions"]
                 for q_idx, q in enumerate(questions):
-                    prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
                     raw_answer = q["references"][0] if q["references"] else ""
                     answer = f"{raw_answer}{eos_token}"
+                    prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
                     examples.append({
                         "prompt": prompt,
                         "answer": answer,
                         "full_text": prompt + answer,
                     })
+                    raw_examples.append({
+                        "context": context,
+                        "question": q["text"],
+                        "answer": answer,
+                        "group_idx": group_idx,
+                        "q_idx": q_idx,
+                    })
 
             self.context_groups.append(examples)
+            self.raw_groups.append(raw_examples)
 
     def _format_prompt(self, context: str, question_text: str, group_idx: int, q_idx: int) -> str:
         """Use the same format as inference."""
@@ -172,12 +201,45 @@ class SQuADGroupedDataset(Dataset):
         system_prompt, user_prompt = build_single_prompt(context, q, dataset=self.dataset_name)
         return build_chat_prompt(self.tokenizer, user_prompt, system_prompt=system_prompt)
 
+    def _truncate_context(self, context: str) -> str:
+        """Keep a contiguous random `keep_ratio` slice of the context tokens."""
+        keep_ratio = self.evidence_dropout_keep
+        if keep_ratio >= 1.0 or not context:
+            return context
+        # Use whitespace tokens for English; for Chinese (CMB) characters work well too.
+        is_cjk = any("一" <= ch <= "鿿" for ch in context[:200])
+        if is_cjk:
+            tokens = list(context)
+        else:
+            tokens = context.split()
+        if len(tokens) < 8:
+            return context
+        keep = max(1, int(len(tokens) * keep_ratio))
+        max_start = len(tokens) - keep
+        start = random.randint(0, max_start)
+        slice_ = tokens[start:start + keep]
+        return ("" if is_cjk else " ").join(slice_)
+
     def __len__(self):
         return len(self.context_groups)
 
     def __getitem__(self, idx):
-        # Return list of examples for this context
-        return self.context_groups[idx]
+        if self.evidence_dropout_prob <= 0:
+            return self.context_groups[idx]
+
+        # Re-format prompts for this group with random per-sample evidence dropout.
+        examples = []
+        for raw in self.raw_groups[idx]:
+            ctx = raw["context"]
+            if random.random() < self.evidence_dropout_prob:
+                ctx = self._truncate_context(ctx)
+            prompt = self._format_prompt(ctx, raw["question"], raw["group_idx"], raw["q_idx"])
+            examples.append({
+                "prompt": prompt,
+                "answer": raw["answer"],
+                "full_text": prompt + raw["answer"],
+            })
+        return examples
 
 
 def grouped_collate_fn(batch: List[List[Dict]], tokenizer: PreTrainedTokenizer, max_length: int = 512):
@@ -350,6 +412,8 @@ class CrossBatchTrainer:
         train_lora: bool = False,  # Whether to train LoRA parameters
         local_rank: int = -1,
         mix_layer: int = -1,  # Which layer to use for training (-1 = last)
+        aux_contrast_lambda: float = 0.0,  # CSA-v2 InfoNCE weight (0 = disabled)
+        aux_contrast_temp: float = 0.1,
     ):
         self.tokenizer = tokenizer
         self.device = device
@@ -358,9 +422,12 @@ class CrossBatchTrainer:
         self.local_rank = local_rank
         self.is_distributed = local_rank >= 0
         self.mix_layer = mix_layer
+        self.aux_contrast_lambda = aux_contrast_lambda
+        self.aux_contrast_temp = aux_contrast_temp
 
         # Check if we're using multi-layer module
         self.is_multi_layer = isinstance(cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention))
+        self.is_csa_v2 = isinstance(cross_batch_module, CrossSequenceAttentionV2)
 
         self.model = model.to(device)
         self.base_model = _resolve_base_model(self.model)
@@ -453,6 +520,7 @@ class CrossBatchTrainer:
         hidden: torch.Tensor,
         context_ids: Optional[torch.Tensor] = None,
         layer_idx: Optional[int] = None,
+        question_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply cross-batch attention separately for each context group.
 
@@ -461,16 +529,20 @@ class CrossBatchTrainer:
             context_ids: [batch] tensor indicating which context each sample belongs to
                         If None, apply cross-batch to all samples together
             layer_idx: For MultiLayerCrossBatch, which layer's gate to use
+            question_emb: [batch, hidden_size] question embeddings for CSA-v2
 
         Returns:
             mixed_hidden: [batch, hidden_size] after per-context cross-batch attention
         """
         # Get the actual module (unwrap DDP if needed)
         module = self.cross_batch_module_unwrapped
+        is_v2 = isinstance(module, CrossSequenceAttentionV2)
 
         if context_ids is None:
             if isinstance(module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)) and layer_idx is not None:
                 return self.cross_batch_module(layer_idx, hidden)
+            if is_v2:
+                return self.cross_batch_module(hidden, question_emb=question_emb)
             return self.cross_batch_module(hidden)
 
         batch_size = hidden.size(0)
@@ -488,6 +560,9 @@ class CrossBatchTrainer:
             # This is important for DDP - all ranks must call the module the same number of times
             if isinstance(module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)) and layer_idx is not None:
                 ctx_mixed = self.cross_batch_module(layer_idx, ctx_hidden)
+            elif is_v2:
+                ctx_q_emb = question_emb[ctx_mask] if question_emb is not None else None
+                ctx_mixed = self.cross_batch_module(ctx_hidden, question_emb=ctx_q_emb)
             else:
                 ctx_mixed = self.cross_batch_module(ctx_hidden)
 
@@ -624,6 +699,14 @@ class CrossBatchTrainer:
                 for hs in hidden_states
             )
 
+            # CSA-v2: cache question embedding (mean-pool prompt last-layer hidden)
+            question_emb = None
+            if self.is_csa_v2:
+                last_layer = hidden_states[-1]  # [B, prompt_len, d]
+                mask_f = attention_mask.to(last_layer.dtype).unsqueeze(-1)
+                question_emb = (last_layer * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+                question_emb = question_emb.detach()  # frozen base model output
+
         # DDP safety: if the entire batch has zero answer tokens (e.g., due to truncation),
         # we still need to run a tiny forward/backward path through cross_batch_module so
         # all ranks participate in gradient synchronization.
@@ -631,7 +714,9 @@ class CrossBatchTrainer:
             if self.is_multi_layer:
                 mixed_hidden = self._apply_multi_layer_cross_batch(all_last_hidden, context_ids)
             else:
-                mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+                mixed_hidden = self._apply_cross_batch_per_context(
+                    last_hidden, context_ids, question_emb=question_emb
+                )
             dummy_loss = mixed_hidden.sum() * 0.0
             zero = torch.zeros((), device=self.device)
             return {
@@ -647,7 +732,9 @@ class CrossBatchTrainer:
             if self.is_multi_layer:
                 mixed_hidden = self._apply_multi_layer_cross_batch(all_last_hidden, context_ids)
             else:
-                mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+                mixed_hidden = self._apply_cross_batch_per_context(
+                    last_hidden, context_ids, question_emb=question_emb
+                )
             last_mixed_hidden_sum = mixed_hidden.sum()
 
             # Compute logits
@@ -731,16 +818,52 @@ class CrossBatchTrainer:
                 if self.is_multi_layer:
                     mixed_hidden = self._apply_multi_layer_cross_batch(all_last_hidden, context_ids)
                 else:
-                    mixed_hidden = self._apply_cross_batch_per_context(last_hidden, context_ids)
+                    mixed_hidden = self._apply_cross_batch_per_context(
+                        last_hidden, context_ids, question_emb=question_emb
+                    )
                 last_mixed_hidden_sum = mixed_hidden.sum()
             avg_loss = last_mixed_hidden_sum * 0.0
             avg_baseline_loss = 0.0
+
+        # CSA-v2 contrastive routing loss: same-context queries should be more
+        # similar under W_Q/W_K than across-context queries (InfoNCE).
+        contrast_loss_val = 0.0
+        if (
+            self.is_csa_v2
+            and self.aux_contrast_lambda > 0
+            and question_emb is not None
+            and context_ids is not None
+            and question_emb.size(0) >= 2
+        ):
+            module = self.cross_batch_module_unwrapped
+            q_proj = module.q_proj(question_emb)
+            k_proj = module.k_proj(question_emb)
+            q_n = F.normalize(q_proj, dim=-1)
+            k_n = F.normalize(k_proj, dim=-1)
+            sim = q_n @ k_n.t() / self.aux_contrast_temp  # [B, B]
+
+            B = question_emb.size(0)
+            eye = torch.eye(B, dtype=torch.bool, device=sim.device)
+            same_ctx = context_ids.unsqueeze(0) == context_ids.unsqueeze(1)
+            pos_mask = same_ctx & ~eye
+
+            sim = sim.masked_fill(eye, -1e4)  # exclude self
+            log_probs = F.log_softmax(sim, dim=-1)
+
+            has_pos = pos_mask.any(dim=-1)
+            if has_pos.any():
+                pos_log = log_probs.masked_fill(~pos_mask, 0.0).sum(dim=-1)
+                n_pos = pos_mask.sum(dim=-1).clamp(min=1).float()
+                contrast = -(pos_log[has_pos] / n_pos[has_pos]).mean()
+                avg_loss = avg_loss + self.aux_contrast_lambda * contrast
+                contrast_loss_val = contrast.item()
 
         return {
             "loss": avg_loss,
             "baseline_loss": torch.tensor(avg_baseline_loss, device=self.device),
             "improvement": torch.tensor(avg_baseline_loss, device=self.device) - avg_loss,
             "num_tokens": num_tokens,
+            "contrast_loss": contrast_loss_val,
         }
 
     def _run_quick_validation(self, val_contexts: List, step: int, epoch: int):

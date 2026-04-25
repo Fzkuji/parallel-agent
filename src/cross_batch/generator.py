@@ -17,6 +17,7 @@ from .attention import (
     SimpleCrossBatchGate,
     MultiLayerCrossBatch,
     MultiLayerCrossBatchAttention,
+    CrossSequenceAttentionV2,
 )
 from .shared_state import SharedStateAttention
 
@@ -117,6 +118,14 @@ class CrossBatchGenerator:
                 hidden_size=hidden_size,
                 num_heads=8,
                 temperature=1.0,
+            ).to(device=self.device, dtype=model_dtype)
+        elif mix_method == "csa_v2":
+            self.cross_batch_module = CrossSequenceAttentionV2(
+                hidden_size=hidden_size,
+                num_heads=8,
+                temperature=1.0,
+                use_gate=True,
+                adaptive_top_k=True,
             ).to(device=self.device, dtype=model_dtype)
         elif mix_method == "shared_state":
             self.cross_batch_module = SharedStateAttention(
@@ -223,6 +232,11 @@ class CrossBatchGenerator:
         # Shared state z for SharedStateAttention mode
         shared_z = None
 
+        # CSA-v2: question embedding cached after the first (prompt) forward.
+        # Mean pool over the prompt's last-layer hidden, masking out padding.
+        question_emb = None
+        is_csa_v2 = isinstance(self.cross_batch_module, CrossSequenceAttentionV2)
+
         for step in range(max_new_tokens):
             # Forward pass
             if past_key_values is not None:
@@ -241,9 +255,19 @@ class CrossBatchGenerator:
                 output_hidden_states=True,
             )
 
+            # Cache question embedding once after the prompt forward.
+            if is_csa_v2 and question_emb is None and outputs.hidden_states is not None:
+                last_layer = outputs.hidden_states[-1].to(self.device)  # [B, prompt_len, d]
+                mask = attention_mask.to(last_layer.dtype).unsqueeze(-1)
+                pooled = (last_layer * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                question_emb = pooled  # [B, d]
+
             # Apply cross-batch interaction (match training: apply to ALL sequences)
             if enable_cross_batch and batch_size > 1:
-                if isinstance(self.cross_batch_module, SharedStateAttention):
+                if is_csa_v2:
+                    last_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
+                    mixed_hidden = self.cross_batch_module(last_hidden, question_emb=question_emb)
+                elif isinstance(self.cross_batch_module, SharedStateAttention):
                     # Shared state mode: maintain running z, read from it
                     last_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
 
