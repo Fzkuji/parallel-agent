@@ -7,6 +7,7 @@ from .attention import (
     MultiLayerCrossBatch,
     MultiLayerCrossBatchAttention,
 )
+from .shared_state import SharedStateAttention
 from .generator import CrossBatchGenerator
 from .trainer import (
     CrossBatchTrainer,
@@ -24,6 +25,7 @@ __all__ = [
     "SimpleCrossBatchGate",
     "MultiLayerCrossBatch",
     "MultiLayerCrossBatchAttention",
+    "SharedStateAttention",
     "CrossBatchGenerator",
     # Training
     "CrossBatchTrainer",

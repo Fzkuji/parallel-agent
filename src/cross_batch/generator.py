@@ -18,6 +18,7 @@ from .attention import (
     MultiLayerCrossBatch,
     MultiLayerCrossBatchAttention,
 )
+from .shared_state import SharedStateAttention
 
 
 class CrossBatchGenerator:
@@ -117,6 +118,13 @@ class CrossBatchGenerator:
                 num_heads=8,
                 temperature=1.0,
             ).to(device=self.device, dtype=model_dtype)
+        elif mix_method == "shared_state":
+            self.cross_batch_module = SharedStateAttention(
+                hidden_size=hidden_size,
+                num_heads=8,
+                alpha=0.9,
+                use_gate=True,
+            ).to(device=self.device, dtype=model_dtype)
         else:  # "mixer"
             self.cross_batch_module = CrossBatchEmbeddingMixer(
                 hidden_size=hidden_size,
@@ -212,6 +220,9 @@ class CrossBatchGenerator:
         generated_ids = input_ids.clone()
         past_key_values = None
 
+        # Shared state z for SharedStateAttention mode
+        shared_z = None
+
         for step in range(max_new_tokens):
             # Forward pass
             if past_key_values is not None:
@@ -232,7 +243,20 @@ class CrossBatchGenerator:
 
             # Apply cross-batch interaction (match training: apply to ALL sequences)
             if enable_cross_batch and batch_size > 1:
-                if self.is_multi_layer and isinstance(self.cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)):
+                if isinstance(self.cross_batch_module, SharedStateAttention):
+                    # Shared state mode: maintain running z, read from it
+                    last_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
+
+                    # Update shared z with current hidden states
+                    shared_z = SharedStateAttention.update_shared_z(
+                        shared_z, last_hidden,
+                        alpha=self.cross_batch_module.alpha,
+                    )
+
+                    # Each sequence reads from shared z
+                    mixed_hidden = self.cross_batch_module(last_hidden, shared_z)
+
+                elif self.is_multi_layer and isinstance(self.cross_batch_module, (MultiLayerCrossBatch, MultiLayerCrossBatchAttention)):
                     # Multi-layer mode
                     accumulated_delta = None
                     for layer_idx in self.cross_batch_module.layer_indices:
@@ -248,7 +272,7 @@ class CrossBatchGenerator:
                     final_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = final_hidden + accumulated_delta / num_layers
                 else:
-                    # Single layer mode
+                    # Single layer mode (original CSA)
                     last_hidden = outputs.hidden_states[-1][:, -1, :].to(self.device)
                     mixed_hidden = self.cross_batch_module(last_hidden)
 
