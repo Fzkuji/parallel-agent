@@ -125,12 +125,20 @@ class SQuADGroupedDataset(Dataset):
         dataset_name: str = "squad",
         evidence_dropout_prob: float = 0.0,
         evidence_dropout_keep: float = 0.5,
+        wrap_answer_tags: bool = True,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_name = dataset_name
         self.evidence_dropout_prob = evidence_dropout_prob
         self.evidence_dropout_keep = evidence_dropout_keep
+        # Whether to wrap targets in <answer>...</answer>. Required for SQuAD
+        # because build_single_prompt's system message instructs the model to
+        # use those tags; mismatch between train target and inference parser
+        # destroys EM. Disable only for datasets where prompts don't use tags.
+        self.wrap_answer_tags = wrap_answer_tags and dataset_name not in {
+            "cmb_exam", "mmlu",
+        }
 
         # Store raw fields so we can re-format prompts per-epoch when evidence
         # dropout is enabled. context_groups also holds pre-formatted prompts so
@@ -139,6 +147,11 @@ class SQuADGroupedDataset(Dataset):
         self.raw_groups = []
 
         eos_token = get_eos_token(tokenizer)
+
+        def _wrap(raw):
+            if self.wrap_answer_tags:
+                return f"<answer>{raw}</answer>{eos_token}"
+            return f"{raw}{eos_token}"
 
         for group_idx, group in enumerate(groups):
             examples = []
@@ -150,7 +163,7 @@ class SQuADGroupedDataset(Dataset):
                     question_text = item.get("question", "")
                     references = item.get("references", [])
                     raw_answer = references[0] if references else ""
-                    answer = f"{raw_answer}{eos_token}"
+                    answer = _wrap(raw_answer)
                     prompt = self._format_prompt(context, question_text, group_idx, q_idx)
                     examples.append({
                         "prompt": prompt,
@@ -169,7 +182,7 @@ class SQuADGroupedDataset(Dataset):
                 questions = group["questions"]
                 for q_idx, q in enumerate(questions):
                     raw_answer = q["references"][0] if q["references"] else ""
-                    answer = f"{raw_answer}{eos_token}"
+                    answer = _wrap(raw_answer)
                     prompt = self._format_prompt(context, q["text"], group_idx, q_idx)
                     examples.append({
                         "prompt": prompt,
