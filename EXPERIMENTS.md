@@ -6,7 +6,47 @@
 pip install torch transformers datasets peft accelerate
 ```
 
-## 一句话总览
+## ★ 推荐流程：FineWeb-Edu Distillation Pretrain → dHotpot Finetune
+
+这条流程绕开了 QA next-token CE 训练 CSA 的弱信号问题。CSA 先在
+FineWeb-Edu 上做 representation distillation（学跨 chunk 信息传递），再
+迁移到 dHotpot。
+
+```bash
+# Step 1: Distillation pretraining on FineWeb-Edu (~30-60 min on 8 GPUs)
+# Oracle: forward 整篇文档；Student: G=4 个 chunk 各看一段 + CSA 通信
+# Loss: MSE(student_mixed_hidden, oracle_hidden) — 不通过 lm_head，不通过 CE
+torchrun --standalone --nproc_per_node=8 scripts/pretrain_csa_distill.py \
+    --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
+    --fineweb-path /mnt/data/zichuanfu/.cache/huggingface/datasets/HuggingFaceFW___fineweb-edu/sample-10BT \
+    --max-groups 5000 --epochs 1 \
+    --n-chunks 4 --chunk-tokens 1024 \
+    --output-dir ./out/csa_distill
+
+# Step 2: dHotpot finetune (init from distilled CSA, lm_head 冻结)
+torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
+    --dataset dhotpot --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
+    --num-train-groups 4000 --n-agents 4 --paragraphs-per-agent 9 \
+    --epochs 3 --no-train-lm-head \
+    --csa-init-from ./out/csa_distill/best_model.pt \
+    --output-dir ./out/dhotpot_csa_distilled
+
+# Step 3: Eval (DDP 分片，~3 min)
+torchrun --standalone --nproc_per_node=8 scripts/eval_csa.py \
+    --dataset dhotpot --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
+    --checkpoint ./out/dhotpot_csa_distilled/best_model.pt \
+    --num-eval-groups 200 --n-agents 4 --paragraphs-per-agent 9 \
+    --output-dir ./out/eval_dhotpot_distilled
+```
+
+为什么 distillation 比 SQuAD warm-up 强：
+- 训练信号 dense + explicit（每个 chunk 边界都有 MSE target）
+- 完全自监督，不依赖 QA label
+- 无 task bias，CSA 学的是通用 cross-sequence transfer
+- 完全不动 lm_head，无 train-test mismatch
+- 数据量无限（FineWeb-Edu 1T+ tokens）
+
+## 旧流程（SQuAD warm-up） — 保留作 ablation
 
 跑这条命令链，3-4 小时拿到完整 paper-ready 数据：
 
