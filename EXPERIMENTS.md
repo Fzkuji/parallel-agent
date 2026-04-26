@@ -26,8 +26,8 @@ torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
     --csa-init-from ./out/csa_warmup/best_model.pt \
     --output-dir ./out/dhotpot_csa_warm
 
-# 3. Eval (~15 min, 单卡跑足够)
-python scripts/eval_csa.py \
+# 3. Eval (DDP 分片，8 卡 ~3 min)
+torchrun --standalone --nproc_per_node=8 scripts/eval_csa.py \
     --dataset dhotpot --model-path /path/to/Qwen2.5-7B-Instruct \
     --checkpoint ./out/dhotpot_csa_warm/best_model.pt \
     --num-eval-groups 200 --n-agents 4 --paragraphs-per-agent 9 \
@@ -87,11 +87,12 @@ done
 
 ## 单卡 fallback
 
-如果只能用 1 卡，把 `torchrun --standalone --nproc_per_node=8` 换成 `python`：
+如果只能用 1 卡，把 `torchrun --standalone --nproc_per_node=8` 换成 `python`，train 和 eval 都支持：
 ```bash
 python scripts/train_csa.py --dataset dhotpot ...
+python scripts/eval_csa.py --dataset dhotpot ...
 ```
-训练时间 ~8 倍（约 5-6 小时）。
+训练时间 ~8 倍。eval 一样，没启动 DDP 时自动走单卡路径。
 
 ## 检查点结构
 
