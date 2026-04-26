@@ -633,6 +633,12 @@ class CrossSequenceAttentionV2(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.dropout = nn.Dropout(dropout)
+        # Distribution-aligning LayerNorm on the cross-sequence info before it
+        # is added back to the residual stream. Without this, training-time loss
+        # reduction can come from CSA pushing the hidden state into a regime the
+        # frozen lm_head cannot decode (loss drops, EM crashes). The norm forces
+        # the injection to share scale/centering with the base model's hidden.
+        self.cross_norm = nn.LayerNorm(hidden_size)
 
         if use_gate:
             self.ln_h = nn.LayerNorm(hidden_size)
@@ -731,6 +737,10 @@ class CrossSequenceAttentionV2(nn.Module):
 
         cross_info = torch.bmm(attn, v).permute(1, 0, 2).reshape(B, self.hidden_size)
         cross_info = self.out_proj(cross_info)
+        # Align cross_info to the base hidden distribution so the lm_head can
+        # decode it. With out_proj=0 at init, cross_norm(0) = 0 (bias=0), so the
+        # zero-initial-contribution invariant still holds.
+        cross_info = self.cross_norm(cross_info)
 
         if self.use_gate:
             ln_h = self.ln_h(hidden_states)

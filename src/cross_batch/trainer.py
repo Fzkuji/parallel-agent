@@ -1187,9 +1187,20 @@ class CrossBatchTrainer:
         # Also save lm_head if it was trained
         if self.train_lm_head and hasattr(self.model, 'lm_head'):
             save_dict["lm_head"] = self.model.lm_head.state_dict()
+        # Save LoRA adapter weights if any are trainable
+        if self.train_lora:
+            lora_state = {n: p.detach().cpu()
+                          for n, p in self.model.named_parameters()
+                          if 'lora' in n.lower() and p.requires_grad}
+            if lora_state:
+                save_dict["lora"] = lora_state
         torch.save(save_dict, path)
-        logger.info(f"Checkpoint saved to {path} (cross_batch_module"
-                   + (", lm_head" if self.train_lm_head else "") + ")")
+        modules = ["cross_batch_module"]
+        if self.train_lm_head and hasattr(self.model, 'lm_head'):
+            modules.append("lm_head")
+        if "lora" in save_dict:
+            modules.append(f"lora({len(save_dict['lora'])})")
+        logger.info(f"Checkpoint saved to {path} ({', '.join(modules)})")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint (only trained modules)."""
@@ -1200,6 +1211,13 @@ class CrossBatchTrainer:
         if "lm_head" in checkpoint and hasattr(self.model, 'lm_head'):
             self.model.lm_head.load_state_dict(checkpoint["lm_head"])
             loaded_modules.append("lm_head")
+        if "lora" in checkpoint:
+            current_lora = {n: p for n, p in self.model.named_parameters()
+                            if 'lora' in n.lower()}
+            for n, v in checkpoint["lora"].items():
+                if n in current_lora:
+                    current_lora[n].data.copy_(v.to(current_lora[n].device))
+            loaded_modules.append(f"lora({len(checkpoint['lora'])})")
         logger.info(f"Checkpoint loaded from {path} ({', '.join(loaded_modules)})")
 
 
