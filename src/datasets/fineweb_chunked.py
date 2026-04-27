@@ -84,12 +84,12 @@ def chunk_document_by_tokens(
     n_chunks: int = 4,
     chunk_tokens: int = 1024,
     skip_head_tokens: int = 0,
-) -> Optional[List[str]]:
-    """Tokenize, take G non-overlapping consecutive windows, return decoded text.
+) -> Optional[List[List[int]]]:
+    """Tokenize, take G non-overlapping consecutive windows of token ids.
 
-    Returns None if the doc cannot fill all G chunks. Uses
-    `add_special_tokens=False` so that special tokens added at chat-formatting
-    time don't double up.
+    Returns None if the doc cannot fill all G chunks. We return token ids
+    directly (not decoded text) so the trainer doesn't need to re-encode —
+    decode/re-encode round-trip can change length and break chunk boundaries.
     """
     ids = tokenizer.encode(text, add_special_tokens=False)
     if skip_head_tokens:
@@ -101,8 +101,7 @@ def chunk_document_by_tokens(
     for c in range(n_chunks):
         start = c * chunk_tokens
         end = start + chunk_tokens
-        sub = ids[start:end]
-        chunks.append(tokenizer.decode(sub, skip_special_tokens=True))
+        chunks.append(ids[start:end])
     return chunks
 
 

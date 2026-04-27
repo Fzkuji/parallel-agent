@@ -88,16 +88,19 @@ class CSADistillTrainer:
     def csa_module(self) -> CrossSequenceAttentionV2:
         return self.csa.module if self.is_distributed else self.csa
 
-    def _build_oracle_inputs(self, chunks: List[str]):
-        """Concat chunks into one long prompt; return input_ids, attention_mask,
-        and the per-chunk "end" token positions in the concatenated sequence.
+    def _build_oracle_inputs(self, per_chunk_ids: List[List[int]]):
+        """Concat chunks into one long prompt; return input_ids and the
+        per-chunk "end" token positions in the concatenated sequence.
 
-        Returned positions reference the original (unpadded) right-aligned
-        tokenization, then offset for left padding when batched.
+        We accept token ids directly (not strings) — re-encoding decoded text
+        is not length-stable, so the dataset produces ids and we use them as-is.
         """
-        # Tokenize each chunk separately so we know exact boundaries.
-        per_chunk_ids = [self.tokenizer.encode(c, add_special_tokens=False)
-                         for c in chunks]
+        # Defensive: ensure all chunks share the same length (required to
+        # batch them into a tensor below). If a stray short chunk slipped
+        # through, raising here makes the bug obvious in the log.
+        lens = {len(ids) for ids in per_chunk_ids}
+        if len(lens) != 1:
+            raise ValueError(f"chunks have inconsistent lengths: {sorted(lens)}")
         concat_ids = []
         chunk_end_positions = []  # 0-indexed token end of each chunk in concat
         for ids in per_chunk_ids:
@@ -148,7 +151,8 @@ class CSADistillTrainer:
     def training_step(self, group: dict) -> dict:
         """One distillation step on one document group.
 
-        group: {"chunks": [str * G], "doc_id": ...}
+        group: {"chunks": [List[int] * G], "doc_id": ...} — chunks are token id
+        lists, each of length self.chunk_tokens.
         """
         chunks = group["chunks"]
         if len(chunks) != self.n_chunks:
