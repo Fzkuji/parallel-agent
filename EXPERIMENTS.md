@@ -3,168 +3,138 @@
 ## 环境
 
 ```bash
-pip install torch transformers datasets peft accelerate
+pip install torch transformers datasets peft accelerate bitsandbytes
 ```
 
-## ★ 推荐流程：FineWeb-Edu Distillation Pretrain → dHotpot Finetune
+## ★ 推荐流程：FineWeb-Edu 全量预训练 → dHotpot 全量微调 → eval
 
-这条流程绕开了 QA next-token CE 训练 CSA 的弱信号问题。CSA 先在
-FineWeb-Edu 上做 representation distillation（学跨 chunk 信息传递），再
-迁移到 dHotpot。
+CSA 不再是单层 post-hoc 的小模块。本流程把它做成 transformer 的常规组件：
+- **每隔 4 层**（28 层模型 → 第 3,7,11,15,19,23,27 层）插入一次 CSA
+- **共享同一个 CSA 模块** + 每层一个可学 scalar gate（α 初始为 0）
+- **base model + CSA 全部参数都训**（continual pretraining + full FT）
+- **训练目标 = next-token CE**（跟 base LLM 预训练一样）
+
+参数总量 ≈ 7B + 60M（CSA shared）+ 7（per-layer α），CSA 引入的额外参数 < 1%。
 
 ```bash
-# Step 1: Distillation pretraining on FineWeb-Edu (~30-60 min on 8 GPUs)
-# Oracle: forward 整篇文档；Student: G=4 个 chunk 各看一段 + CSA 通信
-# Loss: MSE(student_mixed_hidden, oracle_hidden) — 不通过 lm_head，不通过 CE
-torchrun --standalone --nproc_per_node=8 scripts/pretrain_csa_distill.py \
+# Step 1: 在 FineWeb-Edu 上做 continual pretraining (~30-60 min on 8 GPUs)
+# 全量微调 base model + 共享 CSA，next-token CE loss
+torchrun --standalone --nproc_per_node=8 scripts/pretrain_csa.py \
     --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
     --fineweb-path /mnt/data/zichuanfu/.cache/huggingface/datasets/HuggingFaceFW___fineweb-edu/sample-10BT \
     --max-groups 5000 --epochs 1 \
     --n-chunks 4 --chunk-tokens 1024 \
-    --output-dir ./out/csa_distill
+    --csa-every 4 \
+    --base-lr 1e-5 --csa-lr 5e-4 \
+    --output-dir ./out/csa_pretrain
 
-# Step 2: dHotpot finetune (init from distilled CSA, lm_head 冻结)
-torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
-    --dataset dhotpot --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
-    --num-train-groups 4000 --n-agents 4 --paragraphs-per-agent 9 \
-    --epochs 3 --no-train-lm-head \
-    --csa-init-from ./out/csa_distill/best_model.pt \
-    --output-dir ./out/dhotpot_csa_distilled
-
-# Step 3: Eval (DDP 分片，~3 min)
-torchrun --standalone --nproc_per_node=8 scripts/eval_csa.py \
-    --dataset dhotpot --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
-    --checkpoint ./out/dhotpot_csa_distilled/best_model.pt \
-    --num-eval-groups 200 --n-agents 4 --paragraphs-per-agent 9 \
-    --output-dir ./out/eval_dhotpot_distilled
-```
-
-为什么 distillation 比 SQuAD warm-up 强：
-- 训练信号 dense + explicit（每个 chunk 边界都有 MSE target）
-- 完全自监督，不依赖 QA label
-- 无 task bias，CSA 学的是通用 cross-sequence transfer
-- 完全不动 lm_head，无 train-test mismatch
-- 数据量无限（FineWeb-Edu 1T+ tokens）
-
-## 旧流程（SQuAD warm-up） — 保留作 ablation
-
-跑这条命令链，3-4 小时拿到完整 paper-ready 数据：
-
-```bash
-# 1. Warm-up: CSA 在简单 SQuAD grouped 上学基础协作 (~30 min on 8 GPUs)
-torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
-    --dataset squad --model-path /path/to/Qwen2.5-7B-Instruct \
-    --num-train-groups 4000 --questions-per-group 4 \
-    --epochs 2 --no-train-lm-head \
-    --output-dir ./out/csa_warmup
-
-# 2. Finetune: 用 warm-up 权重 init，迁移到 distributed-context HotpotQA (~60 min on 8 GPUs)
-torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
-    --dataset dhotpot --model-path /path/to/Qwen2.5-7B-Instruct \
+# Step 2: dHotpot 全量微调（接 Step 1 的 ckpt 继续训）
+torchrun --standalone --nproc_per_node=8 scripts/finetune_csa.py \
+    --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
+    --resume-from ./out/csa_pretrain/best_model.pt \
     --num-train-groups 4000 --n-agents 4 --paragraphs-per-agent 9 \
     --epochs 3 \
-    --csa-init-from ./out/csa_warmup/best_model.pt \
-    --output-dir ./out/dhotpot_csa_warm
+    --base-lr 5e-6 --csa-lr 2e-4 \
+    --output-dir ./out/dhotpot_csa_pretrained
 
-# 3. Eval (DDP 分片，8 卡 ~3 min)
-torchrun --standalone --nproc_per_node=8 scripts/eval_csa.py \
-    --dataset dhotpot --model-path /path/to/Qwen2.5-7B-Instruct \
-    --checkpoint ./out/dhotpot_csa_warm/best_model.pt \
+# Step 3: Eval (DDP 分片，~3 min)
+torchrun --standalone --nproc_per_node=8 scripts/eval_csa_hook.py \
+    --dataset dhotpot --model-path /YOUR_PATH/Qwen2.5-7B-Instruct \
+    --checkpoint ./out/dhotpot_csa_pretrained/best_model.pt \
     --num-eval-groups 200 --n-agents 4 --paragraphs-per-agent 9 \
-    --output-dir ./out/eval_dhotpot_warm
+    --csa-every 4 \
+    --output-dir ./out/eval_dhotpot_pretrained
 ```
 
-## 实验设计逻辑
+为什么这条比之前的 single-layer post-hoc CSA 更合理：
+- CSA 在 forward 过程中实际改写 hidden（不是事后加在最后一层）
+- 多层注入 → cross-batch 信息有机会被后续层进一步处理
+- 训练目标和 base LLM 一致（next-token CE）→ 没有 train/test mismatch
+- 全量微调 → 不依赖"frozen lm_head 能消化 CSA 输出"这种脆弱假设
 
-之前在单卡跑下来的关键发现：
+## 关键超参选择
 
-| Setup | overall EM | has_supp | no_supp | Δ (CSA on vs off) |
-|---|---|---|---|---|
-| Finetuned baseline (lm_head only) | 20.50 | 36.75 | 4.25 | — |
-| no-LoRA + lm_head + CSA | 21.25 | 37.25 | 5.25 | **+1.88** |
-| LoRA + lm_head + CSA | 19.00 | 33.50 | 4.50 | -0.88 |
-| CSA-only (no LoRA, no lm_head) | 15.62 | 29.50 | 1.75 | **-5.38** ← 反直觉 |
+| 参数 | Step 1 值 | Step 2 值 | 说明 |
+|---|---|---|---|
+| base_lr | 1e-5 | 5e-6 | 全量微调用小 LR 防破坏预训练 |
+| csa_lr | 5e-4 | 2e-4 | CSA 是新模块，可以大点 |
+| csa_every | 4 | 4 | 每 4 层插一次 CSA |
+| 8-bit AdamW | 默认开 | 默认开 | 省 ~40GB optimizer state |
+| Gradient ckpt | 默认开 | 默认开 | 省激活值显存，慢 ~30% |
+| Warmup steps | 100 | 50 | 让 α 先慢慢 ramp up |
 
-**核心问题**：CSA 直接训会让 train loss 大降但 EM 反而恶化。CSA 学到的是概率分布上的 hack，不是真 evidence transfer。
+## 显存估算（H20 96GB/卡）
 
-**修复 (本次代码改动)**：
-1. **CSA 输出加 LayerNorm (`cross_norm`)**: 让 CSA 注入的 hidden 跟 base last-layer 分布对齐，lm_head 不再迷路。
-2. **Warm-up**: 先在 SQuAD grouped 这种简单"同 context 多 query"任务上让 CSA 学会基础 attention pattern (1-2 epoch, lm_head 冻结)，再 finetune 到带 distractor 的 dHotpot。
-3. **DDP**: 8 卡数据并行，effective batch size 8x，训练快 8 倍。
+7B 全量微调 + bf16 weights + 8-bit AdamW + grad checkpointing：
 
-## 主要 ablation
+| 项 | GB/卡 |
+|---|---|
+| Model bf16 | 14 |
+| Gradients bf16 | 14 |
+| 8-bit AdamW state | 14 |
+| Activations (grad ckpt) | ~5 |
+| CSA + buffers | ~1 |
+| 合计 | ~48 |
 
-如果上面 1+2+3 都开有效（Δ ≥ +5 EM），可以补这些 ablation 拆分贡献：
-
-```bash
-# Ablation A: 不 warm-up (跳过 step 1，直接 dhotpot finetune)
-torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
-    --dataset dhotpot --model-path /path/to/Qwen2.5-7B-Instruct \
-    --num-train-groups 4000 --epochs 3 \
-    --output-dir ./out/dhotpot_csa_no_warm
-
-# Ablation B: 关闭 cross_norm (需要单独改 attention.py 把 cross_norm 注释掉，然后跑)
-# - 注释 attention.py:633 处 cross_info = self.cross_norm(cross_info)
-# 跑 1+2 流程
-
-# Ablation C: 训 lm_head（默认现在是冻结）
-torchrun --standalone --nproc_per_node=8 scripts/train_csa.py \
-    --dataset dhotpot --csa-init-from ./out/csa_warmup/best_model.pt \
-    # 不加 --no-train-lm-head
-    --output-dir ./out/dhotpot_csa_with_lmhead
-
-# Ablation D: 不同 G (n_agents=2/4/6/8)
-for G in 2 4 6 8; do
-    torchrun ... --n-agents $G --output-dir ./out/dhotpot_g${G}
-done
-```
-
-## 显存预估 (H20, 96GB/卡)
-
-- 7B base bf16 + grads (only LoRA/CSA/lm_head trainable): ~25 GB / 卡
-- KV cache + activations (4 sequences × 1500 tokens × 28 layers): ~10 GB / 卡
-- 总 ~35 GB / 卡，留 ~60 GB margin。8 卡同时训没压力。
+预算 96GB，留约 50GB margin。
 
 ## 单卡 fallback
 
-如果只能用 1 卡，把 `torchrun --standalone --nproc_per_node=8` 换成 `python`，train 和 eval 都支持：
+去掉 `torchrun --standalone --nproc_per_node=8`，换成 `python`：
 ```bash
-python scripts/train_csa.py --dataset dhotpot ...
-python scripts/eval_csa.py --dataset dhotpot ...
+python scripts/pretrain_csa.py ...
+python scripts/finetune_csa.py ...
+python scripts/eval_csa_hook.py ...
 ```
-训练时间 ~8 倍。eval 一样，没启动 DDP 时自动走单卡路径。
+训练时间约 ×8。
 
-## 检查点结构
+## 检查点结构（新流程）
 
-`best_model.pt` 是个 dict，包含：
-- `cross_batch_module`: CSA-v2 weights (~64M)
-- `lm_head`: 如果训了 lm_head（默认）
-- `lora`: 如果加了 `--lora-rank > 0`
-
-evals 时按需加载（eval_csa.py 会自动检测）。
+`best_model.pt` 是个 dict：
+- `model`: full base model state_dict（~14GB bf16）
+- `csa_module`: MultiLayerCSAModule state_dict（共享 CSA + per-layer α，~60MB）
 
 ## 文件清单
 
-核心代码（不要动）：
-- `src/cross_batch/attention.py` — CSA-v2 with cross_norm
-- `src/cross_batch/generator.py` — 推理 generator
-- `src/cross_batch/trainer.py` — 训练 loop（支持 DDP/LoRA/lm_head 选项）
-- `src/datasets/hotpot_distributed.py` — distributed-context HotpotQA loader
+核心代码：
+- `src/cross_batch/attention.py` — CSA-v2 模块（不动）
+- `src/cross_batch/multi_layer_hook.py` — 多层 hook + per-layer α gate
+- `src/cross_batch/pretrain_trainer.py` — Step 1 trainer（FineWeb 预训练）
+- `src/cross_batch/finetune_trainer.py` — Step 2 trainer（dHotpot 微调）
+- `src/datasets/fineweb_chunked.py` — Step 1 数据流
+- `src/datasets/hotpot_distributed.py` — Step 2/3 dHotpot 加载
 
 入口脚本：
-- `scripts/train_csa.py` — 唯一训练入口（参数化 dataset/LoRA/init）
-- `scripts/eval_csa.py` — 唯一评估入口
+- `scripts/pretrain_csa.py` — Step 1
+- `scripts/finetune_csa.py` — Step 2
+- `scripts/eval_csa_hook.py` — Step 3
+
+## 旧流程（已废弃，保留作 ablation）
+
+旧流程用 single-layer post-hoc CSA + frozen base model + warm-up→finetune。
+对应代码：
+- `src/cross_batch/trainer.py` — 旧训练器
+- `src/cross_batch/distill_trainer.py` — MSE 蒸馏（已废弃）
+- `scripts/train_csa.py` / `scripts/eval_csa.py` / `scripts/pretrain_csa_distill.py`
+
+不再用作主线。如果要复现旧实验做 ablation，直接调旧脚本。
 
 ## 常见问题
 
+**Q: bitsandbytes 装不上？**
+A: 加 `--no-8bit-adam`，回退到 fp32 AdamW。显存会更紧（多 ~30GB）。
+
+**Q: gradient checkpointing 报错 "use_reentrant"？**
+A: 我们已经显式设 `use_reentrant=False`。如果还报错，加 `--no-grad-checkpoint`，但显存可能装不下。
+
 **Q: torchrun 起不来？**
-A: 确认 `LOCAL_RANK` env 在 process 里能读到。`--standalone` 会自动 set 这个。
+A: `--standalone` 自动 set `LOCAL_RANK`。如果环境没读到，手动 export。
 
 **Q: HuggingFace 网络慢？**
-A: 用 mirror：`export HF_ENDPOINT=https://hf-mirror.com`
+A: `export HF_ENDPOINT=https://hf-mirror.com`
 
-**Q: 第一次跑下载 HotpotQA 慢？**
-A: 第一次会下载 ~700MB，之后缓存。也可以用 `HF_HOME` 指定 cache 路径。
+**Q: 第一次下 FineWeb 卡？**
+A: sample-10BT 大约 30GB。本地路径用 `--fineweb-path`，避免每次重新下。
 
 **Q: best_model.pt 怎么选的？**
-A: 按 train loss `improvement` 选（CSA on loss vs CSA off loss 的差）。但注意之前发现这个 metric 跟 EM 不一致——必要时直接用 `final_model.pt`。
+A: 按 running average loss 选最低的。如果想用最后的状态，加载 `final_model.pt`。
