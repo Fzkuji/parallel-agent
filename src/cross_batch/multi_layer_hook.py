@@ -79,14 +79,18 @@ class MultiLayerCSAModule(nn.Module):
         super().__init__()
         self.csa = csa
         self.layer_indices = list(layer_indices)
-        # Init to ones, NOT zeros. With alpha=0 the gradient chain is dead:
-        # CSA's out_proj is also zero-init, so delta=0 initially, which means
-        # both d_loss/d_alpha = grad * delta = 0 AND d_loss/d_csa_params goes
-        # through alpha=0 = 0. Both alpha AND CSA stay frozen forever.
-        # alpha=1 keeps the initial output unchanged (1 * 0 = 0) but lets
-        # gradients flow through the multiplication once CSA's out_proj
-        # starts moving.
-        self.layer_alphas = nn.Parameter(torch.ones(len(self.layer_indices)))
+        # Reparameterized: alpha = 1 + delta, where delta is the trainable
+        # parameter that starts at 0. Two reasons:
+        # (1) Initial alpha=1 keeps initial output unchanged (1 * 0 = 0
+        #     because CSA out_proj is zero-init), AND gradient flows through
+        #     the multiplication so CSA params can learn.
+        # (2) bf16 precision near 1.0 is ~0.0078 (2^-7 mantissa). AdamW
+        #     step ~5e-4 gets rounded away every step if we store alpha=1
+        #     in bf16. By storing the delta=0 instead, we exploit bf16's
+        #     huge precision near 0, so updates of any size are preserved.
+        self.layer_alpha_deltas = nn.Parameter(
+            torch.zeros(len(self.layer_indices))
+        )
         self._idx_to_alpha = {idx: i for i, idx in enumerate(self.layer_indices)}
 
         # Per-forward state. Set via set_context(...) before model forward,
@@ -162,7 +166,7 @@ class MultiLayerCSAModule(nn.Module):
                         else summary
                     )
                     _ = self.csa(summary, question_emb=q_emb).sum() * 0.0
-                    _ = self.layer_alphas[alpha_idx] * 0.0
+                    _ = self.layer_alpha_deltas[alpha_idx] * 0.0
                 return output
 
             summary = self._summary_from_hidden(hidden)  # [B, d]
@@ -174,7 +178,7 @@ class MultiLayerCSAModule(nn.Module):
             mixed = self.csa(summary, question_emb=q_emb)  # [B, d]
             delta = (mixed - summary).unsqueeze(1)  # [B, 1, d]
 
-            alpha = self.layer_alphas[alpha_idx]
+            alpha = 1.0 + self.layer_alpha_deltas[alpha_idx]
             new_hidden = hidden + alpha * delta
 
             if rest is None:
@@ -203,5 +207,8 @@ class MultiLayerCSAModule(nn.Module):
         self._handles = []
 
     def alphas_summary(self) -> str:
-        """For logging: comma-separated current alpha values."""
-        return ", ".join(f"{a.item():+.4f}" for a in self.layer_alphas)
+        """For logging: comma-separated effective alpha = 1 + delta values.
+        6 decimals so we see sub-bf16-precision movements during training."""
+        return ", ".join(
+            f"{(1.0 + d.item()):+.6f}" for d in self.layer_alpha_deltas
+        )
