@@ -79,7 +79,14 @@ class MultiLayerCSAModule(nn.Module):
         super().__init__()
         self.csa = csa
         self.layer_indices = list(layer_indices)
-        self.layer_alphas = nn.Parameter(torch.zeros(len(self.layer_indices)))
+        # Init to ones, NOT zeros. With alpha=0 the gradient chain is dead:
+        # CSA's out_proj is also zero-init, so delta=0 initially, which means
+        # both d_loss/d_alpha = grad * delta = 0 AND d_loss/d_csa_params goes
+        # through alpha=0 = 0. Both alpha AND CSA stay frozen forever.
+        # alpha=1 keeps the initial output unchanged (1 * 0 = 0) but lets
+        # gradients flow through the multiplication once CSA's out_proj
+        # starts moving.
+        self.layer_alphas = nn.Parameter(torch.ones(len(self.layer_indices)))
         self._idx_to_alpha = {idx: i for i, idx in enumerate(self.layer_indices)}
 
         # Per-forward state. Set via set_context(...) before model forward,
