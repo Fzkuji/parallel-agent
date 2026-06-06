@@ -41,6 +41,8 @@ class BatchCrossCache:
         self.context_mask: Optional[torch.Tensor] = None   # [B,T] bool valid context tokens (capture)
         self.valid: Optional[torch.Tensor] = None          # [B,Tc] bool non-pad cache positions
         self.query_rows: Optional[torch.Tensor] = None     # [B,T] rows allowed to read the bank
+        self.valid_all = True                              # no padding in own cache -> flash-eligible
+        self.qrows_all = True                              # every query row reads the bank
         self.allowed: Optional[torch.Tensor] = None        # [Bq,Bctx] bool: query b may read context j
         self.temperature = 1.0                             # APE: context-segment attention temperature (T<1 sharpens)
         self.scale_s = 1.0                                 # APE: context-segment LSE scaling (S<1 down-weights bank)
@@ -58,9 +60,11 @@ class BatchCrossCache:
 
     def set_valid(self, valid):
         self.valid = valid.bool()
+        self.valid_all = bool(self.valid.all())          # cheap flag: no padding -> flash-eligible
 
     def set_query_rows(self, qr):
         self.query_rows = qr.bool()
+        self.qrows_all = bool(self.query_rows.all())      # all rows read the bank -> no row block
 
     def start_capture(self, context_mask):
         """Phase 1: prefill the contexts; capture their KV into a shared bank."""
@@ -142,6 +146,19 @@ class BatchCrossCache:
                 return self.o_proj(o.transpose(1, 2).reshape(B, T, -1)), None
             bK, bV, bseq = bank
             M = bK.shape[0]
+            bKe = repeat_kv(bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
+            bVe = repeat_kv(bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
+            # FAST decode path: single new token, full read (no top-k / exclude / padding) and no
+            # realignment -> the additive mask is all-zero, so drop it and let SDPA use FlashAttention.
+            # Numerically identical to the masked path (adding a zero mask is a no-op).
+            if (T == 1 and mgr.temperature == 1.0 and mgr.scale_s == 1.0
+                    and mgr.allowed is None and not mgr.exclude_self
+                    and mgr.qrows_all and mgr.valid_all
+                    and mgr.valid is not None and mgr.valid.shape[1] == Tc):
+                K = torch.cat([repeat_kv(k, rep), bKe], dim=2)
+                V = torch.cat([repeat_kv(v, rep), bVe], dim=2)
+                out = F.scaled_dot_product_attention(q, K, V)        # no mask -> flash kernel
+                return self.o_proj(out.transpose(1, 2).reshape(B, T, -1)), None
             own = own_mask(B, T, Tc, q.dtype, q.device)
             row_block = (~mgr.query_rows).view(B, 1, T, 1) if (mgr.query_rows is not None and
                          mgr.query_rows.shape[1] == T) else torch.zeros(B, 1, T, 1, dtype=torch.bool, device=q.device)
@@ -154,8 +171,6 @@ class BatchCrossCache:
                 sel = mgr.allowed[:, bseq]                       # [B, M] : allowed[b, source-context-of-m]
                 block = block | (~sel).view(B, 1, 1, M)
             bank_m = torch.zeros(B, 1, T, M, dtype=q.dtype, device=q.device).masked_fill(block, neg)
-            bKe = repeat_kv(bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
-            bVe = repeat_kv(bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
             if mgr.temperature == 1.0 and mgr.scale_s == 1.0:
                 K = torch.cat([repeat_kv(k, rep), bKe], dim=2)
                 V = torch.cat([repeat_kv(v, rep), bVe], dim=2)

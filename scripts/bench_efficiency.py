@@ -149,7 +149,10 @@ def main():
     Ls = [int(x) for x in args.ctx_len.split(",")]
     methods = args.methods.split(",")
     rows = []
-    print(f"{'method':<12}{'G':>4}{'ctxL':>7}{'pre/q(ms)':>11}{'dec/tok/q(ms)':>15}{'peakGB':>8}")
+    fout = open(args.out, "w", newline="")
+    cw = csv.writer(fout)
+    cw.writerow(["method", "G", "ctx_len", "prefill_ms_per_q", "decode_ms_per_tok_per_q", "peak_gb"])
+    print(f"{'method':<12}{'G':>4}{'ctxL':>7}{'pre/q(ms)':>11}{'dec/tok/q(ms)':>15}{'peakGB':>8}", flush=True)
     for L in Ls:
         for G in Gs:
             for m in methods:
@@ -164,17 +167,15 @@ def main():
                     peak = torch.cuda.max_memory_allocated() / 1e9
                     pre_q = _median(pres) / G * 1e3                     # ms per question
                     dec_q = _median(decs) / G / args.gen_len * 1e3      # ms per token per question
-                    rows.append([m, G, L, round(pre_q, 3), round(dec_q, 4), round(peak, 2)])
-                    print(f"{m:<12}{G:>4}{L:>7}{pre_q:>11.3f}{dec_q:>15.4f}{peak:>8.2f}")
+                    row = [m, G, L, round(pre_q, 3), round(dec_q, 4), round(peak, 2)]
+                    rows.append(row); cw.writerow(row); fout.flush()
+                    print(f"{m:<12}{G:>4}{L:>7}{pre_q:>11.3f}{dec_q:>15.4f}{peak:>8.2f}", flush=True)
                 except RuntimeError as e:
                     msg = "OOM" if "out of memory" in str(e).lower() else "ERR"
-                    print(f"{m:<12}{G:>4}{L:>7}{'':>11}{msg:>15}")
+                    print(f"{m:<12}{G:>4}{L:>7}{'':>11}{msg:>15}", flush=True)
                     torch.cuda.empty_cache()
-    with open(args.out, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["method", "G", "ctx_len", "prefill_ms_per_q", "decode_ms_per_tok_per_q", "peak_gb"])
-        w.writerows(rows)
-    print(f"\nwrote {len(rows)} rows -> {args.out}")
+    fout.close()
+    print(f"\nwrote {len(rows)} rows -> {args.out}", flush=True)
 
 
 if __name__ == "__main__":

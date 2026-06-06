@@ -42,6 +42,11 @@ def parse_args():
     p.add_argument("--topk", type=int, default=0,
                    help=">0: train with selective reading (each query reads only its top-k contexts), "
                         "matching selective inference. 0 = read all (default)")
+    p.add_argument("--distill-alpha", type=float, default=0.0,
+                   help=">0: add KL(student||teacher) where teacher=Concat (query sees full union in-context). "
+                        "Distills the oracle's cross-context reasoning into the cross-cache student.")
+    p.add_argument("--distill-temp", type=float, default=2.0, help="KL softmax temperature")
+    p.add_argument("--teacher-max-len", type=int, default=4096, help="truncation for the teacher's union prompt")
     p.add_argument("--bank-grad", action="store_true",
                    help="also backprop through the capture path (expensive); default detaches the bank")
     p.add_argument("--seed", type=int, default=42)
@@ -121,7 +126,23 @@ def select_allowed(model, mgr, tok, items, device, chs, cm, topk, max_plen):
     return allowed
 
 
-def use_loss(model, mgr, tok, items, device, off, max_plen):
+def _union(items):
+    seen = set(); paras = []
+    for it in items:
+        for p in it["context"].split("\n\n"):
+            p = p.strip()
+            if p and p not in seen:
+                seen.add(p); paras.append(p)
+    return "\n\n".join(paras)
+
+
+def _ans_logits(logits, labels):
+    """Answer-position logits (where the shifted label != -100), flattened [N, vocab]."""
+    sl = logits[:, :-1, :]; lab = labels[:, 1:]
+    return sl[lab != -100]
+
+
+def use_loss(model, mgr, tok, items, device, off, max_plen, return_logits=False):
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     ids_l, lab_l = [], []
     for it in items:
@@ -137,7 +158,30 @@ def use_loss(model, mgr, tok, items, device, off, max_plen):
     pos = base_pos + off
     mgr.set_valid(attn); mgr.set_query_rows(attn.bool()); mgr.start_use()
     out = model(input_ids=ids, attention_mask=attn, position_ids=pos, labels=labels, use_cache=False)
+    if return_logits:
+        return out.loss, _ans_logits(out.logits, labels)
     return out.loss
+
+
+@torch.no_grad()
+def teacher_ans_logits(model, mgr, tok, items, device, max_plen):
+    """Concat teacher: each query sees the FULL union in-context (standard attention)."""
+    eos = tok.eos_token_id; pad = tok.pad_token_id or eos
+    uni = _union(items)
+    ids_l, lab_l = [], []
+    for it in items:
+        tp = build_prompt(tok, uni, it["question"])
+        qids = tok(tp, add_special_tokens=True, truncation=True, max_length=max_plen)["input_ids"]
+        aids = tok(" " + it["references"][0], add_special_tokens=False)["input_ids"] + [eos]
+        ids_l.append(qids + aids)
+        lab_l.append([-100] * len(qids) + aids)
+    ids, attn = left_pad(ids_l, pad, device)
+    labels, _ = left_pad(lab_l, -100, device)
+    labels = labels.masked_fill(attn == 0, -100)
+    mgr.set_enabled(False)
+    out = model(input_ids=ids, attention_mask=attn, use_cache=False)
+    mgr.set_enabled(True)
+    return _ans_logits(out.logits, labels)
 
 
 def main():
@@ -181,7 +225,19 @@ def main():
                                                args.topk, args.max_prompt_length))
             else:
                 mgr.set_allowed(None)
-            loss = use_loss(model, mgr, tok, items, device, off, args.max_prompt_length)
+            if args.distill_alpha > 0:
+                loss, s_log = use_loss(model, mgr, tok, items, device, off, args.max_prompt_length,
+                                       return_logits=True)
+                t_log = teacher_ans_logits(model, mgr, tok, items, device, args.teacher_max_len)
+                if s_log.shape == t_log.shape:                    # same answer-token count -> KL aligned
+                    T = args.distill_temp
+                    kl = torch.nn.functional.kl_div(
+                        torch.log_softmax(s_log / T, dim=-1),
+                        torch.softmax(t_log.float() / T, dim=-1),
+                        reduction="batchmean") * (T * T)
+                    loss = loss + args.distill_alpha * kl
+            else:
+                loss = use_loss(model, mgr, tok, items, device, off, args.max_prompt_length)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); opt.zero_grad()
