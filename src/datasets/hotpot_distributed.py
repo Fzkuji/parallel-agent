@@ -173,3 +173,88 @@ def load_distributed_hotpot_groups(
         })
 
     return groups
+
+
+def _parse_hotpot(raw, only_bridge, require_min_supporting):
+    parsed = []
+    global_distractor_pool: List[str] = []
+    for row in raw:
+        question = row.get("question", "").strip()
+        answer = row.get("answer", "").strip()
+        if not question or not answer:
+            continue
+        if only_bridge and row.get("type", "") != "bridge":
+            continue
+        sup_titles = set(row.get("supporting_facts", {}).get("title", []))
+        ctx = row.get("context", {})
+        titles = ctx.get("title", []); sentences = ctx.get("sentences", [])
+        para_map = {t: " ".join(s.strip() for s in sents) for t, sents in zip(titles, sentences)}
+        sup_paras = [(t, para_map[t]) for t in sup_titles if t in para_map]
+        if len(sup_paras) < require_min_supporting:
+            continue
+        distractor_paras = [(t, para_map[t]) for t in titles if t not in sup_titles]
+        parsed.append({"qid": row.get("id", f"hp_{len(parsed)}"), "question": question,
+                       "answer": answer, "supporting": sup_paras, "distractors": distractor_paras})
+        if len(global_distractor_pool) < 5000:
+            for t, p in distractor_paras:
+                global_distractor_pool.append(_format_paragraph(t, p))
+    return parsed, global_distractor_pool
+
+
+def load_multiquery_hotpot_groups(
+    split: str, *, subset: str = "distractor", max_groups: int = 500, n_agents: int = 4,
+    paragraphs_per_agent: int = 6, seed: int = 42, only_bridge: bool = True,
+    require_min_supporting: int = 2, cross_question_distractor_pool: bool = True,
+) -> List[dict]:
+    """G DIFFERENT questions share one evidence pool (the genuine multi-query setting).
+
+    Each group = G distinct multi-hop questions. All their supporting paragraphs are
+    pooled and dealt across the G context slices, so a question's own support often
+    lands in ANOTHER question's slice. Independent (own slice only) then can't answer
+    those; reading the whole pool can. Same output format as the distributed loader,
+    so eval_multiquery uses it unchanged (each item already carries its own question).
+    """
+    if load_dataset is None:
+        raise RuntimeError("Install datasets: pip install datasets")
+    raw = list(load_dataset("hotpotqa/hotpot_qa", subset, split=split))
+    rng = random.Random(seed); rng.shuffle(raw)
+    parsed, global_distractor_pool = _parse_hotpot(raw, only_bridge, require_min_supporting)
+    if len(parsed) < n_agents:
+        raise ValueError("Not enough HotpotQA questions; relax constraints.")
+
+    G = n_agents
+    groups = []
+    qi = 0
+    while qi + G <= len(parsed) and len(groups) < max_groups:
+        gqs = parsed[qi:qi + G]; qi += G
+        all_supp = []                                   # (local_q_idx, formatted_para)
+        for li, q in enumerate(gqs):
+            for (t, p) in q["supporting"][:2]:
+                all_supp.append((li, _format_paragraph(t, p)))
+        rng.shuffle(all_supp)
+        slice_supp = [[] for _ in range(G)]             # supporting paras dealt to each slice
+        for k, item in enumerate(all_supp):
+            slice_supp[k % G].append(item)
+        if cross_question_distractor_pool and global_distractor_pool:
+            distractor_pool = list(global_distractor_pool)
+        else:
+            distractor_pool = [_format_paragraph(t, p) for q in gqs for (t, p) in q["distractors"]]
+
+        items = []
+        for i, q in enumerate(gqs):
+            slots = [para for (_li, para) in slice_supp[i]]
+            need = paragraphs_per_agent - len(slots)
+            if need > 0 and distractor_pool:
+                slots += rng.sample(distractor_pool, k=min(need, len(distractor_pool)))
+            rng.shuffle(slots)
+            n_own = sum(1 for (li, _para) in slice_supp[i] if li == i)
+            has_supp = n_own >= len(q["supporting"][:2])     # both own supports in own slice
+            items.append({
+                "context": "\n\n".join(slots),
+                "question": q["question"],
+                "references": [q["answer"]],
+                "answer_tokens": max(estimate_tokens(q["answer"]), 12),
+                "has_supporting": has_supp,
+            })
+        groups.append({"items": items, "title": "+".join(q["qid"] for q in gqs)})
+    return groups
