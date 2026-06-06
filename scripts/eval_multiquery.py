@@ -13,7 +13,7 @@ Conditions:
   Independent : each query sees only its own context (baseline)
   MultiQuery  : each query sees the shared context bank (this method)
 """
-import argparse, json, logging, os, sys
+import argparse, json, logging, os, sys, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -247,12 +247,19 @@ def main():
 
     sI, sM, sO = newstat(), newstat(), newstat()
     pf = {"indep": 0, "mq": 0, "oracle": 0}     # prefill tokens (context cost)
+    tm = {"indep": 0.0, "mq": 0.0, "oracle": 0.0}   # wall-clock seconds (gi==0 skipped as warmup)
+    n_timed = 0                                      # questions counted toward timing
     for gi, g in enumerate(groups):
         items = g["items"]; uni = union_context(items)
+        torch.cuda.synchronize(); t0 = time.perf_counter()
         it = independent(model, tok, mgr, items, device, args.max_new_tokens, args.max_prompt_length)
+        torch.cuda.synchronize(); t1 = time.perf_counter()
         mq = multiquery(model, tok, mgr, items, device, args.max_new_tokens, args.max_prompt_length,
                         oracle_select=args.oracle_select, topk=args.topk, no_offset=args.no_offset,
                         selector=args.selector, ape_temp=args.ape_temp, ape_scale=args.ape_scale)
+        torch.cuda.synchronize(); t2 = time.perf_counter()
+        if gi > 0:
+            tm["indep"] += t1 - t0; tm["mq"] += t2 - t1; n_timed += len(items)
         accum(sI, items, it); accum(sM, items, mq)
         # prefill-token accounting (the efficiency story: MQ == Oracle quality, G x cheaper)
         pf["indep"] += plen([build_prompt(tok, t["context"], t["question"]) for t in items])
@@ -261,7 +268,11 @@ def main():
         pf["oracle"] += plen([build_prompt(tok, uni, t["question"]) for t in items])
         if args.with_oracle:
             oitems = [{**t, "context": uni} for t in items]
+            torch.cuda.synchronize(); t3 = time.perf_counter()
             orc = independent(model, tok, mgr, oitems, device, args.max_new_tokens, args.max_prompt_length)
+            torch.cuda.synchronize()
+            if gi > 0:
+                tm["oracle"] += time.perf_counter() - t3
             accum(sO, items, orc)
             if gi == 0:
                 jj = min(2, len(items) - 1)
@@ -277,9 +288,13 @@ def main():
                  pc(s["e"], s["n"]), pc(s["se"], s["sn"]), s["sn"], pc(s["ne"], s["nn"]), s["nn"])
     log.info("PREFILL tokens: Independent=%d  MultiQuery=%d  Oracle=%d  | MQ/Oracle=%.3f",
              pf["indep"], pf["mq"], pf["oracle"], pf["mq"] / max(1, pf["oracle"]))
+    nt = max(1, n_timed)
+    log.info("TIME/question (s): Independent=%.4f  MultiQuery=%.4f%s  (n_timed=%d, warmup group skipped)",
+             tm["indep"] / nt, tm["mq"] / nt,
+             ("  Oracle=%.4f" % (tm["oracle"] / nt)) if args.with_oracle else "", n_timed)
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
         json.dump({"Independent": sI, "MultiQuery": sM, "Oracle": sO, "prefill": pf,
-                   "args": vars(args)}, f, indent=2)
+                   "time": tm, "n_timed": n_timed, "args": vars(args)}, f, indent=2)
 
 
 if __name__ == "__main__":
