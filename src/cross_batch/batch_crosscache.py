@@ -43,6 +43,8 @@ class BatchCrossCache:
         self.query_rows: Optional[torch.Tensor] = None     # [B,T] rows allowed to read the bank
         self.valid_all = True                              # no padding in own cache -> flash-eligible
         self.qrows_all = True                              # every query row reads the bank
+        self.record_attn = False                           # analysis: record query->bank attention mass
+        self.attn_record: List = []                        # [B,B] per-context mass, appended per layer/step
         self.allowed: Optional[torch.Tensor] = None        # [Bq,Bctx] bool: query b may read context j
         self.temperature = 1.0                             # APE: context-segment attention temperature (T<1 sharpens)
         self.scale_s = 1.0                                 # APE: context-segment LSE scaling (S<1 down-weights bank)
@@ -148,6 +150,17 @@ class BatchCrossCache:
             M = bK.shape[0]
             bKe = repeat_kv(bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
             bVe = repeat_kv(bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
+            if mgr.record_attn:
+                # ANALYSIS: record how much query->bank attention mass lands on each source context.
+                d = q.shape[-1]; sc = 1.0 / math.sqrt(d)
+                own_a = own_mask(B, T, Tc, q.dtype, q.device)
+                s_own = torch.matmul(q, repeat_kv(k, rep).transpose(-1, -2)) * sc + own_a
+                s_bank = torch.matmul(q, bKe.transpose(-1, -2)) * sc            # [B,H,T,M]
+                full = torch.cat([s_own, s_bank], dim=-1).softmax(dim=-1)
+                w_bank = full[..., Tc:].mean(dim=1).mean(dim=1).float()         # [B,M] avg over heads & query tokens
+                per_ctx = torch.zeros(B, B, device=q.device, dtype=w_bank.dtype)
+                per_ctx.scatter_add_(1, bseq.view(1, M).expand(B, M).long(), w_bank)   # mass per source context
+                mgr.attn_record.append(per_ctx.detach().float().cpu())
             # FAST decode path: single new token, full read (no top-k / exclude / padding) and no
             # realignment -> the additive mask is all-zero, so drop it and let SDPA use FlashAttention.
             # Numerically identical to the masked path (adding a zero mask is a no-op).
