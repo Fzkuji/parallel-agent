@@ -52,6 +52,9 @@ def parse_args():
     p.add_argument("--adaptive", action="store_true",
                    help="parameter-FREE adaptive selection: each query reads a query-dependent number "
                         "of contexts decided from its own relevance distribution (no fixed k/threshold)")
+    p.add_argument("--prune", action="store_true",
+                   help="progressive convergence pruning: each decode step accumulates the model's own "
+                        "attention per context and drops consistently-ignored contexts (no fixed value)")
     p.add_argument("--ape-temp", type=float, default=1.0,
                    help="APE attention temperature on the bank segment (T<1 sharpens; 1.0=off)")
     p.add_argument("--ape-scale", type=float, default=1.0,
@@ -166,8 +169,11 @@ def adaptive_allowed(R):
     has_cut = admissible.any(dim=1)
     first_cut = admissible.float().argmax(dim=1) + 1                # rank of first real gap (>=1)
     kstar = torch.where(has_cut, first_cut, torch.full_like(first_cut, C))
-    meanmass = s.mean(dim=1, keepdim=True)
-    kfloor = (s >= meanmass).float().sum(dim=1).clamp(min=1).long()  # # above-average-mass contexts
+    # CONSERVATIVE floor: keep every context within one mean-gap of the top score -> two comparable
+    # contexts (e.g. both hops of a bridge) are both kept; a far-below distractor is not. Data-derived,
+    # no constant, and fixes the C==2 degeneracy (above-average-mass always returned 1 there).
+    within = (s >= (s[:, :1] - meang.unsqueeze(1)))                 # [G,C] within one mean-gap of top
+    kfloor = within.float().sum(dim=1).clamp(min=1).long()
     kstar = torch.maximum(kstar, kfloor)
     keep_sorted = torch.arange(C, device=R.device).view(1, C) < kstar.view(G, 1)
     allowed = torch.zeros(G, C, dtype=torch.bool, device=R.device)
@@ -178,7 +184,7 @@ def adaptive_allowed(R):
 @torch.no_grad()
 def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=False,
                topk=0, no_offset=False, selector="maxsim", ape_temp=1.0, ape_scale=1.0,
-               adaptive=False, read_counter=None):
+               adaptive=False, read_counter=None, prune=False):
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     # ---- phase 1: capture each context's KV into the bank ----
     cp = [build_prompt(tok, it["context"], it["question"]) for it in items]
@@ -220,6 +226,7 @@ def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=
             read_counter.append(allowed.float().sum(dim=1).mean().item())   # avg contexts read/query
         mgr.set_allowed(allowed)
     mgr.set_realign(ape_temp, ape_scale)
+    mgr.set_prune(prune)
     mgr.start_use()
     base_pos = (qattn.long().cumsum(1) - 1).clamp(min=0)   # left-pad aware 0..
     pos = base_pos + off
@@ -293,7 +300,7 @@ def main():
         mq = multiquery(model, tok, mgr, items, device, args.max_new_tokens, args.max_prompt_length,
                         oracle_select=args.oracle_select, topk=args.topk, no_offset=args.no_offset,
                         selector=args.selector, ape_temp=args.ape_temp, ape_scale=args.ape_scale,
-                        adaptive=args.adaptive, read_counter=read_counter)
+                        adaptive=args.adaptive, read_counter=read_counter, prune=args.prune)
         torch.cuda.synchronize(); t2 = time.perf_counter()
         if gi > 0:
             tm["indep"] += t1 - t0; tm["mq"] += t2 - t1; n_timed += len(items)

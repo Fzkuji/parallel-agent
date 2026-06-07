@@ -46,6 +46,13 @@ class BatchCrossCache:
         self.record_attn = False                           # analysis: record query->bank attention mass
         self.attn_record: List = []                        # [B,B] per-context mass, appended per layer/step
         self.allowed: Optional[torch.Tensor] = None        # [Bq,Bctx] bool: query b may read context j
+        # PROGRESSIVE PRUNING: every decode step, accumulate each query's attention to each source
+        # context; contexts the model keeps ignoring are dropped (monotonically) so later steps read
+        # a shrinking, focused bank. Driven by the model's OWN past-token attention; no fixed k/threshold.
+        self.prune = False                                 # enable progressive convergence pruning
+        self.attn_accum: Optional[torch.Tensor] = None     # [B, Cctx] accumulated attention per context
+        self.prune_steps = 0                               # decode steps seen (warmup before pruning)
+        self._prune_updated_step = -1                      # guard: update survivor set once per step
         self.temperature = 1.0                             # APE: context-segment attention temperature (T<1 sharpens)
         self.scale_s = 1.0                                 # APE: context-segment LSE scaling (S<1 down-weights bank)
         self.bank: Dict[int, Tuple] = {}
@@ -77,6 +84,37 @@ class BatchCrossCache:
     def start_use(self):
         """Phase 2: queries read the captured bank."""
         self.mode = "use"
+        self.attn_accum = None
+        self.prune_steps = 0
+        self._prune_updated_step = -1
+
+    def set_prune(self, on):
+        self.prune = bool(on)
+
+    def _update_survivors(self, w_ctx, step):
+        """Accumulate per-context attention (w_ctx: [B,C]) and monotonically drop contexts whose
+        accumulated attention stays far below the surviving ones. Updates self.allowed in place.
+        Parameter-free: the drop test uses the survivors' own attention distribution, not a constant.
+        Conservative: starts after a short warmup and only drops contexts already near zero."""
+        B, C = w_ctx.shape
+        if self.attn_accum is None or self.attn_accum.shape != w_ctx.shape:
+            self.attn_accum = torch.zeros_like(w_ctx)
+            self.allowed = torch.ones(B, C, dtype=torch.bool, device=w_ctx.device)
+        self.attn_accum = self.attn_accum + w_ctx
+        alive = self.allowed
+        nalive = alive.float().sum(dim=1, keepdim=True).clamp(min=1)
+        # drop a context iff, among ALIVE contexts, it is BOTH cumulatively below the average AND
+        # below the average in THIS step (still being ignored now). Double condition -> conservative
+        # (a briefly-attended context is spared); both thresholds are the alive MEAN, a pure data
+        # statistic -- NO fixed constant. Gradual: only the consistently-ignored set drops, and it
+        # converges as generation proceeds. Keep the per-query top context and >=1 alive.
+        cum_mean = (self.attn_accum * alive).sum(dim=1, keepdim=True) / nalive
+        now_mean = (w_ctx * alive).sum(dim=1, keepdim=True) / nalive
+        acc_a = self.attn_accum.masked_fill(~alive, -1.0)
+        keep_top = acc_a == acc_a.max(dim=1, keepdim=True).values
+        drop = alive & (self.attn_accum < cum_mean) & (w_ctx < now_mean) & ~keep_top
+        if bool(drop.any()):
+            self.allowed = alive & ~drop
 
     def set_allowed(self, allowed):
         """allowed[b,j]=True -> query b may read context j's bank tokens (top-k selectivity)."""
@@ -158,6 +196,22 @@ class BatchCrossCache:
                     bK = bK[idx]; bV = bV[idx]; bseq = bseq[idx]; M = idx.numel()
             bKe = repeat_kv(bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
             bVe = repeat_kv(bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
+            if mgr.prune and T == 1 and self.layer_idx == min(mgr.idx) and Tc != mgr._prune_updated_step:
+                # PROGRESSIVE PRUNING: aggregate THIS step's query->bank attention per source context,
+                # accumulate, and (monotonically) drop the consistently-ignored contexts for NEXT steps.
+                # Uses the model's own past-token attention; updates mgr.allowed -> later steps gather a
+                # shrinking survivor set (faster) and stop attending the noise (cleaner). One layer/step.
+                mgr._prune_updated_step = Tc
+                d2 = q.shape[-1]; sc2 = 1.0 / math.sqrt(d2)
+                own2 = own_mask(B, T, Tc, q.dtype, q.device)
+                s_own2 = torch.matmul(q, repeat_kv(k, rep).transpose(-1, -2)) * sc2 + own2
+                s_bank2 = torch.matmul(q, bKe.transpose(-1, -2)) * sc2
+                full2 = torch.cat([s_own2, s_bank2], dim=-1).softmax(dim=-1)
+                w_bank2 = full2[..., Tc:].mean(dim=1).mean(dim=1).float()       # [B,M] avg heads & query tok
+                Cn = mgr.allowed.shape[1] if mgr.allowed is not None else int(bseq.max().item()) + 1
+                w_ctx = torch.zeros(B, Cn, device=q.device, dtype=w_bank2.dtype)
+                w_ctx.scatter_add_(1, bseq.view(1, M).expand(B, M).long(), w_bank2)
+                mgr._update_survivors(w_ctx, Tc)
             if mgr.record_attn:
                 # ANALYSIS: record how much query->bank attention mass lands on each source context.
                 d = q.shape[-1]; sc = 1.0 / math.sqrt(d)

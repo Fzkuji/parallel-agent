@@ -39,6 +39,9 @@ def parse_args():
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--max-prompt-length", type=int, default=1600)
+    p.add_argument("--distract-train", action="store_true",
+                   help="inject a RANDOM number of distractor contexts (from other groups) into the bank "
+                        "during training, so the model learns to ignore irrelevant contexts via attention")
     p.add_argument("--mix-agents", default=None,
                    help="comma list of pool sizes G to MIX during training (e.g. 2,4,8) -> one general "
                         "LoRA that reads the bank across pool sizes, not tied to a single G")
@@ -49,9 +52,17 @@ def parse_args():
                    help=">0: add KL(student||teacher) where teacher=Concat (query sees full union in-context). "
                         "Distills the oracle's cross-context reasoning into the cross-cache student.")
     p.add_argument("--distill-temp", type=float, default=2.0, help="KL softmax temperature")
+    p.add_argument("--teacher-gold", action="store_true",
+                   help="teacher reads ONLY supporting passages (gold-only oracle, ~63) instead of the "
+                        "contaminated full union (~58). The correct distill target.")
+    p.add_argument("--distill-warmup", type=float, default=0.2,
+                   help="fraction of steps with CE only before ramping in the KL (prevents KL-domination collapse)")
     p.add_argument("--teacher-max-len", type=int, default=4096, help="truncation for the teacher's union prompt")
     p.add_argument("--bank-grad", action="store_true",
                    help="also backprop through the capture path (expensive); default detaches the bank")
+    p.add_argument("--warm-start", default=None,
+                   help="path to a LoRA adapter to CONTINUE training (stage-2 warm-start from stage-1); "
+                        "loads it as the trainable adapter instead of a fresh one")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -167,10 +178,14 @@ def use_loss(model, mgr, tok, items, device, off, max_plen, return_logits=False)
 
 
 @torch.no_grad()
-def teacher_ans_logits(model, mgr, tok, items, device, max_plen):
-    """Concat teacher: each query sees the FULL union in-context (standard attention)."""
+def teacher_ans_logits(model, mgr, tok, items, device, max_plen, gold_only=False):
+    """Concat teacher: each query sees the union in-context (standard attention).
+    gold_only=True restricts the union to supporting passages -> the teacher is the
+    gold-only ORACLE (the bar we want the bank reader to reach), not the contaminated
+    full union (~58). This is the single highest-value fix per the design review."""
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
-    uni = _union(items)
+    src = [it for it in items if it.get("has_supporting", True)] if gold_only else items
+    uni = _union(src if src else items)
     ids_l, lab_l = [], []
     for it in items:
         tp = build_prompt(tok, uni, it["question"])
@@ -198,9 +213,14 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, dtype=torch.bfloat16, trust_remote_code=True,
         attn_implementation="sdpa").to(device)
-    lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
-                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type="CAUSAL_LM")
-    model = get_peft_model(model, lora)
+    if args.warm_start:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, args.warm_start, is_trainable=True)
+        log.info("WARM-START continuing LoRA adapter from %s", args.warm_start)
+    else:
+        lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
+                          target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type="CAUSAL_LM")
+        model = get_peft_model(model, lora)
     model.train()
     model.print_trainable_parameters()
     nl = model.config.num_hidden_layers
@@ -226,17 +246,35 @@ def main():
             require_min_supporting=2, cross_question_distractor_pool=True)
     log.info("train groups=%d  bank_grad=%s", len(groups), args.bank_grad)
 
+    # pool of context strings (from OTHER groups) to inject as random distractor contexts into the
+    # bank during training -> the model learns to IGNORE irrelevant contexts via its own attention,
+    # so read-all stays robust when the pool is full of distractors (where Concat dilutes).
+    import random as _rnd
+    ctx_pool = [it["context"] for g in groups for it in g["items"]]
+    rng = _rnd.Random(args.seed)
+
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-    step = 0; run = 0.0
+    total_steps = max(1, args.epochs * len(groups))
+    warm = int(args.distill_warmup * total_steps)
+    step = 0; run = 0.0; loss_hist = []
     for ep in range(args.epochs):
         for g in groups:
             items = g["items"]
             want_hs = args.topk > 0
+            cap_items = items
+            if args.distract_train:
+                # RANDOM number of distractor contexts (0..len(items)*2), sampled from other groups.
+                own = {it["context"] for it in items}
+                k = rng.randint(0, len(items) * 2)
+                pool = [c for c in rng.sample(ctx_pool, min(len(ctx_pool), k * 3 + 1)) if c not in own]
+                distr = [{"context": c, "question": "", "references": [""], "has_supporting": False}
+                         for c in pool[:k]]
+                cap_items = items + distr
             if args.bank_grad:
-                off, chs, cm = capture(model, mgr, tok, items, device, args.max_prompt_length, want_hs)
+                off, chs, cm = capture(model, mgr, tok, cap_items, device, args.max_prompt_length, want_hs)
             else:
                 with torch.no_grad():
-                    off, chs, cm = capture(model, mgr, tok, items, device, args.max_prompt_length, want_hs)
+                    off, chs, cm = capture(model, mgr, tok, cap_items, device, args.max_prompt_length, want_hs)
             if args.topk > 0:
                 mgr.set_allowed(select_allowed(model, mgr, tok, items, device, chs, cm,
                                                args.topk, args.max_prompt_length))
@@ -245,20 +283,38 @@ def main():
             if args.distill_alpha > 0:
                 loss, s_log = use_loss(model, mgr, tok, items, device, off, args.max_prompt_length,
                                        return_logits=True)
-                t_log = teacher_ans_logits(model, mgr, tok, items, device, args.teacher_max_len)
-                if s_log.shape == t_log.shape:                    # same answer-token count -> KL aligned
-                    T = args.distill_temp
-                    kl = torch.nn.functional.kl_div(
-                        torch.log_softmax(s_log / T, dim=-1),
-                        torch.softmax(t_log.float() / T, dim=-1),
-                        reduction="batchmean") * (T * T)
-                    loss = loss + args.distill_alpha * kl
+                # CE-warmup then linear ramp of alpha (0 -> peak); anneal T 2.0 -> 1.0. The fixed
+                # alpha=1.0/T=2.0 schedule is exactly what collapsed this codebase (61.9 -> 29.7);
+                # warmup lets CE anchor the gold answer before the KL is allowed to pull.
+                if step < warm:
+                    a = 0.0
+                else:
+                    a = args.distill_alpha * (step - warm) / max(1, total_steps - warm)
+                if a > 0:
+                    t_log = teacher_ans_logits(model, mgr, tok, items, device, args.teacher_max_len,
+                                               gold_only=args.teacher_gold)
+                    # SAME reference string -> answer-token counts match; if padding/truncation
+                    # desynced them, align on the shared answer prefix (the old `==` guard zeroed KL).
+                    n = min(s_log.shape[0], t_log.shape[0])
+                    if n > 0:
+                        T = 2.0 - 1.0 * (step / total_steps)
+                        kl = torch.nn.functional.kl_div(
+                            torch.log_softmax(s_log[:n] / T, dim=-1),
+                            torch.softmax(t_log[:n].float() / T, dim=-1),
+                            reduction="batchmean") * (T * T)
+                        loss = loss + a * kl
             else:
                 loss = use_loss(model, mgr, tok, items, device, off, args.max_prompt_length)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); opt.zero_grad()
-            run += loss.item(); step += 1
+            lv = loss.item(); run += lv; step += 1
+            # collapse tripwire: if loss spikes >2.5x the trailing mean early (KL-domination), warn loudly.
+            loss_hist.append(lv)
+            if 50 < step < 400 and len(loss_hist) >= 50:
+                m = sum(loss_hist[-50:]) / 50
+                if lv > 2.5 * m:
+                    log.warning("LOSS SPIKE step%d loss=%.3f (>2.5x trailing %.3f) -- possible collapse", step, lv, m)
             if step % 50 == 0:
                 log.info("ep%d step%d loss=%.4f", ep, step, run / 50); run = 0.0
     model.save_pretrained(args.output_dir)
