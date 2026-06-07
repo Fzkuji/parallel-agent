@@ -74,7 +74,7 @@ def decode(model, mgr, off, G, ql, lengths, vocab, device, shrink):
             keep = done_at[alive] > (step + 1)             # rows that still need more tokens
             if keep.sum() < n:
                 alive = alive[keep]; nxt = nxt[keep]; cur = cur[keep]; nxt_pos = nxt_pos[keep]
-                pkv = pkv.index_select(keep.nonzero(as_tuple=True)[0]) if hasattr(pkv, "index_select") else _gather_cache(pkv, keep)
+                pkv = _gather_cache(pkv, keep)
             if alive.numel() == 0:
                 break
     _sync()
@@ -83,7 +83,18 @@ def decode(model, mgr, off, G, ql, lengths, vocab, device, shrink):
 
 def _gather_cache(pkv, keep):
     idx = keep.nonzero(as_tuple=True)[0]
-    for i in range(len(pkv.key_cache)):
+    if hasattr(pkv, "reorder_cache"):
+        try:
+            pkv.reorder_cache(idx); return pkv
+        except Exception:
+            pass
+    if hasattr(pkv, "layers"):                          # transformers >=4.54 cache refactor
+        for layer in pkv.layers:
+            if getattr(layer, "keys", None) is not None:
+                layer.keys = layer.keys.index_select(0, idx)
+                layer.values = layer.values.index_select(0, idx)
+        return pkv
+    for i in range(len(pkv.key_cache)):                 # legacy API
         if pkv.key_cache[i] is not None:
             pkv.key_cache[i] = pkv.key_cache[i].index_select(0, idx)
             pkv.value_cache[i] = pkv.value_cache[i].index_select(0, idx)
