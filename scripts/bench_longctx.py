@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.cross_batch.batch_crosscache import BatchCrossCache
-from scripts.eval_multiquery import independent, multiquery
+from scripts.eval_multiquery import independent, multiquery, build_prompt, context_mask_for, _maxsim_scores, decode_texts
 from src.datasets.hotpot_distributed import _parse_hotpot, _format_paragraph
 from src.evaluation.basic import compute_em
 from src.inference import extract_answer
@@ -84,6 +84,50 @@ def build_examples_niah(n_paras, num_q, seed):
     return exs
 
 
+@torch.no_grad()
+def ours_read(model, tok, mgr, chunks, question, device, max_new, max_plen, topk=0):
+    """A SINGLE query reads a bank of K independently-encoded chunks (the real method, no query
+    duplication -> K-times less memory than reusing multiquery with K identical queries)."""
+    eos = tok.eos_token_id; pad = tok.pad_token_id or eos
+    cp = [build_prompt(tok, c, question) for c in chunks]
+    enc = tok(cp, return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
+    cids = enc["input_ids"].to(device); cattn = enc["attention_mask"].to(device)
+    cm = context_mask_for(tok, cp, chunks, cids.shape[1], cattn, max_plen).to(device)
+    mgr.set_enabled(True); mgr.exclude_self = False; mgr.set_allowed(None); mgr.set_realign(1.0, 1.0)
+    mgr.start_capture(cm); mgr.set_valid(cattn)
+    out1 = model(input_ids=cids, attention_mask=cattn, use_cache=False, output_hidden_states=(topk > 0))
+    off = int(cattn.sum(1).max().item()); K = len(chunks)
+    qp = build_prompt(tok, "", question)
+    enc = tok([qp], return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
+    qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)
+    if 0 < topk < K:
+        chs = out1.hidden_states[-1]
+        mgr.set_enabled(False)
+        qhs = model(input_ids=qids, attention_mask=qattn, output_hidden_states=True).hidden_states[-1]
+        mgr.set_enabled(True)
+        R = _maxsim_scores(qhs, qattn, chs, cm)
+        allowed = torch.zeros(1, K, dtype=torch.bool, device=device)
+        allowed.scatter_(1, R.topk(topk, dim=1).indices, True); mgr.set_allowed(allowed)
+    mgr.start_use()
+    pos = (qattn.long().cumsum(1) - 1).clamp(min=0) + off
+    nxt_pos = off + qattn.sum(1)
+    gen = qids.clone(); cur = qattn.clone(); fin = torch.zeros(1, dtype=torch.bool, device=device); pkv = None; nxt = gen
+    P = qids.shape[1]
+    for step in range(max_new):
+        mgr.set_valid(cur)
+        mgr.set_query_rows(cur.bool() if step == 0 else torch.ones(1, 1, dtype=torch.bool, device=device))
+        pid = pos if step == 0 else nxt_pos.view(1, 1)
+        out = model(input_ids=nxt, attention_mask=cur, position_ids=pid, past_key_values=pkv, use_cache=True)
+        pkv = out.past_key_values
+        if step > 0:
+            nxt_pos = nxt_pos + 1
+        t = out.logits[:, -1].argmax(-1); t = torch.where(fin, torch.full_like(t, pad), t); fin = fin | (t == eos)
+        gen = torch.cat([gen, t.unsqueeze(1)], 1); cur = torch.cat([cur, (~fin).long().unsqueeze(1)], 1); nxt = t.unsqueeze(1)
+        if fin.all():
+            break
+    return decode_texts(tok, gen, P, eos, pad)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -116,24 +160,27 @@ def main():
     for n_paras in [int(x) for x in args.n_paras.split(",")]:
         exs = gen(n_paras, args.num_q, args.seed)
         sl = so = 0.0; ntot = 0; toklen = 0
+        v_oom = 0
         for ex in exs:
             full = "\n\n".join(ex["paras"])
-            # baseline: one vanilla (standard model, whole context in one sequence)
-            ls = independent(model, tok, mgr,
-                             [{"context": full, "question": ex["question"], "references": [ex["answer"]],
-                               "has_supporting": True}], device, 16, args.max_prompt_length)
-            # ours: K parallel chunks, single query reads the whole bank (duplicate the query K times,
-            # take chunk-0's answer). topk optional.
             chunks = chunk(ex["paras"])
-            items = [{"context": c, "question": ex["question"], "references": [ex["answer"]],
-                      "has_supporting": True} for c in chunks]
-            mq = multiquery(model, tok, mgr, items, device, 16, args.max_prompt_length, topk=args.topk)
-            a_ls, _ = extract_answer(ls[0], "hotpot"); a_mq, _ = extract_answer(mq[0], "hotpot")
-            sl += compute_em(a_ls, [ex["answer"]]); so += compute_em(a_mq, [ex["answer"]]); ntot += 1
+            # baseline: vanilla single sequence (may OOM at very long length -> a feasibility point for us)
+            try:
+                ls = independent(model, tok, mgr,
+                                 [{"context": full, "question": ex["question"], "references": [ex["answer"]],
+                                   "has_supporting": True}], device, 16, args.max_prompt_length)
+                a_ls, _ = extract_answer(ls[0], "hotpot"); sl += compute_em(a_ls, [ex["answer"]])
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache(); v_oom += 1
+            # ours: K parallel chunks, a SINGLE query reads the whole bank (real method, light memory)
+            mq = ours_read(model, tok, mgr, chunks, ex["question"], device, 16, args.max_prompt_length, topk=args.topk)
+            a_mq, _ = extract_answer(mq[0], "hotpot"); so += compute_em(a_mq, [ex["answer"]]); ntot += 1
             if ntot == 1:
                 toklen = len(tok(full)["input_ids"])
-        L = 100.0 * sl / ntot; O = 100.0 * so / ntot
-        print(f"{n_paras:>7}{toklen:>8}{L:>9.1f}{O:>7.1f}{O - L:>+7.1f}", flush=True)
+        vn = ntot - v_oom
+        L = (100.0 * sl / vn) if vn else float("nan"); O = 100.0 * so / ntot
+        vstr = f"{L:>9.1f}" if vn else f"{'OOMx'+str(v_oom):>9}"
+        print(f"{n_paras:>7}{toklen:>8}{vstr}{O:>7.1f}  vOOM={v_oom}", flush=True)
 
 
 if __name__ == "__main__":
