@@ -49,6 +49,9 @@ def parse_args():
     p.add_argument("--selector", default="maxsim", choices=["mean", "maxsim"],
                    help="relevance scorer for top-k: mean=question/context mean-hidden cosine; "
                         "maxsim=late-interaction max token-level cosine (usually much better)")
+    p.add_argument("--adapt-thresh", type=float, default=0.0,
+                   help=">0: ADAPTIVE selection -- read every context whose min-max-normalized relevance "
+                        "exceeds this threshold (variable count per query), instead of a fixed top-k")
     p.add_argument("--ape-temp", type=float, default=1.0,
                    help="APE attention temperature on the bank segment (T<1 sharpens; 1.0=off)")
     p.add_argument("--ape-scale", type=float, default=1.0,
@@ -148,7 +151,8 @@ def _maxsim_scores(qhs, qattn, chs, cm):
 
 @torch.no_grad()
 def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=False,
-               topk=0, no_offset=False, selector="maxsim", ape_temp=1.0, ape_scale=1.0):
+               topk=0, no_offset=False, selector="maxsim", ape_temp=1.0, ape_scale=1.0,
+               adapt_thresh=0.0, read_counter=None):
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     # ---- phase 1: capture each context's KV into the bank ----
     cp = [build_prompt(tok, it["context"], it["question"]) for it in items]
@@ -162,14 +166,14 @@ def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=
     mgr.set_enabled(True); mgr.exclude_self = False; mgr.set_allowed(None)
     mgr.start_capture(cm); mgr.set_valid(cattn)
     out1 = model(input_ids=cids, attention_mask=cattn, use_cache=False,
-                 output_hidden_states=(topk > 0))
+                 output_hidden_states=(topk > 0 or adapt_thresh > 0))
     off = 0 if no_offset else int(cattn.sum(1).max().item())   # put queries AFTER the bank
     # ---- phase 2: query sequences (empty passage) read the whole bank ----
     qp = [build_prompt(tok, "", it["question"]) for it in items]
     enc = tok(qp, return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
     qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)
     G, P = qids.shape
-    if topk > 0 and topk < G:                      # selective: each query reads only its top-k contexts
+    if (topk > 0 and topk < G) or adapt_thresh > 0:   # selective: each query reads only relevant contexts
         chs = out1.hidden_states[-1]                                  # [G, Tc, d]
         mgr.set_enabled(False)
         qhs = model(input_ids=qids, attention_mask=qattn, output_hidden_states=True).hidden_states[-1]
@@ -180,9 +184,19 @@ def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=
             cn = torch.nn.functional.normalize(_masked_mean(chs, cm).float(), dim=-1)
             qn = torch.nn.functional.normalize(_masked_mean(qhs, qattn.bool()).float(), dim=-1)
             R = qn @ cn.t()
-        topi = R.topk(topk, dim=1).indices
-        allowed = torch.zeros(G, G, dtype=torch.bool, device=device)
-        allowed.scatter_(1, topi, True)
+        if adapt_thresh > 0:
+            # ADAPTIVE: per query, min-max normalize scores and keep contexts above the threshold
+            # (variable count: more when scores are spread/uncertain, fewer when one dominates).
+            lo = R.min(dim=1, keepdim=True).values; hi = R.max(dim=1, keepdim=True).values
+            Rn = (R - lo) / (hi - lo).clamp(min=1e-6)
+            allowed = Rn >= adapt_thresh
+            allowed |= (Rn == 1.0)                                    # always keep the top-1
+        else:
+            topi = R.topk(topk, dim=1).indices
+            allowed = torch.zeros(G, G, dtype=torch.bool, device=device)
+            allowed.scatter_(1, topi, True)
+        if read_counter is not None:
+            read_counter.append(allowed.float().sum(dim=1).mean().item())   # avg contexts read/query
         mgr.set_allowed(allowed)
     mgr.set_realign(ape_temp, ape_scale)
     mgr.start_use()
@@ -249,6 +263,7 @@ def main():
     pf = {"indep": 0, "mq": 0, "oracle": 0}     # prefill tokens (context cost)
     tm = {"indep": 0.0, "mq": 0.0, "oracle": 0.0}   # wall-clock seconds (gi==0 skipped as warmup)
     n_timed = 0                                      # questions counted toward timing
+    read_counter = []                                # avg contexts read per query (selective/adaptive)
     for gi, g in enumerate(groups):
         items = g["items"]; uni = union_context(items)
         torch.cuda.synchronize(); t0 = time.perf_counter()
@@ -256,7 +271,8 @@ def main():
         torch.cuda.synchronize(); t1 = time.perf_counter()
         mq = multiquery(model, tok, mgr, items, device, args.max_new_tokens, args.max_prompt_length,
                         oracle_select=args.oracle_select, topk=args.topk, no_offset=args.no_offset,
-                        selector=args.selector, ape_temp=args.ape_temp, ape_scale=args.ape_scale)
+                        selector=args.selector, ape_temp=args.ape_temp, ape_scale=args.ape_scale,
+                        adapt_thresh=args.adapt_thresh, read_counter=read_counter)
         torch.cuda.synchronize(); t2 = time.perf_counter()
         if gi > 0:
             tm["indep"] += t1 - t0; tm["mq"] += t2 - t1; n_timed += len(items)
@@ -286,6 +302,8 @@ def main():
     for name, s in rows:
         log.info("%-12s overall=%.2f | has_supp=%.2f (n=%d) | no_supp=%.2f (n=%d)", name,
                  pc(s["e"], s["n"]), pc(s["se"], s["sn"]), s["sn"], pc(s["ne"], s["nn"]), s["nn"])
+    if read_counter:
+        log.info("SELECT avg contexts read/query = %.2f of %d", sum(read_counter) / len(read_counter), args.n_agents)
     log.info("PREFILL tokens: Independent=%d  MultiQuery=%d  Oracle=%d  | MQ/Oracle=%.3f",
              pf["indep"], pf["mq"], pf["oracle"], pf["mq"] / max(1, pf["oracle"]))
     nt = max(1, n_timed)
