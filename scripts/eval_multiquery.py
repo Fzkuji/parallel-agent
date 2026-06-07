@@ -49,9 +49,9 @@ def parse_args():
     p.add_argument("--selector", default="maxsim", choices=["mean", "maxsim"],
                    help="relevance scorer for top-k: mean=question/context mean-hidden cosine; "
                         "maxsim=late-interaction max token-level cosine (usually much better)")
-    p.add_argument("--adapt-thresh", type=float, default=0.0,
-                   help=">0: ADAPTIVE selection -- read every context whose min-max-normalized relevance "
-                        "exceeds this threshold (variable count per query), instead of a fixed top-k")
+    p.add_argument("--adaptive", action="store_true",
+                   help="parameter-FREE adaptive selection: each query reads a query-dependent number "
+                        "of contexts decided from its own relevance distribution (no fixed k/threshold)")
     p.add_argument("--ape-temp", type=float, default=1.0,
                    help="APE attention temperature on the bank segment (T<1 sharpens; 1.0=off)")
     p.add_argument("--ape-scale", type=float, default=1.0,
@@ -149,10 +149,36 @@ def _maxsim_scores(qhs, qattn, chs, cm):
     return R
 
 
+def adaptive_allowed(R):
+    """Parameter-FREE selection: each query reads a query-dependent number of contexts decided
+    purely from its own relevance distribution -- NO fixed k, threshold, or temperature.
+    Rule: cut at the first relevance GAP that exceeds the row's mean gap (a real structural drop),
+    but never read fewer contexts than carry above-average relevance mass (keeps the 2nd hop).
+    A flat row (no real gap) reads ALL contexts -- the honest 'uncertain -> widen' act.
+    Scale-free: invariant to additive/multiplicative rescales of R. Returns allowed [G,C] bool."""
+    G, C = R.shape
+    if C == 1:
+        return torch.ones(G, 1, dtype=torch.bool, device=R.device)
+    s, order = R.sort(dim=1, descending=True)                       # [G,C] sorted desc
+    gaps = s[:, :-1] - s[:, 1:]                                     # [G,C-1] consecutive drops
+    meang = (s[:, 0] - s[:, -1]) / (C - 1)                          # [G] mean gap (data statistic)
+    admissible = gaps >= meang.unsqueeze(1)                         # [G,C-1] which drops are "real"
+    has_cut = admissible.any(dim=1)
+    first_cut = admissible.float().argmax(dim=1) + 1                # rank of first real gap (>=1)
+    kstar = torch.where(has_cut, first_cut, torch.full_like(first_cut, C))
+    meanmass = s.mean(dim=1, keepdim=True)
+    kfloor = (s >= meanmass).float().sum(dim=1).clamp(min=1).long()  # # above-average-mass contexts
+    kstar = torch.maximum(kstar, kfloor)
+    keep_sorted = torch.arange(C, device=R.device).view(1, C) < kstar.view(G, 1)
+    allowed = torch.zeros(G, C, dtype=torch.bool, device=R.device)
+    allowed.scatter_(1, order, keep_sorted)
+    return allowed
+
+
 @torch.no_grad()
 def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=False,
                topk=0, no_offset=False, selector="maxsim", ape_temp=1.0, ape_scale=1.0,
-               adapt_thresh=0.0, read_counter=None):
+               adaptive=False, read_counter=None):
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     # ---- phase 1: capture each context's KV into the bank ----
     cp = [build_prompt(tok, it["context"], it["question"]) for it in items]
@@ -166,14 +192,14 @@ def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=
     mgr.set_enabled(True); mgr.exclude_self = False; mgr.set_allowed(None)
     mgr.start_capture(cm); mgr.set_valid(cattn)
     out1 = model(input_ids=cids, attention_mask=cattn, use_cache=False,
-                 output_hidden_states=(topk > 0 or adapt_thresh > 0))
+                 output_hidden_states=(topk > 0 or adaptive))
     off = 0 if no_offset else int(cattn.sum(1).max().item())   # put queries AFTER the bank
     # ---- phase 2: query sequences (empty passage) read the whole bank ----
     qp = [build_prompt(tok, "", it["question"]) for it in items]
     enc = tok(qp, return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
     qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)
     G, P = qids.shape
-    if (topk > 0 and topk < G) or adapt_thresh > 0:   # selective: each query reads only relevant contexts
+    if (topk > 0 and topk < G) or adaptive:           # selective: each query reads only relevant contexts
         chs = out1.hidden_states[-1]                                  # [G, Tc, d]
         mgr.set_enabled(False)
         qhs = model(input_ids=qids, attention_mask=qattn, output_hidden_states=True).hidden_states[-1]
@@ -184,13 +210,8 @@ def multiquery(model, tok, mgr, items, device, max_new, max_plen, oracle_select=
             cn = torch.nn.functional.normalize(_masked_mean(chs, cm).float(), dim=-1)
             qn = torch.nn.functional.normalize(_masked_mean(qhs, qattn.bool()).float(), dim=-1)
             R = qn @ cn.t()
-        if adapt_thresh > 0:
-            # ADAPTIVE: per query, min-max normalize scores and keep contexts above the threshold
-            # (variable count: more when scores are spread/uncertain, fewer when one dominates).
-            lo = R.min(dim=1, keepdim=True).values; hi = R.max(dim=1, keepdim=True).values
-            Rn = (R - lo) / (hi - lo).clamp(min=1e-6)
-            allowed = Rn >= adapt_thresh
-            allowed |= (Rn == 1.0)                                    # always keep the top-1
+        if adaptive:
+            allowed = adaptive_allowed(R)                             # parameter-free, per-query count
         else:
             topi = R.topk(topk, dim=1).indices
             allowed = torch.zeros(G, G, dtype=torch.bool, device=device)
@@ -272,7 +293,7 @@ def main():
         mq = multiquery(model, tok, mgr, items, device, args.max_new_tokens, args.max_prompt_length,
                         oracle_select=args.oracle_select, topk=args.topk, no_offset=args.no_offset,
                         selector=args.selector, ape_temp=args.ape_temp, ape_scale=args.ape_scale,
-                        adapt_thresh=args.adapt_thresh, read_counter=read_counter)
+                        adaptive=args.adaptive, read_counter=read_counter)
         torch.cuda.synchronize(); t2 = time.perf_counter()
         if gi > 0:
             tm["indep"] += t1 - t0; tm["mq"] += t2 - t1; n_timed += len(items)

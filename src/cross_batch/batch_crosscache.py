@@ -148,6 +148,14 @@ class BatchCrossCache:
                 return self.o_proj(o.transpose(1, 2).reshape(B, T, -1)), None
             bK, bV, bseq = bank
             M = bK.shape[0]
+            if mgr.allowed is not None and mgr.allowed.shape[0] == B and not mgr.record_attn:
+                # SELECTIVE GATHER: keep only the bank tokens some query is allowed to read (their
+                # union), so QK^T is computed over the SELECTED subset, not the full bank -> real FLOP
+                # saving (maximal at B=1 serving). Numerically identical to masking the full bank.
+                keep = mgr.allowed[:, bseq].any(dim=0)              # [M] tokens any query may read
+                if not bool(keep.all()):
+                    idx = keep.nonzero(as_tuple=True)[0]
+                    bK = bK[idx]; bV = bV[idx]; bseq = bseq[idx]; M = idx.numel()
             bKe = repeat_kv(bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
             bVe = repeat_kv(bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
             if mgr.record_attn:
