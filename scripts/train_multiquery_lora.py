@@ -39,6 +39,9 @@ def parse_args():
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--max-prompt-length", type=int, default=1600)
+    p.add_argument("--mix-agents", default=None,
+                   help="comma list of pool sizes G to MIX during training (e.g. 2,4,8) -> one general "
+                        "LoRA that reads the bank across pool sizes, not tied to a single G")
     p.add_argument("--topk", type=int, default=0,
                    help=">0: train with selective reading (each query reads only its top-k contexts), "
                         "matching selective inference. 0 = read all (default)")
@@ -203,10 +206,24 @@ def main():
     nl = model.config.num_hidden_layers
     mgr = BatchCrossCache(list(range(nl))); mgr.register(model)
 
-    groups = load_multiquery_hotpot_groups(
-        split="train", n_agents=args.n_agents, paragraphs_per_agent=args.paragraphs_per_agent,
-        max_groups=args.num_groups, seed=args.seed, only_bridge=True,
-        require_min_supporting=2, cross_question_distractor_pool=True)
+    if args.mix_agents:
+        # GENERAL recipe: mix several pool sizes G so one LoRA learns to read the shared bank
+        # regardless of how many contexts are present (not tied to a single G).
+        Gs = [int(x) for x in args.mix_agents.split(",")]
+        per = max(1, args.num_groups // len(Gs))
+        groups = []
+        for gi, G in enumerate(Gs):
+            groups += load_multiquery_hotpot_groups(
+                split="train", n_agents=G, paragraphs_per_agent=args.paragraphs_per_agent,
+                max_groups=per, seed=args.seed + gi, only_bridge=True,
+                require_min_supporting=2, cross_question_distractor_pool=True)
+        import random as _r; _r.Random(args.seed).shuffle(groups)
+        log.info("MIXED-G train groups=%d over G=%s", len(groups), Gs)
+    else:
+        groups = load_multiquery_hotpot_groups(
+            split="train", n_agents=args.n_agents, paragraphs_per_agent=args.paragraphs_per_agent,
+            max_groups=args.num_groups, seed=args.seed, only_bridge=True,
+            require_min_supporting=2, cross_question_distractor_pool=True)
     log.info("train groups=%d  bank_grad=%s", len(groups), args.bank_grad)
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
