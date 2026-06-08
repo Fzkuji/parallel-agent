@@ -22,6 +22,7 @@ def main():
     p.add_argument("--num-q", type=int, default=100)
     p.add_argument("--max-new", type=int, default=64)
     p.add_argument("--gold-only", action="store_true", help="oracle passages only (else full context)")
+    p.add_argument("--dump", default=None, help="JSONL path to dump (q,gold,pred) for the LLM judge")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -46,6 +47,8 @@ def main():
             txt = txt.split("</think>")[-1].strip()
         return txt
 
+    dump = getattr(args, "dump", None)
+    df = open(dump, "w") if dump else None
     for task in [t.strip() for t in args.tasks.split(",") if t.strip()]:
         path = os.path.join(args.data_dir, f"{task}.jsonl")
         data = [json.loads(l) for l in open(path) if l.strip()][: args.num_q]
@@ -56,9 +59,14 @@ def main():
                               else passages)
             pred = gen(ctx, ex["input"])
             sc += best_f1(pred, ex["answers"]); n += 1
+            if df:
+                df.write(json.dumps({"task": task, "arm": "oracle" if args.gold_only else "concat",
+                                     "question": ex["input"], "gold": ex["answers"], "pred": pred}) + "\n")
             if n % 25 == 0:
                 print(f"  [{task} {n}/{len(data)}] qa_f1={100*sc/n:.1f}", flush=True)
         print(f"{task}: qa_f1={100*sc/n:.2f}  (gold_only={args.gold_only})", flush=True)
+    if df:
+        df.close()
 
 
 if __name__ == "__main__":

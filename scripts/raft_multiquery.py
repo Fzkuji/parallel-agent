@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--no-beat-greedy", dest="beat_greedy", action="store_false",
                    help="keep any correct (subem>=1) winner, even if greedy already matched it -> "
                         "higher winrate, reinforces correct outputs (fixes low-winrate RAFT)")
+    p.add_argument("--think", action="store_true",
+                   help="enable <think> in rollouts (Qwen3); use larger --max-new")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -107,6 +109,8 @@ def reward(pred, refs):
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    from src.templates import set_think_tokens
+    set_think_tokens(args.think)  # <think> in rollouts to match the distilled thinking reader
     tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token; tok.pad_token_id = tok.eos_token_id

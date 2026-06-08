@@ -162,7 +162,14 @@ def use_loss(model, mgr, tok, items, device, off, max_plen, return_logits=False)
     for it in items:
         qp = build_prompt(tok, "", it["question"])
         qids = tok(qp, add_special_tokens=True, truncation=True, max_length=max_plen)["input_ids"]
-        aids = tok(" " + it["references"][0], add_special_tokens=False)["input_ids"] + [eos]
+        # think-distill: target = teacher's full <think>..</think><answer>..</answer> trajectory
+        # if present; else the bare answer. The reader learns to re-derive the bridge by
+        # reproducing the reasoning while reading only the independent bank.
+        tgt = it.get("think_answer")
+        if tgt:
+            aids = tok(tgt, add_special_tokens=False)["input_ids"] + [eos]
+        else:
+            aids = tok(" " + it["references"][0], add_special_tokens=False)["input_ids"] + [eos]
         ids_l.append(qids + aids)
         lab_l.append([-100] * len(qids) + aids)
     ids, attn = left_pad(ids_l, pad, device)

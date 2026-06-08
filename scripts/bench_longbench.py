@@ -96,6 +96,10 @@ def parse_args():
                    help="ours: parameter-free per-step selective read (default: read all)")
     p.add_argument("--max-new", type=int, default=32)
     p.add_argument("--max-prompt-length", type=int, default=131072)
+    p.add_argument("--think", action="store_true",
+                   help="enable <think> for all arms (Qwen3); raise --max-new accordingly")
+    p.add_argument("--no-think", dest="think", action="store_false")
+    p.set_defaults(think=False)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", default="/tmp/longbench")
     return p.parse_args()
@@ -113,13 +117,47 @@ def split_passages(context):
     return [p.strip() for p in parts if p.strip()]
 
 
-def oracle_passages(passages, answers):
-    """Oracle retrieval: keep only passages containing a (normalized) gold answer string."""
+_STOP = set("a an the of in on at to for and or but who what where when which whose was were "
+            "is are be been being did do does of by with from as that this his her its their "
+            "born wife husband father mother son daughter died death place country city".split())
+
+
+def _entities(text):
+    """Capitalized multi-word entity spans (e.g. 'Francis I Rakoczi') for bridge matching."""
+    ents = re.findall(r"[A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+)*", text)
+    out = set()
+    for e in ents:
+        ne = normalize_answer(e)
+        if ne and ne not in _STOP and len(ne) > 2:
+            out.add(ne)
+    return out
+
+
+def oracle_passages(passages, answers, question=""):
+    """TRUE multi-hop oracle: keep every passage that contains a gold ANSWER string OR a
+    QUESTION entity (the bridge passage — e.g. for 'where was the wife of Francis I Rakoczi
+    born', the 'Francis I Rakoczi' passage names the wife and is required even though it does
+    NOT contain the final answer). The old answer-only rule dropped bridge passages, making the
+    'oracle' input incomplete and (wrongly) worse than reading all passages."""
     na = [normalize_answer(a) for a in answers if a.strip()]
+    # yes/no and other non-entity answers ("no" is a substring of arbitrary prose) make the
+    # answer-substring branch fire on near-random passages -> disable it for those; rely on the
+    # question-entity bridge passages instead (hotpot yes/no fix).
+    _nonentity = {"yes", "no", "true", "false"}
+    use_ans = [a for a in na if a not in _nonentity and len(a) > 2]
+    qents = _entities(question)
     keep = []
     for p in passages:
         npp = normalize_answer(p)
-        if any(a and a in npp for a in na):
+        title = ""
+        for ln in p.split("\n"):
+            ln = ln.strip()
+            if ln and not re.match(r"passage\s*\d+", ln.lower()):
+                title = ln; break
+        tents = _entities(title)
+        hit_ans = any(a and a in npp for a in use_ans)
+        hit_q = bool(qents & tents)  # this passage is ABOUT a question entity -> bridge
+        if hit_ans or hit_q:
             keep.append(p)
     return keep or passages[:2]  # never empty
 
@@ -131,6 +169,8 @@ def lb_prompt(context, question):
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    from src.templates import set_think_tokens
+    set_think_tokens(args.think)  # <think> on/off for ALL arms uniformly (fair comparison)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
 
@@ -162,6 +202,7 @@ def main():
         if args.num_q:
             data = data[: args.num_q]
         scores = {a: 0.0 for a in arms}; n = 0
+        preds = {a: [] for a in arms}  # dump (q, gold, pred) per arm for offline LLM-judge
         for ex in data:
             passages = split_passages(ex["context"])
             answers = ex["answers"]
@@ -174,7 +215,7 @@ def main():
                                         "references": answers, "has_supporting": True}],
                                       device, args.max_new, args.max_prompt_length)[0]
                 elif a == "oracle":
-                    op = oracle_passages(passages, answers)
+                    op = oracle_passages(passages, answers, q)
                     full = "\n\n".join(op)
                     out = independent(model, tok, mgr,
                                       [{"context": full, "question": q,
@@ -185,11 +226,11 @@ def main():
                                        args.max_new, args.max_prompt_length,
                                        temp=args.ape_temp, scale=args.ape_scale, adaptive=False)
                 elif a == "ape_oracle":  # APE encoding ceiling under perfect selection
-                    out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers), q,
+                    out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers, q), q,
                                        device, args.max_new, args.max_prompt_length,
                                        temp=args.ape_temp, scale=args.ape_scale, adaptive=False)
                 elif a == "ours_oracle":  # our encoding ceiling under perfect selection
-                    out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers), q,
+                    out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers, q), q,
                                        device, args.max_new, args.max_prompt_length,
                                        temp=1.0, scale=1.0, adaptive=False)
                 else:  # ours
@@ -200,6 +241,7 @@ def main():
                 # scoring (best_f1 of "<answer>Ozalj</answer>" vs "Ozalj" is wrecked by the tags).
                 ans, _ = extract_box_answer(out)
                 scores[a] += best_f1(ans, answers)
+                preds[a].append({"task": task, "question": q, "gold": answers, "pred": out})
             n += 1
             if n % 25 == 0:
                 run = "  ".join(f"{a}={100.0*scores[a]/n:.1f}" for a in arms)
@@ -207,6 +249,11 @@ def main():
         row = {a: round(100.0 * scores[a] / n, 2) for a in arms}
         table[task] = row
         print(f"{task:>10}" + "".join(f"{row[a]:>9.2f}" for a in arms), flush=True)
+        import json as _j
+        with open(os.path.join(args.output_dir, f"preds_{task}.jsonl"), "w") as pf:
+            for a in arms:
+                for r in preds[a]:
+                    pf.write(_j.dumps({**r, "arm": a}) + "\n")
 
     # averages
     if table:
