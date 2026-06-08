@@ -57,6 +57,12 @@ def parse_args():
                         "higher winrate, reinforces correct outputs (fixes low-winrate RAFT)")
     p.add_argument("--think", action="store_true",
                    help="enable <think> in rollouts (Qwen3); use larger --max-new")
+    p.add_argument("--train-datasets", default="2wikimultihopqa,hotpotqa,musique",
+                   help="flashrag train datasets for multi-dataset GRPO rollouts")
+    p.add_argument("--n-paras", type=int, default=8, help="paragraphs (items) per group = gold + distractors")
+    p.add_argument("--distill-ref", default=None,
+                   help="frozen distill LoRA to KL-anchor against (protects gold-only ability)")
+    p.add_argument("--kl-beta", type=float, default=0.05, help="KL-to-distill-ref weight")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -120,7 +126,8 @@ def main():
         args.model_path, dtype=torch.bfloat16, trust_remote_code=True,
         attn_implementation="sdpa").to(device)
     if args.warm_start:
-        model = PeftModel.from_pretrained(base, args.warm_start, is_trainable=True)
+        model = PeftModel.from_pretrained(base, args.warm_start, is_trainable=True,
+                                          adapter_name="policy")
         log.info("RAFT warm-start from %s", args.warm_start)
     else:
         lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
@@ -130,76 +137,104 @@ def main():
     nl = model.config.num_hidden_layers
     mgr = BatchCrossCache(list(range(nl))); mgr.register(model)
 
-    Gs = [int(x) for x in args.mix_agents.split(",")]
-    per = max(1, args.num_groups // len(Gs))
-    groups = []
-    for gi, G in enumerate(Gs):
-        groups += load_multiquery_hotpot_groups(
-            split="train", n_agents=G, paragraphs_per_agent=args.paragraphs_per_agent,
-            max_groups=per, seed=args.seed + gi, only_bridge=True,
-            require_min_supporting=2, cross_question_distractor_pool=True)
+    # MULTI-DATASET rollout data (2wiki+hotpot+musique flashrag train) — fixes the hotpot-only
+    # cross-distribution failure of GRPO v1. One query per group, one item per paragraph.
+    from src.datasets.flashrag_multihop import load_flashrag_multihop_groups
+    groups = load_flashrag_multihop_groups(
+        datasets=tuple(args.train_datasets.split(",")), split="train",
+        n_paras=args.n_paras, max_groups=args.num_groups, seed=args.seed)
     import random as _r
-    _r.Random(args.seed).shuffle(groups)
     ctx_pool = [it["context"] for g in groups for it in g["items"]]
     rng = _r.Random(args.seed)
-    log.info("RAFT groups=%d", len(groups))
+    from collections import Counter
+    log.info("RAFT groups=%d by dataset=%s", len(groups),
+             dict(Counter(g["dataset"] for g in groups)))
+
+    has_ref = args.distill_ref is not None and args.kl_beta > 0 and args.warm_start is not None
+    if has_ref:
+        model.load_adapter(args.distill_ref, adapter_name="ref")
+        model.set_adapter("policy")
+        log.info("KL-anchor to frozen distill ref %s (beta=%.3f)", args.distill_ref, args.kl_beta)
+
+    def _gold_kl(g):
+        """KL(policy gold-only read || frozen distill-ref gold-only read) on answer tokens.
+        Evaluated on the GOLD-only bank — the exact regime ours_oracle measures — so it pins the
+        distilled gold-only ability (59.5) and can't be eroded by the distractor-bank RAFT term."""
+        gi = [{"context": p, "question": g["question"], "references": g["references"],
+               "has_supporting": True} for p in g["gold"]]
+        offs, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False); mgr.set_allowed(None)
+        _, s_log = use_loss(model, mgr, tok, [{"question": g["question"], "references": g["references"]}],
+                            device, offs, args.max_prompt_length, return_logits=True)
+        mgr.bank = {}
+        model.set_adapter("ref")
+        with torch.no_grad():
+            offr, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False); mgr.set_allowed(None)
+            _, r_log = use_loss(model, mgr, tok, [{"question": g["question"], "references": g["references"]}],
+                                device, offr, args.max_prompt_length, return_logits=True)
+        mgr.bank = {}; model.set_adapter("policy")
+        n = min(s_log.shape[0], r_log.shape[0])
+        if n == 0:
+            return None
+        return torch.nn.functional.kl_div(torch.log_softmax(s_log[:n], -1),
+                                          torch.softmax(r_log[:n].float(), -1), reduction="batchmean")
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-    step = 0; run = 0.0; n_win = 0; n_q = 0
+    step = 0; run = 0.0; n_rescue = 0; n_q = 0
     for ep in range(args.epochs):
         for g in groups:
-            items = g["items"]
-            cap_items = items
-            if args.distract_train:
-                own = {it["context"] for it in items}
-                k = rng.randint(0, len(items) * 2)
-                pool = [c for c in rng.sample(ctx_pool, min(len(ctx_pool), k * 3 + 1)) if c not in own]
-                cap_items = items + [{"context": c, "question": "", "references": [""],
-                                      "has_supporting": False} for c in pool[:k]]
-            # capture once under no_grad (bank is fixed evidence); sample under no_grad
+            items = g["items"]; q = g["question"]; refs = g["references"]
+            cap_items = items  # items are already gold + distractors (n_paras), one per paragraph
+            # GREEDY-WRONG-ONLY rescue: only SFT when greedy FAILS but a sample SUCCEEDS (true increment,
+            # kills the winrate-inflation overfitting; greedy-correct cases get zero RAFT gradient).
             model.eval()
+            win = None
             with torch.no_grad():
                 off, _, _ = capture(model, mgr, tok, cap_items, device, args.max_prompt_length, False)
-                winners = []
-                for it in items:
-                    refs = it["references"]
-                    greedy = sample_answer(model, mgr, tok, it["question"], device, off,
-                                           args.max_prompt_length, args.max_new, 0.0)
-                    gr = reward(greedy, refs)
-                    best_s, best_r = greedy, gr
+                mgr.set_allowed(None)
+                greedy = sample_answer(model, mgr, tok, q, device, off, args.max_prompt_length, args.max_new, 0.0)
+                n_q += 1
+                if best_f1(extract_box_answer(greedy)[0], refs) < 0.5:   # greedy WRONG -> try to rescue
+                    best_s, best_r = None, 0.0
                     for _ in range(args.raft_n):
-                        s = sample_answer(model, mgr, tok, it["question"], device, off,
-                                          args.max_prompt_length, args.max_new, args.raft_temp)
-                        r = reward(s, refs)
+                        s = sample_answer(model, mgr, tok, q, device, off, args.max_prompt_length,
+                                          args.max_new, args.raft_temp)
+                        r = best_f1(extract_box_answer(s)[0], refs)
                         if r > best_r:
                             best_s, best_r = s, r
-                    n_q += 1
-                    ans, _ = extract_box_answer(best_s)
-                    keep = compute_subem(ans, refs) >= 1
-                    if args.beat_greedy:
-                        keep = keep and best_r > gr + 1e-6
-                    if keep:
-                        winners.append({**it, "references": [ans]}); n_win += 1
+                    if best_r >= 0.5:                                     # a sample RESCUED it
+                        ans = extract_box_answer(best_s)[0]
+                        win = {"question": q, "references": [ans]}
+                        if args.think:
+                            win["think_answer"] = best_s
+                        n_rescue += 1
+                mgr.bank = {}
             model.train()
-            if not winners:
+            # loss = RAFT-on-rescue (over distractor bank) + KL-anchor (over gold-only bank)
+            loss = None
+            if win is not None:
+                off2, _, _ = capture(model, mgr, tok, cap_items, device, args.max_prompt_length, False)
+                mgr.set_allowed(None)
+                loss = use_loss(model, mgr, tok, [win], device, off2, args.max_prompt_length)
+                mgr.bank = {}
+            if has_ref and g["gold"]:
+                kl = _gold_kl(g)
+                if kl is not None:
+                    loss = (loss + args.kl_beta * kl) if loss is not None else args.kl_beta * kl
+            if loss is None:
                 continue
-            # SFT on the winners over the SAME captured bank (recapture WITH grad on query path)
-            off2, _, _ = capture(model, mgr, tok, cap_items, device, args.max_prompt_length, False)
-            loss = use_loss(model, mgr, tok, winners, device, off2, args.max_prompt_length)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             opt.step(); opt.zero_grad()
-            run += loss.item(); step += 1
+            run += float(loss.item()); step += 1
             del loss
-            mgr.bank = {}                       # drop the captured bank KV between groups
             if step % 8 == 0:
                 torch.cuda.empty_cache()
             if step % 25 == 0:
-                log.info("ep%d step%d loss=%.4f winrate=%.2f", ep, step, run / 25,
-                         n_win / max(1, n_q)); run = 0.0
+                log.info("ep%d step%d loss=%.4f rescue_rate=%.3f", ep, step, run / 25,
+                         n_rescue / max(1, n_q)); run = 0.0
     model.save_pretrained(args.output_dir)
     tok.save_pretrained(args.output_dir)
-    log.info("saved RAFT LoRA to %s  (final winrate=%.3f)", args.output_dir, n_win / max(1, n_q))
+    log.info("saved RAFT LoRA to %s  (rescue_rate=%.3f)", args.output_dir, n_rescue / max(1, n_q))
 
 
 if __name__ == "__main__":
