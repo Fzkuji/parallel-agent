@@ -46,6 +46,8 @@ class BatchCrossCache:
         self.record_attn = False                           # analysis: record query->bank attention mass
         self.attn_record: List = []                        # [B,B] per-context mass, appended per layer/step
         self.allowed: Optional[torch.Tensor] = None        # [Bq,Bctx] bool: query b may read context j
+        self.rec_ctx_w = 0                                 # >0: record per-source-context bank mass (read-fraction)
+        self.ctx_mass = None                               # [B, rec_ctx_w] accumulated bank mass per source context
         # PROGRESSIVE PRUNING: every decode step, accumulate each query's attention to each source
         # context; contexts the model keeps ignoring are dropped (monotonically) so later steps read
         # a shrinking, focused bank. Driven by the model's OWN past-token attention; no fixed k/threshold.
@@ -119,6 +121,14 @@ class BatchCrossCache:
     def set_allowed(self, allowed):
         """allowed[b,j]=True -> query b may read context j's bank tokens (top-k selectivity)."""
         self.allowed = allowed.bool() if allowed is not None else None
+
+    def start_relevance(self, c):
+        """Record per-source-context query->bank attention mass (for read-fraction top-k)."""
+        self.rec_ctx_w = int(c); self.ctx_mass = None
+
+    def relevance(self):
+        r = self.ctx_mass; self.rec_ctx_w = 0; self.ctx_mass = None
+        return r            # [B, c] summed over steps & layers, or None
 
     def reset(self, context_mask):
         self.mode = "use"
@@ -219,6 +229,17 @@ class BatchCrossCache:
                 w_ctx = torch.zeros(B, Cn, device=q.device, dtype=w_bank2.dtype)
                 w_ctx.scatter_add_(1, bseq.view(1, M).expand(B, M).long(), w_bank2)
                 mgr._update_survivors(w_ctx, Tc)
+            if mgr.rec_ctx_w > 0:
+                # READ-FRACTION telemetry: per-source-context bank mass, for top-k selective read.
+                d = q.shape[-1]; sc = 1.0 / math.sqrt(d)
+                own_a = own_mask(B, T, Tc, q.dtype, q.device)
+                s_own = torch.matmul(q, repeat_kv(k, rep).transpose(-1, -2)) * sc + own_a
+                s_bank = torch.matmul(q, bKe.transpose(-1, -2)) * sc
+                full = torch.cat([s_own, s_bank], dim=-1).softmax(dim=-1)
+                w_bank = full[..., Tc:].mean(dim=1).mean(dim=1).float()         # [B,M]
+                pc = torch.zeros(B, mgr.rec_ctx_w, device=q.device, dtype=w_bank.dtype)
+                pc.scatter_add_(1, bseq.view(1, M).expand(B, M).long(), w_bank)
+                mgr.ctx_mass = pc.detach().float().cpu() if mgr.ctx_mass is None else mgr.ctx_mass + pc.detach().float().cpu()
             if mgr.record_attn:
                 # ANALYSIS: record how much query->bank attention mass lands on each source context.
                 d = q.shape[-1]; sc = 1.0 / math.sqrt(d)

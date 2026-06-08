@@ -144,12 +144,36 @@ def compute_subem(prediction, references):
 
 # ----------------------------------------------------------------------------- ours/APE read
 @torch.no_grad()
+@torch.no_grad()
+def _relevance_decode(model, tok, mgr, qids, qattn, device, off, n_steps, eos, pad):
+    """Short greedy decode that lets mgr.record per-passage bank attention (start_relevance must
+    be active). Used only to RANK passages for read-fraction top-k; output discarded."""
+    pos = (qattn.long().cumsum(1) - 1).clamp(min=0) + off
+    nxt_pos = off + qattn.sum(1)
+    cur = qattn.clone(); fin = torch.zeros(1, dtype=torch.bool, device=device); pkv = None; nxt = qids.clone()
+    for step in range(n_steps):
+        mgr.set_valid(cur)
+        mgr.set_query_rows(cur.bool() if step == 0 else torch.ones(1, 1, dtype=torch.bool, device=device))
+        pid = pos if step == 0 else nxt_pos.view(1, 1)
+        out = model(input_ids=nxt, attention_mask=cur, position_ids=pid, past_key_values=pkv, use_cache=True)
+        pkv = out.past_key_values
+        if step > 0:
+            nxt_pos = nxt_pos + 1
+        t = out.logits[:, -1].argmax(-1); t = torch.where(fin, torch.full_like(t, pad), t)
+        fin = fin | (t == eos)
+        cur = torch.cat([cur, (~fin).long().unsqueeze(1)], 1); nxt = t.unsqueeze(1)
+        if fin.all():
+            break
+
+
 def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
-              temp=1.0, scale=1.0, adaptive=False):
+              temp=1.0, scale=1.0, adaptive=False, topk_frac=1.0):
     """A SINGLE query reads a bank of independently-encoded paragraphs.
     temp/scale<1 -> APE realignment (training-free). adaptive -> parameter-free per-query
-    paragraph selection that filters hard negatives (ours). With a LoRA-merged model and
-    temp=scale=1, this is the trained CrossKV read."""
+    paragraph selection. topk_frac<1 -> READ-FRACTION: a cheap first decode records per-passage
+    attention, then only the top-(topk_frac) most-attended passages are read (Pareto: read fewer,
+    often MORE accurate by filtering distractors). With a LoRA-merged model and temp=scale=1,
+    this is the trained CrossKV read."""
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     cp = [build_prompt(tok, c, question) for c in chunks]
     enc = tok(cp, return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
@@ -169,10 +193,21 @@ def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
         mgr.set_enabled(False)
         qhs = model(input_ids=qids, attention_mask=qattn, output_hidden_states=True).hidden_states[-1]
         mgr.set_enabled(True)
-        # R[1,K]: relevance of the (single) query to each of the K paragraphs.
         R = _maxsim_scores(qhs, qattn, chs, cm)[:1]   # [1,K]
-        allowed = adaptive_allowed(R)                 # parameter-free selection
-        mgr.set_allowed(allowed)
+        mgr.set_allowed(adaptive_allowed(R))          # parameter-free selection
+    if topk_frac < 1.0 and K > 1:
+        # READ-FRACTION via ATTENTION MASS: a short relevance decode records per-passage bank
+        # attention, then read only the top-(topk_frac) most-attended passages (Pareto: read
+        # fewer, often more accurate by filtering distractors).
+        import torch as _t
+        mgr.start_use(); mgr.set_allowed(None); mgr.start_relevance(K)
+        _relevance_decode(model, tok, mgr, qids, qattn, device, off, n_steps=16, eos=eos, pad=pad)
+        rel = mgr.relevance()
+        if rel is not None:
+            kk = max(1, round(topk_frac * K))
+            a = _t.zeros(1, K, dtype=_t.bool, device=device)
+            a.scatter_(1, rel.to(device).topk(kk, dim=1).indices, True)
+            mgr.set_allowed(a)
     mgr.start_use()
     pos = (qattn.long().cumsum(1) - 1).clamp(min=0) + off
     nxt_pos = off + qattn.sum(1)

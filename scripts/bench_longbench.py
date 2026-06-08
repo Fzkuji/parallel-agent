@@ -96,6 +96,8 @@ def parse_args():
                    help="ours: parameter-free per-step selective read (default: read all)")
     p.add_argument("--max-new", type=int, default=32)
     p.add_argument("--max-prompt-length", type=int, default=131072)
+    p.add_argument("--topk-frac", type=float, default=0.5,
+                   help="ours_topk arm: read only this fraction of the most-relevant passages")
     p.add_argument("--think", action="store_true",
                    help="enable <think> for all arms (Qwen3); raise --max-new accordingly")
     p.add_argument("--no-think", dest="think", action="store_false")
@@ -233,6 +235,10 @@ def main():
                     out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers, q), q,
                                        device, args.max_new, args.max_prompt_length,
                                        temp=1.0, scale=1.0, adaptive=False)
+                elif a == "ours_topk":  # READ-FRACTION: read only the top-frac most relevant passages
+                    out, _ = bank_read(model, tok, mgr, passages, q, device,
+                                       args.max_new, args.max_prompt_length,
+                                       temp=1.0, scale=1.0, topk_frac=args.topk_frac)
                 else:  # ours
                     out, _ = bank_read(model, tok, mgr, passages, q, device,
                                        args.max_new, args.max_prompt_length,
