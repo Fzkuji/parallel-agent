@@ -34,9 +34,14 @@ BOX_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 def extract_box_answer(text: str) -> Tuple[str, bool]:
     """Return the first <answer>...</answer> content if present; otherwise fallback to raw text.
 
+    Strips any Qwen3 <think>...</think> block first so reasoning text never contaminates the
+    score / RL reward (both the metric and the GRPO reward call this).
+
     Returns:
         Tuple of (answer, valid) where valid=True if <answer> tags were found.
     """
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
     match = BOX_PATTERN.search(text)
     if match:
         return match.group(1).strip(), True

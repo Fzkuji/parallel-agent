@@ -156,6 +156,13 @@ class BatchCrossCache:
             q = self.q_proj(hidden_states).view(shp).transpose(1, 2)
             k = self.k_proj(hidden_states).view(shp).transpose(1, 2)
             v = self.v_proj(hidden_states).view(shp).transpose(1, 2)
+            # Qwen3 applies per-head RMSNorm to q/k (on head_dim) BEFORE RoPE; the original
+            # qwen2-style hook skipped it, corrupting every hooked attention on Qwen3. No-op on
+            # Qwen2.5 (no q_norm attribute).
+            if getattr(self, "q_norm", None) is not None:
+                q = self.q_norm(q)
+            if getattr(self, "k_norm", None) is not None:
+                k = self.k_norm(k)
             cos, sin = position_embeddings
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             if past_key_values is not None:

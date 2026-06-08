@@ -40,7 +40,11 @@ def main():
         with torch.no_grad():
             out = model.generate(**ids, max_new_tokens=args.max_new, do_sample=False,
                                   pad_token_id=tok.pad_token_id)
-        return tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        txt = tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        # Qwen3 thinking: strip the <think>...</think> block, keep only the post-think answer.
+        if "</think>" in txt:
+            txt = txt.split("</think>")[-1].strip()
+        return txt
 
     for task in [t.strip() for t in args.tasks.split(",") if t.strip()]:
         path = os.path.join(args.data_dir, f"{task}.jsonl")
