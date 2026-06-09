@@ -176,7 +176,13 @@ def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
     often MORE accurate by filtering distractors). With a LoRA-merged model and temp=scale=1,
     this is the trained CrossKV read."""
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
-    cp = [build_prompt(tok, c, question) for c in chunks]
+    if os.environ.get("PURE_PASSAGE"):
+        # ABLATION: encode each segment as PURE passage text (no per-segment system+question in the
+        # capture input). Tests whether conditioning each passage's KV on its own duplicated question
+        # is what hurts (vs the current build_prompt which puts system+question around every segment).
+        cp = ["Passage:\n" + c.strip() for c in chunks]
+    else:
+        cp = [build_prompt(tok, c, question) for c in chunks]
     # Cap PER-SEGMENT length. max_plen bounds the whole prompt; a single pathological passage can still
     # be ~1.7k tokens, and capturing many such segments stacks 36-layer activations into OOM. Real wiki
     # passages are a few hundred tokens, so a per-segment cap is lossless in practice and bounds memory.
