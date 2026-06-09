@@ -13,6 +13,7 @@ per-sequence positions -- validated to not break cross-attention).
 """
 from __future__ import annotations
 import math
+import os
 import types
 from typing import Dict, List, Optional, Tuple
 
@@ -180,6 +181,11 @@ class BatchCrossCache:
                     k, v, self.layer_idx, {"sin": sin, "cos": cos, "cache_position": cache_position})
             nkv = k.shape[1]; nh = q.shape[1]; rep = nh // nkv; Tc = k.shape[2]
             neg = torch.finfo(q.dtype).min
+            if os.environ.get("CROSSDBG") and self.layer_idx == min(mgr.idx):
+                _bk = mgr.bank.get(self.layer_idx)
+                _M = (_bk[0].shape[0] if (_bk and _bk[0] is not None) else 0)
+                print(f"[CROSSDBG] mode={mgr.mode} B={B} T={T} Tc={Tc} nh={nh} rep={rep} bankM={_M} "
+                      f"mem={torch.cuda.memory_allocated()/1e9:.1f}G", flush=True)
 
             if mgr.mode == "capture":
                 # store each context's KV into the shared bank, then standard attention
@@ -191,8 +197,35 @@ class BatchCrossCache:
                     if prev is not None and prev[0] is not None:
                         nk = torch.cat([prev[0], nk]); nv = torch.cat([prev[1], nv]); ns = torch.cat([prev[2], ns])
                     mgr.bank[self.layer_idx] = (nk, nv, ns)
-                o = F.scaled_dot_product_attention(q, repeat_kv(k, rep), repeat_kv(v, rep),
-                                                   attn_mask=own_mask(B, T, Tc, q.dtype, q.device))
+                # capture = per-segment causal self-attention. The float own_mask is a [B,1,T,T]
+                # tensor (B=10, T=1761 -> ~2GB/layer) that forces SDPA to build the full score matrix
+                # -> OOM. Padding is on the LEFT (padding_side="left"); the output rows at padded
+                # positions are discarded (only context-mask tokens enter the bank), so we only need
+                # the REAL token rows to attend correctly. is_causal=True (FlashAttention, no score
+                # matrix) is exact for the unpadded case; with left padding a real token would also
+                # see the padded prefix, so we pass a compact per-key BOOL mask (key padding only,
+                # broadcast over query rows) which SDPA handles without materializing [B,H,T,T].
+                _valid = mgr.valid if (mgr.valid is not None and mgr.valid.shape[1] == Tc) else None
+                if _valid is None or bool(_valid.all()) or T == 1:
+                    # no padding -> is_causal lets SDPA use FlashAttention (no [B,H,T,T] score matrix).
+                    o = F.scaled_dot_product_attention(q, repeat_kv(k, rep), repeat_kv(v, rep),
+                                                       is_causal=(T > 1))
+                else:
+                    # Left-padded batch. Any explicit attn_mask makes SDPA materialize the full
+                    # [B,H,T,T] score matrix (~2GB/layer at B=10,T=1761) -> OOM. Instead process each
+                    # segment over only its REAL tokens with is_causal=True (FlashAttention, no score
+                    # matrix); padded query rows are discarded anyway (only context tokens enter bank).
+                    kr = repeat_kv(k, rep); vr = repeat_kv(v, rep)
+                    o = torch.zeros_like(q)
+                    for b in range(B):
+                        sel = _valid[b].nonzero(as_tuple=True)[0]
+                        if sel.numel() == 0:
+                            continue
+                        s0 = int(sel[0].item())  # left padding -> real tokens are a contiguous suffix
+                        ob = F.scaled_dot_product_attention(
+                            q[b:b+1, :, s0:, :], kr[b:b+1, :, s0:, :], vr[b:b+1, :, s0:, :],
+                            is_causal=True)
+                        o[b:b+1, :, s0:, :] = ob
                 return self.o_proj(o.transpose(1, 2).reshape(B, T, -1)), None
 
             # mode == "use": query attends own cache + the shared context bank
@@ -211,8 +244,24 @@ class BatchCrossCache:
                 if not bool(keep.all()):
                     idx = keep.nonzero(as_tuple=True)[0]
                     bK = bK[idx]; bV = bV[idx]; bseq = bseq[idx]; M = idx.numel()
-            bKe = repeat_kv(bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
-            bVe = repeat_kv(bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1), rep)
+            # MEMORY: keep the bank K/V at n_kv_heads (NO per-step/per-layer GQA repeat -> no
+            # [B,nh,M,hd] materialization, which was the decode-step OOM). These are cheap expand
+            # views: [B, n_kv, M, head_dim]. SDPA uses enable_gqa=True; the manual-matmul paths
+            # broadcast over the rep groups (see _gqa_scores / _gqa_ctx below). Math-identical.
+            bKn = bK.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1)
+            bVn = bV.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1)
+
+            def _gqa_scores(qx, kkv):
+                # qx:[B,nh,T,hd], kkv:[B,nkv,Mk,hd] -> [B,nh,T,Mk] without repeating kkv.
+                Tq = qx.shape[2]; Mk = kkv.shape[2]
+                qg = qx.reshape(B, nkv, rep, Tq, qx.shape[-1])
+                return torch.matmul(qg, kkv.unsqueeze(2).transpose(-1, -2)).reshape(B, nh, Tq, Mk)
+
+            def _gqa_ctx(wx, vkv):
+                # wx:[B,nh,T,Mk] softmax weights, vkv:[B,nkv,Mk,hd] -> [B,nh,T,hd] without repeating vkv.
+                Tq = wx.shape[2]; Mk = wx.shape[3]
+                wg = wx.reshape(B, nkv, rep, Tq, Mk)
+                return torch.matmul(wg, vkv.unsqueeze(2)).reshape(B, nh, Tq, vkv.shape[-1])
             if mgr.prune and T == 1 and self.layer_idx == min(mgr.idx) and Tc != mgr._prune_updated_step:
                 # PROGRESSIVE PRUNING: aggregate THIS step's query->bank attention per source context,
                 # accumulate, and (monotonically) drop the consistently-ignored contexts for NEXT steps.
@@ -221,8 +270,8 @@ class BatchCrossCache:
                 mgr._prune_updated_step = Tc
                 d2 = q.shape[-1]; sc2 = 1.0 / math.sqrt(d2)
                 own2 = own_mask(B, T, Tc, q.dtype, q.device)
-                s_own2 = torch.matmul(q, repeat_kv(k, rep).transpose(-1, -2)) * sc2 + own2
-                s_bank2 = torch.matmul(q, bKe.transpose(-1, -2)) * sc2
+                s_own2 = _gqa_scores(q, k) * sc2 + own2
+                s_bank2 = _gqa_scores(q, bKn) * sc2
                 full2 = torch.cat([s_own2, s_bank2], dim=-1).softmax(dim=-1)
                 w_bank2 = full2[..., Tc:].mean(dim=1).mean(dim=1).float()       # [B,M] avg heads & query tok
                 Cn = mgr.allowed.shape[1] if mgr.allowed is not None else int(bseq.max().item()) + 1
@@ -233,8 +282,8 @@ class BatchCrossCache:
                 # READ-FRACTION telemetry: per-source-context bank mass, for top-k selective read.
                 d = q.shape[-1]; sc = 1.0 / math.sqrt(d)
                 own_a = own_mask(B, T, Tc, q.dtype, q.device)
-                s_own = torch.matmul(q, repeat_kv(k, rep).transpose(-1, -2)) * sc + own_a
-                s_bank = torch.matmul(q, bKe.transpose(-1, -2)) * sc
+                s_own = _gqa_scores(q, k) * sc + own_a
+                s_bank = _gqa_scores(q, bKn) * sc
                 full = torch.cat([s_own, s_bank], dim=-1).softmax(dim=-1)
                 w_bank = full[..., Tc:].mean(dim=1).mean(dim=1).float()         # [B,M]
                 pc = torch.zeros(B, mgr.rec_ctx_w, device=q.device, dtype=w_bank.dtype)
@@ -244,8 +293,8 @@ class BatchCrossCache:
                 # ANALYSIS: record how much query->bank attention mass lands on each source context.
                 d = q.shape[-1]; sc = 1.0 / math.sqrt(d)
                 own_a = own_mask(B, T, Tc, q.dtype, q.device)
-                s_own = torch.matmul(q, repeat_kv(k, rep).transpose(-1, -2)) * sc + own_a
-                s_bank = torch.matmul(q, bKe.transpose(-1, -2)) * sc            # [B,H,T,M]
+                s_own = _gqa_scores(q, k) * sc + own_a
+                s_bank = _gqa_scores(q, bKn) * sc                               # [B,H,T,M]
                 full = torch.cat([s_own, s_bank], dim=-1).softmax(dim=-1)
                 w_bank = full[..., Tc:].mean(dim=1).mean(dim=1).float()         # [B,M] avg over heads & query tokens
                 per_ctx = torch.zeros(B, B, device=q.device, dtype=w_bank.dtype)
@@ -258,9 +307,9 @@ class BatchCrossCache:
                     and mgr.allowed is None and not mgr.exclude_self
                     and mgr.qrows_all and mgr.valid_all
                     and mgr.valid is not None and mgr.valid.shape[1] == Tc):
-                K = torch.cat([repeat_kv(k, rep), bKe], dim=2)
-                V = torch.cat([repeat_kv(v, rep), bVe], dim=2)
-                out = F.scaled_dot_product_attention(q, K, V)        # no mask -> flash kernel
+                K = torch.cat([k, bKn], dim=2)                       # [B,n_kv,Tc+M,hd], un-repeated
+                V = torch.cat([v, bVn], dim=2)
+                out = F.scaled_dot_product_attention(q, K, V, enable_gqa=True)  # no mask -> flash kernel
                 return self.o_proj(out.transpose(1, 2).reshape(B, T, -1)), None
             own = own_mask(B, T, Tc, q.dtype, q.device)
             row_block = (~mgr.query_rows).view(B, 1, T, 1) if (mgr.query_rows is not None and
@@ -275,22 +324,23 @@ class BatchCrossCache:
                 block = block | (~sel).view(B, 1, 1, M)
             bank_m = torch.zeros(B, 1, T, M, dtype=q.dtype, device=q.device).masked_fill(block, neg)
             if mgr.temperature == 1.0 and mgr.scale_s == 1.0:
-                K = torch.cat([repeat_kv(k, rep), bKe], dim=2)
-                V = torch.cat([repeat_kv(v, rep), bVe], dim=2)
-                out = F.scaled_dot_product_attention(q, K, V, attn_mask=torch.cat([own, bank_m], dim=-1))
+                K = torch.cat([k, bKn], dim=2)                       # un-repeated -> enable_gqa
+                V = torch.cat([v, bVn], dim=2)
+                out = F.scaled_dot_product_attention(
+                    q, K, V, attn_mask=torch.cat([own, bank_m], dim=-1), enable_gqa=True)
                 return self.o_proj(out.transpose(1, 2).reshape(B, T, -1)), None
             # APE realignment: own (local) and bank (context) segments computed separately,
             # bank sharpened by temperature T and re-weighted by S in log space, then merged.
             d = q.shape[-1]; sc = 1.0 / math.sqrt(d)
-            Ko = repeat_kv(k, rep); Vo = repeat_kv(v, rep)
+            Ko = repeat_kv(k, rep); Vo = repeat_kv(v, rep)          # own is local (Tc tokens) -> cheap
             s_own = torch.matmul(q, Ko.transpose(-1, -2)) * sc + own
-            s_bank = torch.matmul(q, bKe.transpose(-1, -2)) * (sc / mgr.temperature) + bank_m
+            s_bank = _gqa_scores(q, bKn) * (sc / mgr.temperature) + bank_m   # bank: no [B,nh,M,hd] repeat
             lse_own = torch.logsumexp(s_own, dim=-1, keepdim=True)
             lse_bank = torch.logsumexp(s_bank, dim=-1, keepdim=True) * (mgr.scale_s * mgr.temperature)
             mmax = torch.maximum(lse_own, lse_bank)
             wo = torch.exp(lse_own - mmax); wb = torch.exp(lse_bank - mmax)
             o_own = torch.matmul(torch.softmax(s_own, dim=-1), Vo)
-            o_bank = torch.matmul(torch.softmax(s_bank, dim=-1), bVe)
+            o_bank = _gqa_ctx(torch.softmax(s_bank, dim=-1), bVn)   # bank ctx: no repeat
             out = (wo * o_own + wb * o_bank) / (wo + wb).clamp(min=1e-9)
             return self.o_proj(out.transpose(1, 2).reshape(B, T, -1)), None
 

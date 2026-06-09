@@ -64,7 +64,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model-path", required=True)
     p.add_argument("--lora-path", required=True)
-    p.add_argument("--tasks", default="2wikimqa,hotpotqa")
+    p.add_argument("--tasks", default="2wikimqa,hotpotqa,musique")
+    p.add_argument("--fracs", default="0.8,0.6,0.5,0.4,0.3,0.2")
     p.add_argument("--data-dir", default="/mnt/data/zichuanfu/longbench_export")
     p.add_argument("--num-q", type=int, default=50)
     p.add_argument("--max-new", type=int, default=512)
@@ -85,15 +86,20 @@ def main():
     nl = model.config.num_hidden_layers
     mgr = BatchCrossCache(list(range(nl))); mgr.register(model)
 
+    sweep = [float(x) for x in args.fracs.split(",") if x.strip()]
     for task in [t.strip() for t in args.tasks.split(",") if t.strip()]:
         data = [json.loads(l) for l in open(os.path.join(args.data_dir, f"{task}.jsonl")) if l.strip()][:args.num_q]
-        acc = {"full": 0.0, "0.5C": 0.0, "0.3C": 0.0}; frac = {"0.5C": 0.0, "0.3C": 0.0}; n = 0
+        acc = {"full": 0.0}; frac = {}
+        for kf in sweep:
+            acc[f"{kf}"] = 0.0; frac[f"{kf}"] = 0.0
+        n = 0
         for ex in data:
             ps = split_passages(ex["context"]); C = len(ps); ans = ex["answers"]; q = ex["input"]
             off = capture_bank(model, tok, mgr, ps, q, device, args.max_prompt_length)
             full, rel = decode(model, tok, mgr, q, device, off, args.max_prompt_length, args.max_new, rec_c=C)
             acc["full"] += best_f1(extract_box_answer(full)[0], ans)
-            for tag, kf in [("0.5C", 0.5), ("0.3C", 0.3)]:
+            for kf in sweep:
+                tag = f"{kf}"
                 k = max(1, round(kf * C))
                 a = torch.zeros(1, C, dtype=torch.bool, device=device)
                 a.scatter_(1, rel.to(device).topk(k, dim=1).indices, True)
@@ -103,9 +109,11 @@ def main():
                 acc[tag] += best_f1(extract_box_answer(out)[0], ans)
                 frac[tag] += k / C
             mgr.bank = {}; n += 1
-        print(f"{task} (n={n}): full={100*acc['full']/n:.1f}  "
-              f"0.5C={100*acc['0.5C']/n:.1f}(read {frac['0.5C']/n:.2f})  "
-              f"0.3C={100*acc['0.3C']/n:.1f}(read {frac['0.3C']/n:.2f})", flush=True)
+        parts = [f"full={100*acc['full']/n:.1f}"]
+        for kf in sweep:
+            tag = f"{kf}"
+            parts.append(f"{tag}={100*acc[tag]/n:.1f}(read {frac[tag]/n:.2f})")
+        print(f"{task} (n={n}): " + "  ".join(parts), flush=True)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ from scripts.eval_multiquery import (
 )
 from scripts.bench_distract import bank_read
 from src.inference import extract_box_answer
+from src.datasets.longbench_gold import gold_passages_flashrag
 
 # ---- official LongBench metric (THUDM/LongBench/metrics.py, verbatim) ------------
 import string
@@ -98,6 +99,10 @@ def parse_args():
     p.add_argument("--max-prompt-length", type=int, default=131072)
     p.add_argument("--topk-frac", type=float, default=0.5,
                    help="ours_topk arm: read only this fraction of the most-relevant passages")
+    p.add_argument("--gold-source", default="flashrag", choices=["flashrag", "approx"],
+                   help="oracle gold passages: flashrag=true supporting_facts (question-matched), "
+                        "approx=entity-bridge heuristic. flashrag falls back to approx if a "
+                        "question is not found in flashrag.")
     p.add_argument("--think", action="store_true",
                    help="enable <think> for all arms (Qwen3); raise --max-new accordingly")
     p.add_argument("--no-think", dest="think", action="store_false")
@@ -164,6 +169,22 @@ def oracle_passages(passages, answers, question=""):
     return keep or passages[:2]  # never empty
 
 
+_ORACLE_MISS = {"flashrag": 0, "fallback": 0}
+
+
+def select_oracle(passages, answers, question, task, source):
+    """Gold passage subset for the *-oracle arms. source='flashrag' uses the true
+    supporting_facts (question-matched to flashrag) and falls back to the entity-bridge
+    approximation when the question is not found; source='approx' always uses the heuristic."""
+    if source == "flashrag":
+        gp = gold_passages_flashrag(passages, question, task)
+        if gp is not None:
+            _ORACLE_MISS["flashrag"] += 1
+            return gp
+        _ORACLE_MISS["fallback"] += 1
+    return oracle_passages(passages, answers, question)
+
+
 def lb_prompt(context, question):
     return LB_PROMPT.format(context=context, input=question)
 
@@ -209,6 +230,7 @@ def main():
             passages = split_passages(ex["context"])
             answers = ex["answers"]
             q = ex["input"]
+            op = None  # lazily computed gold subset, shared by oracle/ape_oracle/ours_oracle
             for a in arms:
                 if a == "concat":
                     full = "\n\n".join(passages)
@@ -217,7 +239,8 @@ def main():
                                         "references": answers, "has_supporting": True}],
                                       device, args.max_new, args.max_prompt_length)[0]
                 elif a == "oracle":
-                    op = oracle_passages(passages, answers, q)
+                    if op is None:
+                        op = select_oracle(passages, answers, q, task, args.gold_source)
                     full = "\n\n".join(op)
                     out = independent(model, tok, mgr,
                                       [{"context": full, "question": q,
@@ -228,11 +251,15 @@ def main():
                                        args.max_new, args.max_prompt_length,
                                        temp=args.ape_temp, scale=args.ape_scale, adaptive=False)
                 elif a == "ape_oracle":  # APE encoding ceiling under perfect selection
-                    out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers, q), q,
+                    if op is None:
+                        op = select_oracle(passages, answers, q, task, args.gold_source)
+                    out, _ = bank_read(model, tok, mgr, op, q,
                                        device, args.max_new, args.max_prompt_length,
                                        temp=args.ape_temp, scale=args.ape_scale, adaptive=False)
                 elif a == "ours_oracle":  # our encoding ceiling under perfect selection
-                    out, _ = bank_read(model, tok, mgr, oracle_passages(passages, answers, q), q,
+                    if op is None:
+                        op = select_oracle(passages, answers, q, task, args.gold_source)
+                    out, _ = bank_read(model, tok, mgr, op, q,
                                        device, args.max_new, args.max_prompt_length,
                                        temp=1.0, scale=1.0, adaptive=False)
                 elif a == "ours_topk":  # READ-FRACTION: read only the top-frac most relevant passages
@@ -248,6 +275,8 @@ def main():
                 ans, _ = extract_box_answer(out)
                 scores[a] += best_f1(ans, answers)
                 preds[a].append({"task": task, "question": q, "gold": answers, "pred": out})
+                mgr.bank = {}  # free this arm's KV bank before the next arm (else it accumulates -> OOM)
+            torch.cuda.empty_cache()  # release the per-sample peak (long thinking generations stack up)
             n += 1
             if n % 25 == 0:
                 run = "  ".join(f"{a}={100.0*scores[a]/n:.1f}" for a in arms)
@@ -255,6 +284,10 @@ def main():
         row = {a: round(100.0 * scores[a] / n, 2) for a in arms}
         table[task] = row
         print(f"{task:>10}" + "".join(f"{row[a]:>9.2f}" for a in arms), flush=True)
+        if args.gold_source == "flashrag" and any("oracle" in a for a in arms):
+            print(f"  [oracle gold: flashrag={_ORACLE_MISS['flashrag']} "
+                  f"fallback={_ORACLE_MISS['fallback']}]", flush=True)
+            _ORACLE_MISS["flashrag"] = 0; _ORACLE_MISS["fallback"] = 0
         import json as _j
         with open(os.path.join(args.output_dir, f"preds_{task}.jsonl"), "w") as pf:
             for a in arms:

@@ -144,7 +144,6 @@ def compute_subem(prediction, references):
 
 # ----------------------------------------------------------------------------- ours/APE read
 @torch.no_grad()
-@torch.no_grad()
 def _relevance_decode(model, tok, mgr, qids, qattn, device, off, n_steps, eos, pad):
     """Short greedy decode that lets mgr.record per-passage bank attention (start_relevance must
     be active). Used only to RANK passages for read-fraction top-k; output discarded."""
@@ -155,7 +154,8 @@ def _relevance_decode(model, tok, mgr, qids, qattn, device, off, n_steps, eos, p
         mgr.set_valid(cur)
         mgr.set_query_rows(cur.bool() if step == 0 else torch.ones(1, 1, dtype=torch.bool, device=device))
         pid = pos if step == 0 else nxt_pos.view(1, 1)
-        out = model(input_ids=nxt, attention_mask=cur, position_ids=pid, past_key_values=pkv, use_cache=True)
+        out = model(input_ids=nxt, attention_mask=cur, position_ids=pid, past_key_values=pkv, use_cache=True,
+                    logits_to_keep=1)  # only last-position logits; full [1,P,151k] step-0 logits OOMs
         pkv = out.past_key_values
         if step > 0:
             nxt_pos = nxt_pos + 1
@@ -166,6 +166,7 @@ def _relevance_decode(model, tok, mgr, qids, qattn, device, off, n_steps, eos, p
             break
 
 
+@torch.no_grad()
 def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
               temp=1.0, scale=1.0, adaptive=False, topk_frac=1.0):
     """A SINGLE query reads a bank of independently-encoded paragraphs.
@@ -176,15 +177,34 @@ def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
     this is the trained CrossKV read."""
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     cp = [build_prompt(tok, c, question) for c in chunks]
-    enc = tok(cp, return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
+    # Cap PER-SEGMENT length. max_plen bounds the whole prompt; a single pathological passage can still
+    # be ~1.7k tokens, and capturing many such segments stacks 36-layer activations into OOM. Real wiki
+    # passages are a few hundred tokens, so a per-segment cap is lossless in practice and bounds memory.
+    _seg_cap = int(os.environ.get("CAP_SEG_LEN", "768"))
+    enc = tok(cp, return_tensors="pt", padding=True, truncation=True, max_length=min(max_plen, _seg_cap))
     cids = enc["input_ids"].to(device); cattn = enc["attention_mask"].to(device)
     cm = context_mask_for(tok, cp, chunks, cids.shape[1], cattn, max_plen).to(device)
     mgr.set_enabled(True); mgr.exclude_self = False; mgr.set_allowed(None)
     mgr.set_realign(temp, scale)
-    mgr.start_capture(cm); mgr.set_valid(cattn)
-    out1 = model(input_ids=cids, attention_mask=cattn, use_cache=False,
-                 output_hidden_states=adaptive)
-    off = int(cattn.sum(1).max().item()); K = len(chunks)
+    # Capture in sub-batches of segments. Forwarding all K padded segments at once builds the full
+    # 36-layer activation stack for [K, max_seg_len] (e.g. K=10, len=1761 -> tens of GB) and OOMs on
+    # long contexts. The bank accumulates across forwards (capture cats into it), so chunking is exact.
+    # start_capture() resets the bank, so call it ONCE then only swap context_mask/valid per sub-batch.
+    K = len(chunks)
+    _cap_bs = int(os.environ.get("CAP_BS", "4"))
+    qhs_parts = [] if adaptive else None
+    mgr.start_capture(cm)  # sets mode=capture and clears bank, ONCE
+    for s in range(0, K, _cap_bs):
+        sub_ids = cids[s:s + _cap_bs]; sub_attn = cattn[s:s + _cap_bs]
+        mgr.context_mask = cm[s:s + _cap_bs].bool(); mgr.set_valid(sub_attn)
+        o = model(input_ids=sub_ids, attention_mask=sub_attn, use_cache=False,
+                  output_hidden_states=adaptive)
+        if adaptive:
+            qhs_parts.append(o.hidden_states[-1].detach())
+        del o
+        torch.cuda.empty_cache()  # release this sub-batch's activation peak before the next
+    out1 = type("O", (), {"hidden_states": (None, torch.cat(qhs_parts, 0))})() if adaptive else None
+    off = int(cattn.sum(1).max().item())
     qp = build_prompt(tok, "", question)
     enc = tok([qp], return_tensors="pt", padding=True, truncation=True, max_length=max_plen)
     qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)

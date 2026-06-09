@@ -120,7 +120,11 @@ def independent(model, tok, mgr, items, device, max_new, max_plen):
     G, P = ids.shape; eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     gen = ids.clone(); cur = attn.clone(); fin = torch.zeros(G, dtype=torch.bool, device=device); pkv = None; nxt = gen
     for _ in range(max_new):
-        out = model(input_ids=nxt, attention_mask=cur, past_key_values=pkv, use_cache=True); pkv = out.past_key_values
+        # logits_to_keep=1: only materialize the LAST position's logits. Without this, step-0 builds
+        # the full [G, P, vocab] logits tensor (Qwen3 vocab=151k -> ~2.8GB for a long gold prompt),
+        # which OOMs; we only ever use out.logits[:, -1] anyway.
+        out = model(input_ids=nxt, attention_mask=cur, past_key_values=pkv, use_cache=True,
+                    logits_to_keep=1); pkv = out.past_key_values
         t = out.logits[:, -1].argmax(-1); t = torch.where(fin, torch.full_like(t, pad), t); fin = fin | (t == eos)
         gen = torch.cat([gen, t.unsqueeze(1)], 1); cur = torch.cat([cur, (~fin).long().unsqueeze(1)], 1); nxt = t.unsqueeze(1)
         if fin.all():
