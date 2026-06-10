@@ -116,7 +116,43 @@ mask 只在我们想多做 selective/多轮时出现，是增量不是欠债。
 自动到手（vLLM 原生支持 Qwen3，已处理 QK-norm）。真正的工程是把我们的并行编码 bank 逻辑
 接进 vLLM，而非手写 varlen kernel。
 
-## 8. 待落地清单
+## 8. 实测验证（2026-06-10，Qwen3-8B + SDPA，2wiki）
+
+实现：`scripts/bench_multiturn.py`（多轮逻辑）、`scripts/bench_speed.py`（速度）。
+核心机制全部在现有代码上落地，注意力核心未改；位置分段靠 capture 时传偏移 `position_ids`
+（已验证：偏移 100 使 bank K 的 RoPE 改变 maxdiff=9.875，轮间错开可实现）。
+
+### 逻辑正确性（跨轮读取生效）
+2 轮 episode：turn-1 问 qB（passages 含 gold_A+gold_B），turn-2 问 qA（passages 只有干扰，
+gold_A 仅存在于 turn-1 累积进 bank 的 KV 中）。n=50：
+
+| 配置 | turn-2 SubEM（问 qA，证据只在 bank） |
+|---|---|
+| multiturn（累积 bank，轮间错开） | **16.0** |
+| isolated（每轮 fresh bank，基线） | 6.0 |
+| multiturn（不错开 no-offset） | 10.0 |
+
+跨轮增益 = 16.0 − 6.0 = **+10**。turn-2 确实读到了 turn-1 引入的文档 → 设计按预期工作。
+轮间位置错开（16）> 不错开（10）→ 错开有益（帮模型定位旧轮证据），非副作用。
+
+### 速度（同模型同输入，prefill/decode 中位数 ms）
+
+| N | concat | ape(T=.9) | ours(T=1) |
+|---|---|---|---|
+| 4 | 173/805 | 422/1411 | 423/**860** |
+| 8 | 554/994 | 794/1484 | 801/**885** |
+| 16 | 1510/1194 | 1605/1472 | 1599/**948** |
+| 32 | **4994**/1768 | 1294/1344 | 1293/**868** |
+| 64 | **12810**/2177 | 2592/1428 | 2591/**916** |
+
+结论：
+- **ours 与 APE 编码速度相同**（prefill 逐格相等，编码计算图一致）。
+- **ours decode 比 APE 快 ~1.5×**（ours ~900ms vs APE ~1400ms）：APE 的温度对齐(T/S<1)需分两段
+  算 LSE、手写 matmul，失去 flash；ours(T=S=1)读全部无 mask，走 SDPA flash 快路。**实测印证 §6。**
+- 并行编码 vs Concat 的价值在长上下文兑现：N=32 concat prefill 是 ours 的 3.9×，N=64 达 4.9×
+  （concat 平方级，ours 近线性）。
+
+## 9. 待落地清单
 
 - [ ] 外层 `off` 多轮递推 + 回答 KV 入 bank（打回答段标记）
 - [ ] selective 从 mask 路径改为拼接路径（对齐 APE stitch）
