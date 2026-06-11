@@ -99,7 +99,7 @@ def build_examples(root, name, num_q, seed):
         if not isinstance(ctx, dict) or "title" not in ctx or not sf:
             continue
         titles = ctx["title"]
-        texts = ctx.get("content") or ctx.get("text")
+        texts = ctx.get("content") or ctx.get("text") or ctx.get("sentences")  # hotpot uses "sentences"
         if texts is None or len(texts) != len(titles):
             continue
         gold_titles = set(sf.get("title", []))
@@ -176,10 +176,10 @@ def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
     often MORE accurate by filtering distractors). With a LoRA-merged model and temp=scale=1,
     this is the trained CrossKV read."""
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
-    if os.environ.get("PURE_PASSAGE"):
-        # ABLATION: encode each segment as PURE passage text (no per-segment system+question in the
-        # capture input). Tests whether conditioning each passage's KV on its own duplicated question
-        # is what hurts (vs the current build_prompt which puts system+question around every segment).
+    if os.environ.get("PURE_PASSAGE") or os.environ.get("SHARED_PREFIX"):
+        # SHARED_PREFIX: segments encode passage-only; the system+question prefix (with its single
+        # sink) is captured once separately below. PURE_PASSAGE: same passage-only segments, no shared
+        # prefix at all (sink-free ablation).
         cp = ["Passage:\n" + c.strip() for c in chunks]
     else:
         cp = [build_prompt(tok, c, question) for c in chunks]
@@ -198,8 +198,20 @@ def bank_read(model, tok, mgr, chunks, question, device, max_new, max_plen,
     # start_capture() resets the bank, so call it ONCE then only swap context_mask/valid per sub-batch.
     K = len(chunks)
     _cap_bs = int(os.environ.get("CAP_BS", "4"))
+    _shared_prefix = bool(os.environ.get("SHARED_PREFIX"))
     qhs_parts = [] if adaptive else None
     mgr.start_capture(cm)  # sets mode=capture and clears bank, ONCE
+    if _shared_prefix:
+        # APE sink fix: capture the shared system+question prefix ONCE into the bank (one sink),
+        # so the N segments do not each contribute a duplicated <|im_start|> sink. The prefix is
+        # tokenized alone and ALL its tokens are marked to enter the bank.
+        pfx = build_prompt(tok, "", question)
+        penc = tok([pfx], return_tensors="pt", truncation=True, max_length=max_plen)
+        pids = penc["input_ids"].to(device); pattn = penc["attention_mask"].to(device)
+        pcm = pattn.bool().clone()
+        mgr.context_mask = pcm; mgr.set_valid(pattn)
+        o = model(input_ids=pids, attention_mask=pattn, use_cache=False); del o
+        torch.cuda.empty_cache()
     for s in range(0, K, _cap_bs):
         sub_ids = cids[s:s + _cap_bs]; sub_attn = cattn[s:s + _cap_bs]
         mgr.context_mask = cm[s:s + _cap_bs].bool(); mgr.set_valid(sub_attn)

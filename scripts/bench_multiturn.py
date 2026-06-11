@@ -21,9 +21,20 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.cross_batch.batch_crosscache import BatchCrossCache
-from scripts.eval_multiquery import build_prompt, context_mask_for, decode_texts
+from scripts.eval_multiquery import build_prompt as _bp_think, context_mask_for, decode_texts
 from scripts.bench_distract import build_examples
 from src.evaluation.basic import normalize_answer
+from src.templates import build_chat_prompt
+from src.prompts import build_single_prompt
+from src.models import Question
+
+
+def build_prompt(tok, context, question):
+    """no-think build_prompt: Qwen3 outputs the answer directly (no <think>...). The thinking
+    model otherwise spends all decode tokens reasoning and never reaches the answer -> SubEM floor."""
+    q = Question(qid="q", text=question, priority=1.0, answer_tokens=12, type_hint=None, references=[])
+    sp, up = build_single_prompt(context, q, dataset="hotpot")
+    return build_chat_prompt(tok, up, system_prompt=sp, enable_thinking=False)
 
 FLASHRAG = "/mnt/data/zichuanfu/.cache/huggingface/datasets/RUC-NLPIR___flash_rag_datasets"
 
@@ -39,10 +50,10 @@ def parse_args():
     p.add_argument("--max-new", type=int, default=32)
     p.add_argument("--max-plen", type=int, default=1600)
     p.add_argument("--seg-cap", type=int, default=768)
-    p.add_argument("--arms", default="multiturn,isolated")
-    p.add_argument("--no-offset", action="store_true",
-                   help="encode every turn's passages from position 0 (disable 轮间错开) to isolate "
-                        "whether the per-turn offset is what drops turn-2 accuracy")
+    p.add_argument("--arms", default="multiturn,ape_realign,isolated,nooffset",
+                   help="subset of {multiturn, ape_realign, isolated, nooffset}")
+    p.add_argument("--ape-temp", type=float, default=0.9, help="ape_realign bank temperature")
+    p.add_argument("--ape-scale", type=float, default=0.9, help="ape_realign bank LSE scale")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=5)
     return p.parse_args()
@@ -80,12 +91,14 @@ def capture_turn(model, tok, mgr, chunks, question, device, off, max_plen, seg_c
 
 
 @torch.no_grad()
-def answer_turn(model, tok, mgr, question, device, q_off, max_new, max_plen):
-    """Query reads the WHOLE accumulated bank (睁眼, no `allowed` -> flash fast path)."""
+def answer_turn(model, tok, mgr, question, device, q_off, max_new, max_plen, temp=1.0, scale=1.0):
+    """Query reads the WHOLE accumulated bank. temp=scale=1 -> ours (flash fast path);
+    temp=scale<1 -> APE realignment (sharpen bank + LSE down-weight, the APE-style read)."""
     qp = build_prompt(tok, "", question)
     enc = tok([qp], return_tensors="pt", truncation=True, max_length=max_plen)
     qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
+    mgr.set_realign(temp, scale)
     mgr.start_use()
     pos = (qattn.long().cumsum(1) - 1).clamp(min=0) + q_off
     nxt_pos = q_off + qattn.sum(1)
@@ -110,22 +123,20 @@ def answer_turn(model, tok, mgr, question, device, q_off, max_new, max_plen):
     return decode_texts(tok, gen, P, eos, pad)[0]
 
 
-def run_episode(model, tok, mgr, ep, device, args, accumulate):
-    """ep = {turns:[{passages, question, answers}, ...]}. accumulate=True -> cross-turn bank;
-    False -> fresh bank each turn (isolated baseline). Returns list of per-turn SubEM."""
+def run_episode(model, tok, mgr, ep, device, args, cfg):
+    """cfg = {accumulate, no_offset, temp, scale}. Returns per-turn SubEM list."""
     scores = []
     off = 0
     for ti, turn in enumerate(ep["turns"]):
-        fresh = (ti == 0) or (not accumulate)
-        # `off` is the per-turn position offset (轮间错开). --no-offset encodes every turn's passages
-        # from position 0 (no 轮间错开) to isolate whether the offset is what drops turn-2.
-        turn_off = 0 if (getattr(args, "no_offset", False) or fresh) else off
+        fresh = (ti == 0) or (not cfg["accumulate"])
+        # `off` = per-turn position offset (轮间错开). no_offset -> every turn from pos 0.
+        turn_off = 0 if (cfg["no_offset"] or fresh) else off
         seg_len = capture_turn(model, tok, mgr, turn["passages"], turn["question"],
                                device, turn_off, args.max_plen, args.seg_cap, fresh)
         q_off = turn_off + seg_len
-        pred = answer_turn(model, tok, mgr, turn["question"], device, q_off, args.max_new, args.max_plen)
+        pred = answer_turn(model, tok, mgr, turn["question"], device, q_off, args.max_new,
+                           args.max_plen, cfg["temp"], cfg["scale"])
         scores.append(subem(pred, turn["answers"]))
-        # advance offset past this turn's passages + an estimated query/answer span
         off = q_off + 48
     return scores
 
@@ -185,19 +196,30 @@ def main():
     eps = build_episodes(parsed, pool, args.num_episodes, args.paras_per_turn, rng)
     print(f"built {len(eps)} 2-turn episodes ({args.dataset}, {args.paras_per_turn} paras/turn)", flush=True)
 
+    # arm -> setting. isolated == APE-single-turn-equivalent (fresh bank, no history).
+    # ape_realign == accumulate bank but read with APE temperature/scale (the APE-style read).
+    ARM_CFG = {
+        "multiturn":   dict(accumulate=True,  no_offset=False, temp=1.0, scale=1.0),  # ours full
+        "nooffset":    dict(accumulate=True,  no_offset=True,  temp=1.0, scale=1.0),  # ablate 错开
+        "ape_realign": dict(accumulate=True,  no_offset=False, temp=args.ape_temp, scale=args.ape_scale),
+        "isolated":    dict(accumulate=False, no_offset=False, temp=1.0, scale=1.0),  # = APE single-turn
+    }
+    if not eps:
+        print(f"[ERROR] 0 episodes for {args.dataset} -- check build_examples field parsing", flush=True)
+        return
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     for arm in arms:
-        accumulate = (arm == "multiturn")
+        cfg = ARM_CFG[arm]
         t1s, t2s = [], []
         t0 = time.time()
         for ep in eps:
-            s = run_episode(model, tok, mgr, ep, device, args, accumulate)
+            s = run_episode(model, tok, mgr, ep, device, args, cfg)
             t1s.append(s[0]); t2s.append(s[1])
             torch.cuda.empty_cache()
         dt = time.time() - t0
         n = len(eps)
-        print(f"[{arm:9s}] turn1 SubEM={100*sum(t1s)/n:.1f}  turn2 SubEM={100*sum(t2s)/n:.1f}  "
-              f"({n} eps, {dt:.1f}s, {dt/n*1000:.0f}ms/ep)", flush=True)
+        print(f"[{arm:11s}] turn1={100*sum(t1s)/n:.1f}  turn2={100*sum(t2s)/n:.1f}  "
+              f"({n} eps, {dt/n*1000:.0f}ms/ep)", flush=True)
 
 
 if __name__ == "__main__":
