@@ -87,7 +87,7 @@ def load_items(root, name, split, num_q, rng):
             items.append({"gold": gold, "question": r["question"], "answers": ans})
         if len(items) >= num_q and len(pool) > 5000:
             break
-    return items, pool
+    return items[:num_q], pool
 
 
 @torch.no_grad()
