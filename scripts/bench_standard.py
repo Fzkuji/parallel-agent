@@ -32,7 +32,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model-path", required=True)
     p.add_argument("--lora-path", default=None)
-    p.add_argument("--dataset", default="2wikimultihopqa", choices=["2wikimultihopqa", "hotpotqa"])
+    p.add_argument("--dataset", default="2wikimultihopqa",
+                   choices=["2wikimultihopqa", "hotpotqa", "musique"])
     p.add_argument("--flashrag-root",
                    default="/mnt/data/zichuanfu/.cache/huggingface/datasets/RUC-NLPIR___flash_rag_datasets")
     p.add_argument("--num-q", type=int, default=50)

@@ -28,6 +28,10 @@ def main():
     p.add_argument("--gpu-mem", type=float, default=0.85)
     p.add_argument("--out", required=True)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--cot", action="store_true",
+                   help="CoT teacher for non-thinking models (Qwen2.5): append a step-by-step "
+                        "instruction to the teacher prompt, keep on answer-correct only (no <think> "
+                        "tag required). Stored question stays PLAIN so the student matches inference.")
     args = p.parse_args()
 
     Gs = [int(x) for x in args.mix_agents.split(",")]
@@ -56,7 +60,10 @@ def main():
     sp = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=args.max_new)
 
     # build teacher prompts = student bank-read prompt but over the gold union (full attention)
-    prompts = [build_prompt(tok, it["gold_union"], it["question"]) for it in items]
+    COT = ("\nThink step by step about how the passages connect before giving your final answer "
+           "in <answer></answer> tags.")
+    prompts = [build_prompt(tok, it["gold_union"], it["question"] + (COT if args.cot else ""))
+               for it in items]
     outs = llm.generate(prompts, sp)
 
     kept = 0
@@ -64,7 +71,10 @@ def main():
     for it, o in zip(items, outs):
         traj = o.outputs[0].text
         ans, _ = extract_box_answer(traj)
-        ok = best_f1(ans, it["references"]) >= 0.5 and "</think>" in traj and "<answer>" in traj
+        if args.cot:
+            ok = best_f1(ans, it["references"]) >= 0.5 and "<answer>" in traj
+        else:
+            ok = best_f1(ans, it["references"]) >= 0.5 and "</think>" in traj and "<answer>" in traj
         if ok:
             # store the full think+answer (strip leading whitespace; keep <think>..</answer>)
             ta = traj[traj.find("<think>"):] if "<think>" in traj else traj

@@ -33,6 +33,9 @@ def parse_args():
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--max-prompt-length", type=int, default=2048)
     p.add_argument("--bank-grad", action="store_true", default=True)
+    p.add_argument("--capture-all", action="store_true",
+                   help="capture ALL group items (incl. non-supporting) like the answer-only arm, "
+                        "for a fair thinking-vs-answer-target A/B")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -71,7 +74,7 @@ def main():
     step = 0; run = 0.0
     for ep in range(args.epochs):
         for t in traj:
-            gi = gold_items(t["group_items"])
+            gi = t["group_items"] if args.capture_all else gold_items(t["group_items"])
             # capture gold passages independently (with grad on the capture path)
             if args.bank_grad:
                 off, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False)
@@ -81,7 +84,7 @@ def main():
             mgr.set_allowed(None)
             # one query, target = the teacher's full think+answer trajectory
             item = {"question": t["question"], "references": t["references"],
-                    "think_answer": t["think_answer"]}
+                    "think_answer": t.get("think_answer")}
             loss = use_loss(model, mgr, tok, [item], device, off, args.max_prompt_length)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
