@@ -36,6 +36,9 @@ def parse_args():
     p.add_argument("--capture-all", action="store_true",
                    help="capture ALL group items (incl. non-supporting) like the answer-only arm, "
                         "for a fair thinking-vs-answer-target A/B")
+    p.add_argument("--save-every", type=int, default=0, help=">0: checkpoint every N steps (overwrite)")
+    p.add_argument("--max-segs", type=int, default=0,
+                   help=">0: cap bank segments per row (keep supporting first) to bound capture memory")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -75,26 +78,38 @@ def main():
     for ep in range(args.epochs):
         for t in traj:
             gi = t["group_items"] if args.capture_all else gold_items(t["group_items"])
-            # capture gold passages independently (with grad on the capture path)
-            if args.bank_grad:
-                off, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False)
-            else:
-                with torch.no_grad():
+            if args.max_segs and len(gi) > args.max_segs:
+                sup = [x for x in gi if x.get("has_supporting", True)]
+                non = [x for x in gi if not x.get("has_supporting", True)]
+                gi = (sup + non)[: args.max_segs]
+            try:
+                # capture gold passages independently (with grad on the capture path)
+                if args.bank_grad:
                     off, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False)
-            mgr.set_allowed(None)
-            # one query, target = the teacher's full think+answer trajectory
-            item = {"question": t["question"], "references": t["references"],
-                    "think_answer": t.get("think_answer")}
-            loss = use_loss(model, mgr, tok, [item], device, off, args.max_prompt_length)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            opt.step(); opt.zero_grad()
-            run += loss.item(); step += 1
+                else:
+                    with torch.no_grad():
+                        off, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False)
+                mgr.set_allowed(None)
+                # one query, target = the teacher's full think+answer trajectory
+                item = {"question": t["question"], "references": t["references"],
+                        "think_answer": t.get("think_answer")}
+                loss = use_loss(model, mgr, tok, [item], device, off, args.max_prompt_length)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+                opt.step(); opt.zero_grad()
+                run += loss.item()
+            except torch.OutOfMemoryError:
+                opt.zero_grad(set_to_none=True); mgr.bank = {}
+                torch.cuda.empty_cache()
+                log.warning("OOM at step%d -- row skipped (segs=%d)", step, len(gi))
+            step += 1
             mgr.bank = {}
             if step % 8 == 0:
                 torch.cuda.empty_cache()
             if step % 25 == 0:
                 log.info("ep%d step%d loss=%.4f", ep, step, run / 25); run = 0.0
+            if args.save_every and step % args.save_every == 0:
+                model.save_pretrained(args.output_dir)
     model.save_pretrained(args.output_dir)
     tok.save_pretrained(args.output_dir)
     log.info("saved think-distill LoRA to %s", args.output_dir)

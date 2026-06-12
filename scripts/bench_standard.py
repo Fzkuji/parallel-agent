@@ -132,8 +132,9 @@ def main():
         args.model_path, dtype=torch.bfloat16, attn_implementation="sdpa").to(device).eval()
     if args.lora_path:
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, args.lora_path).merge_and_unload().eval()
-        print("loaded LoRA:", args.lora_path, flush=True)
+        for lp in args.lora_path.split(","):
+            model = PeftModel.from_pretrained(model, lp).merge_and_unload().eval()
+            print("loaded LoRA:", lp, flush=True)
     mgr = BatchCrossCache(list(range(len(model.model.layers))))
     mgr.register(model)
 
