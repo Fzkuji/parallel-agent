@@ -35,8 +35,11 @@ def parse_args():
     p.add_argument("--model-path", required=True)
     p.add_argument("--warm-start", required=True, help="distill LoRA to merge as policy init + KL ref")
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--dataset", default="2wikimultihopqa")
+    p.add_argument("--dataset", default="2wikimultihopqa",
+                   help="flashrag name, or 'hotpotqa_hf' for the HF hotpot_qa distractor train split")
     p.add_argument("--split", default="train")
+    p.add_argument("--think", action="store_true",
+                   help="think-mode rollouts (enable_thinking prompts; raise --max-new to 192+)")
     p.add_argument("--flashrag-root",
                    default="/mnt/data/zichuanfu/.cache/huggingface/datasets/RUC-NLPIR___flash_rag_datasets")
     p.add_argument("--num-q", type=int, default=3000)
@@ -90,10 +93,34 @@ def load_items(root, name, split, num_q, rng):
     return items[:num_q], pool
 
 
+def load_hotpot_train(num_q, rng):
+    """HF hotpot_qa distractor train: native gold + in-context distractor paragraphs."""
+    from datasets import load_dataset
+    ds = load_dataset("hotpot_qa", "distractor", split="train")
+    idx = list(range(len(ds))); rng.shuffle(idx)
+    items, pool = [], []
+    for i in idx:
+        ex = ds[i]
+        titles = ex["context"]["title"]; sents = ex["context"]["sentences"]
+        gold_titles = set(ex["supporting_facts"]["title"])
+        gold, others = [], []
+        for t, sx in zip(titles, sents):
+            s = " ".join(sx).strip()
+            if not s:
+                continue
+            (gold if t in gold_titles else others).append(s)
+        pool.extend(others)
+        if gold:
+            items.append({"gold": gold, "question": ex["question"], "answers": [ex["answer"]]})
+        if len(items) >= num_q and len(pool) > 5000:
+            break
+    return items[:num_q], pool
+
+
 @torch.no_grad()
-def sample_group(model, tok, mgr, question, device, off, G, max_new, temp):
+def sample_group(model, tok, mgr, question, device, off, G, max_new, temp, think=False):
     """sample G completions in one batch reading the shared bank."""
-    qp = bp(tok, "", question, False)
+    qp = bp(tok, "", question, think)
     enc = tok([qp], return_tensors="pt", add_special_tokens=False)
     qids = enc["input_ids"].to(device).repeat(G, 1)
     qattn = enc["attention_mask"].to(device).repeat(G, 1)
@@ -176,7 +203,10 @@ def main():
     model.train(); model.print_trainable_parameters()
     mgr = BatchCrossCache(list(range(model.config.num_hidden_layers))); mgr.register(model)
 
-    items, pool = load_items(args.flashrag_root, args.dataset, args.split, args.num_q, rng)
+    if args.dataset == "hotpotqa_hf":
+        items, pool = load_hotpot_train(args.num_q, rng)
+    else:
+        items, pool = load_items(args.flashrag_root, args.dataset, args.split, args.num_q, rng)
     log.info("GRPO items=%d pool=%d", len(items), len(pool))
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
@@ -189,7 +219,7 @@ def main():
         model.eval()
         off = capture(model, tok, mgr, paras, it["question"], device, args.seg_cap, args.max_plen)
         texts, comps, qids = sample_group(model, tok, mgr, it["question"], device, off,
-                                          args.group, args.max_new, args.temp)
+                                          args.group, args.max_new, args.temp, args.think)
         rewards = torch.tensor([subem(extract_answer(t), it["answers"]) for t in texts],
                                device=device)
         run_r += rewards.mean().item()
