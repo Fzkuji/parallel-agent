@@ -58,9 +58,12 @@ def capture(model, tok, mgr, chunks, question, device, seg_cap, max_plen):
 
 
 @torch.no_grad()
-def gen_select(model, tok, mgr, question, device, off, max_new):
-    """greedy decode from the bank until </select>."""
+def gen_select(model, tok, mgr, question, device, off, max_new, force=True):
+    """greedy decode from the bank until </select>. force=True appends '<select>' to the prompt
+    (constrained start) so the model only needs to continue with indices — kills format failures."""
     qp = bp(tok, "", question, True)
+    if force:
+        qp = qp + "<select>"
     enc = tok([qp], return_tensors="pt", add_special_tokens=False)
     qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
@@ -94,6 +97,9 @@ def parse_select(text, n):
     m = re.search(r"<select>([\d,\s]+)</select>", text)
     if not m:
         m = re.search(r"<select>([\d,\s]+)", text)
+    if not m:
+        # forced-start mode: text begins directly with the indices ("2,5</select>...")
+        m = re.match(r"\s*([\d,\s]+)", text)
     if not m:
         return None
     idx = sorted({int(x) for x in re.findall(r"\d+", m.group(1)) if 1 <= int(x) <= n})
