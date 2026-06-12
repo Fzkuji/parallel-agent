@@ -35,6 +35,9 @@ def parse_args():
     p.add_argument("--max-new-think", type=int, default=512)
     p.add_argument("--max-new-nothink", type=int, default=32)
     p.add_argument("--sel-max-new", type=int, default=24)
+    p.add_argument("--min-k", type=int, default=4,
+                   help="pad the parsed selection with attention-top passages up to min-k "
+                        "(trained select is precise but under-selects; attention adds coverage)")
     p.add_argument("--seg-cap", type=int, default=768)
     p.add_argument("--max-plen", type=int, default=1600)
     p.add_argument("--seed", type=int, default=0)
@@ -68,6 +71,8 @@ def gen_select(model, tok, mgr, question, device, off, max_new, force=True):
     qids = enc["input_ids"].to(device); qattn = enc["attention_mask"].to(device)
     eos = tok.eos_token_id; pad = tok.pad_token_id or eos
     mgr.start_use()
+    if getattr(mgr, "start_relevance", None) and gen_select.rec_c:
+        mgr.start_relevance(gen_select.rec_c)
     pos = (qattn.long().cumsum(1) - 1).clamp(min=0) + off
     nxt_pos = off + qattn.sum(1)
     cur = qattn.clone(); nxt = qids.clone(); pkv = None
@@ -90,7 +95,11 @@ def gen_select(model, tok, mgr, question, device, off, max_new, force=True):
         text = tok.decode(out_ids)
         if "</select>" in text:
             break
-    return tok.decode(out_ids)
+    rel = mgr.relevance() if (getattr(mgr, "start_relevance", None) and gen_select.rec_c) else None
+    return tok.decode(out_ids), rel
+
+
+gen_select.rec_c = 0
 
 
 def parse_select(text, n):
@@ -140,13 +149,20 @@ def main():
     for it in items:
         headers = [f"Passage {i+1}: {p}" for i, p in enumerate(it["paras"])]
         off = capture(model, tok, mgr, headers, it["question"], device, args.seg_cap, args.max_plen)
-        sel_text = gen_select(model, tok, mgr, it["question"], device, off, args.sel_max_new)
+        gen_select.rec_c = len(it["paras"])
+        sel_text, rel = gen_select(model, tok, mgr, it["question"], device, off, args.sel_max_new)
         idx = parse_select(sel_text, len(it["paras"]))
         mgr.bank = {}
         if idx is None:
             parse_fail += 1
             idx = list(range(1, len(it["paras"]) + 1))  # fallback: keep all
         sel0 = {i - 1 for i in idx}
+        if rel is not None and len(sel0) < args.min_k:
+            order = rel.flatten().argsort(descending=True).tolist()
+            for j in order:
+                if len(sel0) >= min(args.min_k, len(it["paras"])):
+                    break
+                sel0.add(int(j))
         if it["gold_pos"] <= sel0:
             rec_full += 1
         prec_n += len(it["gold_pos"] & sel0) / max(1, len(sel0))
