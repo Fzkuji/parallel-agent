@@ -229,6 +229,8 @@ def main():
                 log.info("step%d avg_reward=%.3f loss=%.4f skipped=%d",
                          step, run_r / 25, run_loss / max(1, 25 - skipped), skipped)
                 run_r = 0.0; run_loss = 0.0; skipped = 0
+            if args.save_every and step % args.save_every == 0:
+                model.save_pretrained(args.output_dir)
             continue
         adv = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
 
