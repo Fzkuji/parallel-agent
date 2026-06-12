@@ -15,7 +15,7 @@
 | 蒸馏训满 12467 步 | 74→66，hotpot 34→24 | ✗ 过训练，5200 步是甜点 |
 | GRPO@弱底（think_distill 60）| +6~+8 think | ✓ |
 | GRPO@强底（冠军 74）| ~0（np8 +4）| ✗ 增益与蒸馏重叠 |
-| GRPO think-rollout 臂 | 64/58（+4@弱底）| 弱于 nothink rollout |
+| GRPO think-rollout 臂 | 64/58（+4@弱底）；@冠军 68/54（−6）| 弱于 nothink rollout，强底无增益 |
 | 投票 self-consistency N=8 | think 68 < greedy 74 | ✗ 采样分布脆，greedy 即最优路径 |
 | 似然重排 N=8/16 | nothink +2，think − | ✗（nothink 真天花板 82，选择器收不回）|
 | verify 探针重排 | 40-50 | ✗ 蒸馏模型对 yes/no 探针无校准 |
