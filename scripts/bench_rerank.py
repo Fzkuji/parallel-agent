@@ -35,21 +35,35 @@ def parse_args():
     p.add_argument("--max-new", type=int, default=320)
     p.add_argument("--seg-cap", type=int, default=768)
     p.add_argument("--max-plen", type=int, default=1600)
+    p.add_argument("--selector", default="logp", choices=["logp", "verify"],
+                   help="logp: mean answer-token likelihood; verify: P(yes) on a "
+                        "'is this answer correct' probe under the same bank")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
     return p.parse_args()
 
 
 @torch.no_grad()
-def score_candidates(model, tok, mgr, question, cands, device, off):
-    """mean token logprob of '<answer>X</answer>' under the bank-read, per candidate."""
-    qp = bp(tok, "", question, False)
-    qids = tok(qp, add_special_tokens=False)["input_ids"]
-    ids_l, lab_l = [], []
-    for c in cands:
-        aids = tok(f"<answer>{c}</answer>", add_special_tokens=False)["input_ids"]
-        ids_l.append(qids + aids)
-        lab_l.append([-100] * len(qids) + aids)
+def score_candidates(model, tok, mgr, question, cands, device, off, selector="logp"):
+    """logp: mean token logprob of '<answer>X</answer>'; verify: logprob of ' yes' after a
+    correctness probe. Both scored under the SAME bank-read forward."""
+    if selector == "verify":
+        probe = question + ' Proposed answer: "{c}". Based on the passages, is this answer correct? Reply yes or no.'
+        qp_t = [bp(tok, "", probe.format(c=c), False) for c in cands]
+        yes_id = tok(" yes", add_special_tokens=False)["input_ids"]
+        ids_l, lab_l = [], []
+        for q in qp_t:
+            qids = tok(q, add_special_tokens=False)["input_ids"]
+            ids_l.append(qids + yes_id)
+            lab_l.append([-100] * len(qids) + yes_id)
+    else:
+        qp = bp(tok, "", question, False)
+        qids = tok(qp, add_special_tokens=False)["input_ids"]
+        ids_l, lab_l = [], []
+        for c in cands:
+            aids = tok(f"<answer>{c}</answer>", add_special_tokens=False)["input_ids"]
+            ids_l.append(qids + aids)
+            lab_l.append([-100] * len(qids) + aids)
     pad = tok.pad_token_id or tok.eos_token_id
     ids, attn = left_pad(ids_l, pad, device)
     labels, _ = left_pad(lab_l, -100, device)
@@ -101,7 +115,7 @@ def main():
                 seen.add(k); cands.append(a[:80])
         if not cands:
             mgr.bank = {}; continue
-        scores = score_candidates(model, tok, mgr, it["question"], cands, device, off)
+        scores = score_candidates(model, tok, mgr, it["question"], cands, device, off, args.selector)
         pick = cands[max(range(len(cands)), key=lambda i: scores[i])]
         tot_rr += subem(pick, it["answers"])
         tot_any += 1.0 if any(subem(c, it["answers"]) for c in cands) else 0.0
