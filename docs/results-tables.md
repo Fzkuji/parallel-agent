@@ -1,4 +1,30 @@
-# 实验结果总表（2026-06-11）
+# 实验结果总表（2026-06-11 ~ 06-12）
+
+## ⭐ 06-12 优化战役总结（Qwen3-8B，2wiki dev np4，SubEM，greedy 单跑）
+
+**冠军配置：`ckpt_snap/mixed_s5200`**（三源混合轨迹蒸馏 12467 条的第 5200 步快照，脏 bank capture-all）
+- 2wiki s0：**74 (think) / 54 (nothink)**；n=150 精确值：**72.0 / 53.3**
+- 对照标准模型（base concat）n=150：88.7 (think) / 66.7 (nothink)
+- **跨模式压制成立且随密度增强**：ours(think) vs concat(直答) = +5.3(4段) / 0(8段) / +4(16段) / +6(32段)
+- 同模式 gap：think −16.7、nothink −13.4（未平）
+
+**全部杠杆的战绩（每项一行）：**
+| 杠杆 | 结果 | 判定 |
+|---|---|---|
+| 三源混合蒸馏（hotpot+2wiki train+SQuAD切块+脏bank）| 60→74 | ✓ 最大增益来源 |
+| 蒸馏训满 12467 步 | 74→66，hotpot 34→24 | ✗ 过训练，5200 步是甜点 |
+| GRPO@弱底（think_distill 60）| +6~+8 think | ✓ |
+| GRPO@强底（冠军 74）| ~0（np8 +4）| ✗ 增益与蒸馏重叠 |
+| GRPO think-rollout 臂 | 64/58（+4@弱底）| 弱于 nothink rollout |
+| 投票 self-consistency N=8 | think 68 < greedy 74 | ✗ 采样分布脆，greedy 即最优路径 |
+| 似然重排 N=8/16 | nothink +2，think − | ✗（nothink 真天花板 82，选择器收不回）|
+| verify 探针重排 | 40-50 | ✗ 蒸馏模型对 yes/no 探针无校准 |
+| ckpt 平均（@1000+@5200）| 64 | ✗ |
+| selective read（注意力 top-k）| 高密度 +2~+6，读取省 2-8 倍 | ✓ 效率主张核心 |
+
+**机制结论**：RL/重排/投票全部失效的共同原因——冠军蒸馏已把"分布内可恢复的桥接"吃完,
+剩余 gap 是独立编码在 encode 期丢失的跨段信息,decode 端的任何选择/强化都补不回。
+这本身是论文的强 claim（与 encoding-vs-selection-split 诊断互证）。
 
 协议：flashrag dev，每题 gold 段落 + 干扰段补足 n_paras，SubEM，n=50/seed。
 no-think `max_new=32`，think `max_new=256~512`。
