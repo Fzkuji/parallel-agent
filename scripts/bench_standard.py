@@ -38,6 +38,9 @@ def parse_args():
                    default="/mnt/data/zichuanfu/.cache/huggingface/datasets/RUC-NLPIR___flash_rag_datasets")
     p.add_argument("--num-q", type=int, default=50)
     p.add_argument("--n-paras", type=int, default=4)
+    p.add_argument("--gold-only", action="store_true",
+                   help="oracle selection upper bound: context = gold passages only, no distractors "
+                        "(the two-stage reread ceiling; independent of n-paras)")
     p.add_argument("--encodings", default="concat,ape,ours")
     p.add_argument("--think-modes", default="think,nothink")
     p.add_argument("--max-new-think", type=int, default=256)
@@ -141,7 +144,11 @@ def main():
     parsed, pool = build_examples(args.flashrag_root, args.dataset, args.num_q, args.seed)
     items = []
     for ex in parsed[:args.num_q]:
-        items.append({"paras": make_paras(ex, args.n_paras, pool, rng),
+        if args.gold_only:
+            paras = list(ex["gold"]); rng.shuffle(paras)
+        else:
+            paras = make_paras(ex, args.n_paras, pool, rng)
+        items.append({"paras": paras,
                       "question": ex["question"], "answers": ex["answer"]})
 
     encs = args.encodings.split(","); tms = args.think_modes.split(",")
