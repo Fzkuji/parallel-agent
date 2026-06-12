@@ -37,6 +37,9 @@ def parse_args():
                    help="capture ALL group items (incl. non-supporting) like the answer-only arm, "
                         "for a fair thinking-vs-answer-target A/B")
     p.add_argument("--save-every", type=int, default=0, help=">0: checkpoint every N steps (overwrite)")
+    p.add_argument("--ape-style", action="store_true",
+                   help="train the APE read path: realign(temp=0.9, scale=0.9) during the use phase, "
+                        "for a fair 'APE + same training' baseline")
     p.add_argument("--max-segs", type=int, default=0,
                    help=">0: cap bank segments per row (keep supporting first) to bound capture memory")
     p.add_argument("--seed", type=int, default=42)
@@ -90,6 +93,8 @@ def main():
                     with torch.no_grad():
                         off, _, _ = capture(model, mgr, tok, gi, device, args.max_prompt_length, False)
                 mgr.set_allowed(None)
+                if args.ape_style:
+                    mgr.set_realign(0.9, 0.9)
                 # one query, target = the teacher's full think+answer trajectory
                 item = {"question": t["question"], "references": t["references"],
                         "think_answer": t.get("think_answer")}
