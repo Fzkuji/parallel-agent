@@ -38,6 +38,7 @@ def parse_args():
     p.add_argument("--min-k", type=int, default=4,
                    help="pad the parsed selection with attention-top passages up to min-k "
                         "(trained select is precise but under-selects; attention adds coverage)")
+    p.add_argument("--dump", default=None, help="JSONL path: per-question selection/answer dump for error analysis")
     p.add_argument("--seg-cap", type=int, default=768)
     p.add_argument("--max-plen", type=int, default=1600)
     p.add_argument("--seed", type=int, default=0)
@@ -169,12 +170,26 @@ def main():
         k_sum += len(sel0)
         selected = [it["paras"][i] for i in sorted(sel0)]
         mgr.set_enabled(False)
+        preds = {}
         for t in tms:
             think = (t == "think")
             mn = args.max_new_think if think else args.max_new_nothink
             pred = gen_concat(model, tok, selected, it["question"], device, mn, args.seg_cap, think)
-            acc[t] += subem(pred, it["answers"])
+            preds[t] = (pred, subem(pred, it["answers"]))
+            acc[t] += preds[t][1]
         mgr.set_enabled(True)
+        if args.dump:
+            import json as _json
+            missed = sorted(it["gold_pos"] - sel0)
+            with open(args.dump, "a") as df:
+                df.write(_json.dumps({
+                    "q": it["question"], "answers": it["answers"],
+                    "gold_pos": sorted(it["gold_pos"]), "selected": sorted(sel0),
+                    "sel_text": sel_text[:120],
+                    "missed_gold_snippets": [it["paras"][i][:150] for i in missed],
+                    "selected_snippets": [it["paras"][i][:100] for i in sorted(sel0)[:6]],
+                    "preds": {t: {"pred": p[:120], "ok": ok} for t, (p, ok) in preds.items()},
+                }, ensure_ascii=False) + "\n")
         torch.cuda.empty_cache()
     n = len(items)
     parts = [f"{t}={100*acc[t]/n:.1f}" for t in tms]
