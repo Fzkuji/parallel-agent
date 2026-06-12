@@ -96,7 +96,7 @@ def load_items(root, name, split, num_q, rng):
 def load_hotpot_train(num_q, rng):
     """HF hotpot_qa distractor train: native gold + in-context distractor paragraphs."""
     from datasets import load_dataset
-    ds = load_dataset("hotpot_qa", "distractor", split="train")
+    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split="train")
     idx = list(range(len(ds))); rng.shuffle(idx)
     items, pool = [], []
     for i in idx:
