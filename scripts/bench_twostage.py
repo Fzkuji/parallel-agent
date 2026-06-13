@@ -39,6 +39,10 @@ def parse_args():
                    help="pad the parsed selection with attention-top passages up to min-k "
                         "(trained select is precise but under-selects; attention adds coverage)")
     p.add_argument("--dump", default=None, help="JSONL path: per-question selection/answer dump for error analysis")
+    p.add_argument("--oracle-select", action="store_true",
+                   help="UPPER BOUND: select the gold passages directly (skip the model selector). "
+                        "If this stays low at np32 the bottleneck is reread, not selection -> don't retrain selector.")
+    p.add_argument("--shard", default="0/1", help="i/N data-parallel shard for 8-GPU single-experiment runs")
     p.add_argument("--seg-cap", type=int, default=768)
     p.add_argument("--max-plen", type=int, default=1600)
     p.add_argument("--seed", type=int, default=0)
@@ -144,20 +148,26 @@ def main():
         items.append({"paras": paras, "gold_pos": gold_pos,
                       "question": ex["question"], "answers": ex["answer"]})
 
+    si, sn = (int(x) for x in args.shard.split("/"))
+    items = items[si::sn]
     tms = [t for t in args.think_modes.split(",") if t]
     acc = {t: 0.0 for t in tms}
     rec_full = 0; prec_n = 0.0; k_sum = 0; parse_fail = 0
     for it in items:
-        headers = [f"Passage {i+1}: {p}" for i, p in enumerate(it["paras"])]
-        off = capture(model, tok, mgr, headers, it["question"], device, args.seg_cap, args.max_plen)
-        gen_select.rec_c = len(it["paras"])
-        sel_text, rel = gen_select(model, tok, mgr, it["question"], device, off, args.sel_max_new)
-        idx = parse_select(sel_text, len(it["paras"]))
-        mgr.bank = {}
-        if idx is None:
-            parse_fail += 1
-            idx = list(range(1, len(it["paras"]) + 1))  # fallback: keep all
-        sel0 = {i - 1 for i in idx}
+        if args.oracle_select:
+            sel0 = set(it["gold_pos"]); rel = None; sel_text = "<oracle>"
+            mgr.bank = {}
+        else:
+            headers = [f"Passage {i+1}: {p}" for i, p in enumerate(it["paras"])]
+            off = capture(model, tok, mgr, headers, it["question"], device, args.seg_cap, args.max_plen)
+            gen_select.rec_c = len(it["paras"])
+            sel_text, rel = gen_select(model, tok, mgr, it["question"], device, off, args.sel_max_new)
+            idx = parse_select(sel_text, len(it["paras"]))
+            mgr.bank = {}
+            if idx is None:
+                parse_fail += 1
+                idx = list(range(1, len(it["paras"]) + 1))  # fallback: keep all
+            sel0 = {i - 1 for i in idx}
         if rel is not None and len(sel0) < args.min_k:
             order = rel.flatten().argsort(descending=True).tolist()
             for j in order:

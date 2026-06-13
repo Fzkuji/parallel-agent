@@ -33,6 +33,8 @@ def parse_args():
     p.add_argument("--max-plen", type=int, default=1600)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--shard", default="0/1", help="i/N data-parallel shard for 8-GPU single-experiment runs")
+    p.add_argument("--rank-dump", default=None, help="JSONL: per-gold-passage rank (diagnose under-train vs conditional-relevance)")
     return p.parse_args()
 
 
@@ -79,6 +81,7 @@ def main():
     mgr = BatchCrossCache(list(range(len(model.model.layers)))); mgr.register(model)
 
     parsed, pool = build_examples(args.flashrag_root, args.dataset, args.num_q, args.seed)
+    si, sn = (int(x) for x in args.shard.split("/"))
     items = []
     for ex in parsed[:args.num_q]:
         gold = list(ex["gold"])
@@ -89,22 +92,44 @@ def main():
         paras = [paras[i] for i in idx]
         gold_pos = {pi for pi, oi in enumerate(idx) if oi < len(gold)}
         items.append({"paras": paras, "gold_pos": gold_pos, "question": ex["question"]})
+    items = items[si::sn]
 
     ks = [2, 3, 4, 6, 8]
     rec = {k: 0 for k in ks}
+    # gold-rank histogram: where do gold passages land when scored? best-rank vs worst-rank per Q
+    gold_ranks = []  # every gold passage's rank (0=top)
+    worst_ranks = []  # the WORST-ranked gold per question (the 2nd-hop bottleneck)
+    import json as _json
+    df = open(args.rank_dump, "w") if args.rank_dump else None
     for it in items:
         C = len(it["paras"])
         off = capture(model, tok, mgr, it["paras"], it["question"], device, args.seg_cap, args.max_plen)
         sc = passage_scores(model, tok, mgr, it["question"], C, device, off)
         order = sc.argsort(descending=True).tolist()
+        rank_of = {p: r for r, p in enumerate(order)}
+        gr = sorted(rank_of[g] for g in it["gold_pos"])
+        gold_ranks.extend(gr); worst_ranks.append(gr[-1] if gr else C)
         for k in ks:
             if it["gold_pos"] <= set(order[:k]):
                 rec[k] += 1
+        if df:
+            df.write(_json.dumps({"C": C, "n_gold": len(it["gold_pos"]), "gold_ranks": gr,
+                                  "q": it["question"][:80]}) + "\n")
         mgr.bank = {}
         torch.cuda.empty_cache()
+    if df:
+        df.close()
     n = len(items)
     parts = [f"recall@{k}={100*rec[k]/n:.1f}" for k in ks]
-    print(f"== passage-score {args.dataset} np{args.n_paras} n={n} ==  " + "  ".join(parts), flush=True)
+    # how the worst gold per Q distributes — the killer metric for under-train vs conditional
+    wr = sorted(worst_ranks)
+    buckets = {"top4": sum(1 for r in worst_ranks if r < 4),
+               "top8": sum(1 for r in worst_ranks if r < 8),
+               "top16": sum(1 for r in worst_ranks if r < 16),
+               "beyond16": sum(1 for r in worst_ranks if r >= 16)}
+    print(f"== passage-score {args.dataset} np{args.n_paras} n={n} shard={args.shard} ==  "
+          + "  ".join(parts), flush=True)
+    print(f"   worst-gold-rank buckets {buckets}  (beyond16 = unrecoverable-by-topk gold)", flush=True)
 
 
 if __name__ == "__main__":
